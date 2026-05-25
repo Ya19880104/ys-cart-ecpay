@@ -68,6 +68,7 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_requester', [ $this, 'register_shipping_requester' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
+		add_filter( 'ys_ec_admin_nav_groups', [ $this, 'register_admin_nav_group' ] );
 		add_filter( 'ys_ec_external_admin_pages', [ $this, 'register_external_admin_page' ] );
 	}
 
@@ -204,6 +205,29 @@ final class Plugin {
 		$labels['ecpay'] = 'ECPay';
 
 		return $labels;
+	}
+
+	/**
+	 * @param array<string,array<string,mixed>> $groups
+	 * @return array<string,array<string,mixed>>
+	 */
+	public function register_admin_nav_group( array $groups ): array {
+		if ( ! isset( $groups['providers'] ) || ! is_array( $groups['providers'] ) ) {
+			$groups['providers'] = [
+				'label' => 'Payment / Logistics',
+				'icon'  => 'dashicons-store',
+				'slugs' => [],
+			];
+		}
+
+		if ( ! isset( $groups['providers']['slugs'] ) || ! is_array( $groups['providers']['slugs'] ) ) {
+			$groups['providers']['slugs'] = [];
+		}
+
+		$groups['providers']['slugs'][] = 'ys-ecommerce-ecpay';
+		$groups['providers']['slugs']   = array_values( array_unique( array_map( 'sanitize_key', $groups['providers']['slugs'] ) ) );
+
+		return $groups;
 	}
 
 	/**
