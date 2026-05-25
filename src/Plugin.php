@@ -106,7 +106,7 @@ final class Plugin {
 			'payment'     => [ 'Credit Card', 'ATM', 'CVS Code', 'Barcode' ],
 			'shipping'    => [ '7-ELEVEN', 'FamilyMart', 'Hi-Life', 'TCAT', 'Post' ],
 			'setting_key' => 'ys_ec_ecpay_enabled',
-			'admin_url'   => admin_url( 'admin.php?page=ys-ecommerce-ecpay' ),
+			'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay',
 		];
 
 		return $providers;

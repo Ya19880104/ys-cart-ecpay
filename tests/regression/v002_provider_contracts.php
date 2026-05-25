@@ -61,5 +61,12 @@ foreach ($requiredPluginStrings as $needle) {
     }
 }
 
-echo "v002_provider_contracts passed\n";
+if (preg_match("/'admin_url'\s*=>\s*admin_url\s*\(/", $plugin)) {
+    fail_contract('Provider admin_url must be a relative wp-admin path because YS CART wraps it with admin_url().');
+}
 
+if (false === strpos($plugin, "'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay'")) {
+    fail_contract('Provider admin_url must be admin.php?page=ys-ecommerce-ecpay.');
+}
+
+echo "v002_provider_contracts passed\n";

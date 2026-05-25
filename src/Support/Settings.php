@@ -37,14 +37,6 @@ final class Settings {
 		'ship_post'      => 'ys_ec_ecpay_ship_post_enabled',
 	];
 
-	public const SHIPPING_COST_KEYS = [
-		'ship_family'  => [ 'cost' => 'ys_ec_ecpay_ship_family_cost', 'free' => 'ys_ec_ecpay_ship_family_free_threshold' ],
-		'ship_unimart' => [ 'cost' => 'ys_ec_ecpay_ship_unimart_cost', 'free' => 'ys_ec_ecpay_ship_unimart_free_threshold' ],
-		'ship_hilife'  => [ 'cost' => 'ys_ec_ecpay_ship_hilife_cost', 'free' => 'ys_ec_ecpay_ship_hilife_free_threshold' ],
-		'ship_tcat'    => [ 'cost' => 'ys_ec_ecpay_ship_tcat_cost', 'free' => 'ys_ec_ecpay_ship_tcat_free_threshold' ],
-		'ship_post'    => [ 'cost' => 'ys_ec_ecpay_ship_post_cost', 'free' => 'ys_ec_ecpay_ship_post_free_threshold' ],
-	];
-
 	public const SENDER_KEYS = [
 		'name'    => 'shipping_ecpay_sender_name',
 		'phone'   => 'shipping_ecpay_sender_phone',
@@ -131,14 +123,16 @@ final class Settings {
 		return rtrim( $base, '/' ) . '/' . ltrim( $path, '/' );
 	}
 
-	public static function shipping_cost( string $key ): float {
-		$map = self::SHIPPING_COST_KEYS[ $key ] ?? null;
-		return $map ? max( 0.0, (float) self::get( $map['cost'], '0' ) ) : 0.0;
+	public static function shipping_method_option( string $method_id, string $key, mixed $default = '' ): mixed {
+		return self::get( 'shipping_' . $method_id . '_' . $key, $default );
 	}
 
-	public static function free_threshold( string $key ): float {
-		$map = self::SHIPPING_COST_KEYS[ $key ] ?? null;
-		return $map ? max( 0.0, (float) self::get( $map['free'], '0' ) ) : 0.0;
+	public static function shipping_base_fee( string $method_id ): float {
+		return max( 0.0, (float) self::shipping_method_option( $method_id, 'base_fee', '0' ) );
+	}
+
+	public static function shipping_free_threshold( string $method_id ): float {
+		return max( 0.0, (float) self::shipping_method_option( $method_id, 'free_threshold', '0' ) );
 	}
 
 	public static function has_payment_credentials(): bool {
@@ -151,4 +145,3 @@ final class Settings {
 		return '' !== $c['merchant_id'] && '' !== $c['hash_key'] && '' !== $c['hash_iv'];
 	}
 }
-

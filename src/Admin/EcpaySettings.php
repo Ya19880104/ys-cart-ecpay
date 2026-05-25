@@ -10,6 +10,13 @@ use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpaySettings {
 	private const NONCE_ACTION = 'ys_cart_ecpay_save_settings';
+	private const DEFAULT_TAB = 'api';
+	private const TABS = [
+		'api'         => 'API',
+		'payment'     => 'Payment',
+		'shipping'    => 'Shipping',
+		'diagnostics' => 'Diagnostics',
+	];
 
 	public static function register(): void {
 		add_action( 'admin_post_ys_cart_ecpay_save_settings', [ __CLASS__, 'handle_save' ] );
@@ -22,28 +29,34 @@ final class EcpaySettings {
 
 		check_admin_referer( self::NONCE_ACTION );
 
+		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_POST['ys_ec_ecpay_tab'] ?? self::DEFAULT_TAB ) ) ) );
+
 		Settings::update( Settings::ENABLED, isset( $_POST['ys_ec_ecpay_enabled'] ) ? '1' : '0' );
 
-		self::save_credentials_group( 'payment', Settings::PAYMENT_KEYS );
-		self::save_credentials_group( 'logistics', Settings::LOGISTICS_KEYS );
-
-		foreach ( Settings::METHOD_KEYS as $alias => $setting_key ) {
-			Settings::update( $setting_key, isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ? '1' : '0' );
+		if ( 'api' === $tab ) {
+			self::save_credentials_group( 'payment', Settings::PAYMENT_KEYS );
+			self::save_credentials_group( 'logistics', Settings::LOGISTICS_KEYS );
 		}
 
-		foreach ( Settings::SHIPPING_COST_KEYS as $alias => $keys ) {
-			$cost = max( 0, (float) wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $alias . '_cost' ] ?? '0' ) ) );
-			$free = max( 0, (float) wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $alias . '_free_threshold' ] ?? '0' ) ) );
-			Settings::update( $keys['cost'], (string) $cost );
-			Settings::update( $keys['free'], (string) $free );
+		if ( 'payment' === $tab ) {
+			self::save_method_switches( [ 'credit', 'atm', 'cvs', 'barcode' ] );
 		}
 
-		foreach ( Settings::SENDER_KEYS as $alias => $setting_key ) {
-			$value = sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_sender_' . $alias ] ?? '' ) ) );
-			Settings::update( $setting_key, $value );
+		if ( 'shipping' === $tab ) {
+			self::save_method_switches( [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ] );
+			self::save_sender_fields();
 		}
 
-		wp_safe_redirect( admin_url( 'admin.php?page=ys-ecommerce-ecpay&updated=1' ) );
+		wp_safe_redirect(
+			add_query_arg(
+				[
+					'page'    => 'ys-ecommerce-ecpay',
+					'tab'     => $tab,
+					'updated' => '1',
+				],
+				admin_url( 'admin.php' )
+			)
+		);
 		exit;
 	}
 
@@ -62,6 +75,26 @@ final class EcpaySettings {
 			if ( '' !== $raw ) {
 				Settings::update( $keys[ $secret_key ], Settings::encrypt_secret( $raw ) );
 			}
+		}
+	}
+
+	/**
+	 * @param array<int,string> $aliases
+	 */
+	private static function save_method_switches( array $aliases ): void {
+		foreach ( $aliases as $alias ) {
+			$setting_key = Settings::METHOD_KEYS[ $alias ] ?? '';
+			if ( '' === $setting_key ) {
+				continue;
+			}
+			Settings::update( $setting_key, isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ? '1' : '0' );
+		}
+	}
+
+	private static function save_sender_fields(): void {
+		foreach ( Settings::SENDER_KEYS as $alias => $setting_key ) {
+			$value = sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_sender_' . $alias ] ?? '' ) ) );
+			Settings::update( $setting_key, $value );
 		}
 	}
 
@@ -93,8 +126,34 @@ final class EcpaySettings {
 	 * @return array<string,mixed>
 	 */
 	public static function settings_for_render(): array {
+		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_GET['tab'] ?? self::DEFAULT_TAB ) ) ) );
 		$out = [
-			'enabled' => '1' === (string) Settings::get( Settings::ENABLED, '0' ),
+			'enabled'               => '1' === (string) Settings::get( Settings::ENABLED, '0' ),
+			'tab'                   => $tab,
+			'tabs'                  => self::TABS,
+			'page_url'              => admin_url( 'admin.php?page=ys-ecommerce-ecpay' ),
+			'shipping_settings_url' => admin_url( 'admin.php?page=ys-ec-shipping' ),
+			'callback_urls'         => [
+				'payment_notify'   => rest_url( 'ys-ecommerce/v1/ecpay/notify' ),
+				'payment_info'     => rest_url( 'ys-ecommerce/v1/ecpay/payment-info' ),
+				'payment_return'   => rest_url( 'ys-ecommerce/v1/ecpay/return' ),
+				'store_callback'   => rest_url( 'ys-ecommerce/v1/ecpay/store-callback' ),
+				'logistics_notify' => rest_url( 'ys-ecommerce/v1/ecpay/logistics-notify' ),
+				'store_map'        => rest_url( 'ys-ecommerce-headless/v1/stores/ecpay/map-url' ),
+			],
+			'payment_methods'       => [
+				'credit'  => 'Credit Card',
+				'atm'     => 'ATM',
+				'cvs'     => 'CVS Code',
+				'barcode' => 'Barcode',
+			],
+			'shipping_methods'      => [
+				'ship_family'  => [ 'label' => 'FamilyMart', 'id' => 'ys_ec_ecpay_ship_family' ],
+				'ship_unimart' => [ 'label' => '7-ELEVEN', 'id' => 'ys_ec_ecpay_ship_unimart' ],
+				'ship_hilife'  => [ 'label' => 'Hi-Life', 'id' => 'ys_ec_ecpay_ship_hilife' ],
+				'ship_tcat'    => [ 'label' => 'TCAT', 'id' => 'ys_ec_ecpay_ship_tcat' ],
+				'ship_post'    => [ 'label' => 'Post', 'id' => 'ys_ec_ecpay_ship_post' ],
+			],
 		];
 
 		foreach ( [ 'payment' => Settings::PAYMENT_KEYS, 'logistics' => Settings::LOGISTICS_KEYS ] as $prefix => $keys ) {
@@ -108,16 +167,15 @@ final class EcpaySettings {
 			$out[ $alias . '_enabled' ] = '1' === (string) Settings::get( $setting_key, '0' );
 		}
 
-		foreach ( Settings::SHIPPING_COST_KEYS as $alias => $keys ) {
-			$out[ $alias . '_cost' ] = (string) Settings::get( $keys['cost'], '0' );
-			$out[ $alias . '_free_threshold' ] = (string) Settings::get( $keys['free'], '0' );
-		}
-
 		foreach ( Settings::SENDER_KEYS as $alias => $setting_key ) {
 			$out[ 'sender_' . $alias ] = (string) Settings::get( $setting_key, '' );
 		}
 
 		return $out;
+	}
+
+	private static function normalize_tab( string $tab ): string {
+		return array_key_exists( $tab, self::TABS ) ? $tab : self::DEFAULT_TAB;
 	}
 }
 

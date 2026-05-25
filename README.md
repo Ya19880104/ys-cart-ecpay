@@ -15,6 +15,7 @@ Standalone ECPay provider plugin for YS CART.
   - Hi-Life
   - TCAT
   - Post
+- Shipping method visibility, sorting, base rates, and free-shipping rules are managed in YS CART Shipping Settings.
 - ECPay CVS electronic map integration using YS CART's existing `cvs_store_id`, `cvs_store_name`, and `cvs_store_addr` checkout fields.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.
 
@@ -40,4 +41,3 @@ php bin/build-release.php
 ```
 
 The release zip root is `ys-cart-ecpay/` and excludes development-only files.
-

@@ -38,11 +38,11 @@ abstract class EcpayShipping implements YSShippingInterface {
 			}
 		}
 
-		return Settings::shipping_cost( $this->settings_key() );
+		return Settings::shipping_base_fee( $this->get_id() );
 	}
 
 	public function get_free_threshold(): float {
-		return Settings::free_threshold( $this->settings_key() );
+		return Settings::shipping_free_threshold( $this->get_id() );
 	}
 
 	public function supports_cvs_selection(): bool {
@@ -61,4 +61,3 @@ abstract class EcpayShipping implements YSShippingInterface {
 		return [ 'TW' ];
 	}
 }
-

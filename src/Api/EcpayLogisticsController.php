@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Api;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -108,13 +109,26 @@ final class EcpayLogisticsController {
 			'updated_at'           => current_time( 'mysql' ),
 		] );
 
-		YSOrder::update( (int) $order->id, [
+		$order_update = [
 			'payment_detail'  => wp_json_encode( $payment_detail ),
 			'tracking_number' => $tracking ?: (string) ( $order->tracking_number ?? '' ),
-			'shipping_status' => $this->map_status( $status ),
-		] );
+		];
+
+		if ( ! class_exists( YSShippingPipelineService::class ) ) {
+			$order_update['shipping_status'] = $this->map_status( $status );
+		}
+
+		YSOrder::update( (int) $order->id, $order_update );
 
 		$this->sync_label( (int) $order->id, (string) ( $params['AllPayLogisticsID'] ?? '' ), $tracking, $status );
+
+		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
+			YSShippingPipelineService::advance_from_carrier_status(
+				(int) $order->id,
+				$status,
+				'webhook_ecpay'
+			);
+		}
 	}
 
 	private function map_status( string $status ): string {
