@@ -101,11 +101,11 @@ final class Plugin {
 	 */
 	public function register_provider( array $providers ): array {
 		$providers['ecpay'] = [
-			'name'        => 'ECPay',
+			'name'        => '綠界 ECPay',
 			'icon'        => 'dashicons-money-alt',
-			'description' => 'ECPay AIO payment and domestic logistics for YS CART.',
-			'payment'     => [ 'Credit Card', 'ATM', 'CVS Code', 'Barcode' ],
-			'shipping'    => [ '7-ELEVEN', 'FamilyMart', 'Hi-Life', 'TCAT', 'Post' ],
+			'description' => '綠界全方位金流與台灣本地物流，整合 YS CART 付款、超商取貨、宅配與物流狀態。',
+			'payment'     => [ '信用卡', 'ATM 虛擬帳號', '超商代碼', '超商條碼' ],
+			'shipping'    => [ '7-ELEVEN 超商取貨', '全家超商取貨', '萊爾富超商取貨', '黑貓宅配', '郵局宅配' ],
 			'setting_key' => 'ys_ec_ecpay_enabled',
 			'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay',
 		];
@@ -116,8 +116,8 @@ final class Plugin {
 	public function register_admin_menu( string $parent_slug, string $capability ): void {
 		add_submenu_page(
 			$parent_slug,
-			'ECPay Settings',
-			'ECPay',
+			'綠界金流設定',
+			'綠界',
 			$capability,
 			'ys-ecommerce-ecpay',
 			[ EcpaySettings::class, 'render_page' ]

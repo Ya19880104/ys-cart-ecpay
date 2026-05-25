@@ -11,7 +11,7 @@ final class EcpayCvsGateway extends EcpayGatewayBase {
 	}
 
 	public function get_title(): string {
-		return 'ECPay CVS Code';
+		return '綠界超商代碼';
 	}
 
 	protected function gateway_key(): string {
@@ -22,4 +22,3 @@ final class EcpayCvsGateway extends EcpayGatewayBase {
 		return 'CVS';
 	}
 }
-

@@ -14,7 +14,7 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	abstract protected function choose_payment(): string;
 
 	public function get_description(): string {
-		return 'Pay with ECPay AIO.';
+		return '使用綠界 ECPay AIO 付款。';
 	}
 
 	public function get_icon(): string {
@@ -103,4 +103,3 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		return substr( preg_replace( '/[^A-Za-z0-9]/', '', $raw ) ?: $raw, 0, 20 );
 	}
 }
-

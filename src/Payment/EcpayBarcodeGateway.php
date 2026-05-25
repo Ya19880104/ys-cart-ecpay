@@ -11,7 +11,7 @@ final class EcpayBarcodeGateway extends EcpayGatewayBase {
 	}
 
 	public function get_title(): string {
-		return 'ECPay Barcode';
+		return '綠界超商條碼';
 	}
 
 	protected function gateway_key(): string {
@@ -22,4 +22,3 @@ final class EcpayBarcodeGateway extends EcpayGatewayBase {
 		return 'BARCODE';
 	}
 }
-

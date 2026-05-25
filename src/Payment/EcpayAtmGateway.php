@@ -11,7 +11,7 @@ final class EcpayAtmGateway extends EcpayGatewayBase {
 	}
 
 	public function get_title(): string {
-		return 'ECPay ATM';
+		return '綠界 ATM 虛擬帳號';
 	}
 
 	protected function gateway_key(): string {
@@ -22,4 +22,3 @@ final class EcpayAtmGateway extends EcpayGatewayBase {
 		return 'ATM';
 	}
 }
-

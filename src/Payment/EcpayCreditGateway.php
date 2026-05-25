@@ -11,7 +11,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	public function get_title(): string {
-		return 'ECPay Credit Card';
+		return '綠界信用卡';
 	}
 
 	protected function gateway_key(): string {
@@ -22,4 +22,3 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		return 'Credit';
 	}
 }
-

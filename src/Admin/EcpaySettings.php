@@ -12,10 +12,23 @@ final class EcpaySettings {
 	private const NONCE_ACTION = 'ys_cart_ecpay_save_settings';
 	private const DEFAULT_TAB = 'api';
 	private const TABS = [
-		'api'         => 'API',
-		'payment'     => 'Payment',
-		'shipping'    => 'Shipping',
-		'diagnostics' => 'Diagnostics',
+		'api'         => 'API 設定',
+		'payment'     => '付款方式',
+		'shipping'    => '物流方式',
+		'diagnostics' => '診斷資訊',
+	];
+	private const PAYMENT_GATEWAY_IDS = [
+		'credit'  => 'ys_ec_ecpay_credit',
+		'atm'     => 'ys_ec_ecpay_atm',
+		'cvs'     => 'ys_ec_ecpay_cvs',
+		'barcode' => 'ys_ec_ecpay_barcode',
+	];
+	private const SHIPPING_METHOD_IDS = [
+		'ship_family'  => 'ys_ec_ecpay_ship_family',
+		'ship_unimart' => 'ys_ec_ecpay_ship_unimart',
+		'ship_hilife'  => 'ys_ec_ecpay_ship_hilife',
+		'ship_tcat'    => 'ys_ec_ecpay_ship_tcat',
+		'ship_post'    => 'ys_ec_ecpay_ship_post',
 	];
 
 	public static function register(): void {
@@ -39,11 +52,15 @@ final class EcpaySettings {
 		}
 
 		if ( 'payment' === $tab ) {
-			self::save_method_switches( [ 'credit', 'atm', 'cvs', 'barcode' ] );
+			$aliases = [ 'credit', 'atm', 'cvs', 'barcode' ];
+			self::save_method_switches( $aliases );
+			self::sync_gateway_enabled_list( self::selected_ids_from_post( $aliases, self::PAYMENT_GATEWAY_IDS ) );
 		}
 
 		if ( 'shipping' === $tab ) {
-			self::save_method_switches( [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ] );
+			$aliases = [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ];
+			self::save_method_switches( $aliases );
+			self::sync_shipping_enabled_list( self::selected_ids_from_post( $aliases, self::SHIPPING_METHOD_IDS ) );
 			self::save_sender_fields();
 		}
 
@@ -98,6 +115,76 @@ final class EcpaySettings {
 		}
 	}
 
+	/**
+	 * @param array<int,string> $aliases
+	 * @param array<string,string> $ids
+	 * @return array<int,string>
+	 */
+	private static function selected_ids_from_post( array $aliases, array $ids ): array {
+		$selected = [];
+		foreach ( $aliases as $alias ) {
+			$id = $ids[ $alias ] ?? '';
+			if ( '' !== $id && isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ) {
+				$selected[] = $id;
+			}
+		}
+
+		return $selected;
+	}
+
+	/**
+	 * Keep YS CART's canonical gateway visibility list in sync when it exists.
+	 *
+	 * @param array<int,string> $selected_ids
+	 */
+	private static function sync_gateway_enabled_list( array $selected_ids ): void {
+		self::sync_enabled_list( 'gateway_enabled_list', array_values( self::PAYMENT_GATEWAY_IDS ), $selected_ids );
+	}
+
+	/**
+	 * Keep YS CART's canonical shipping visibility list in sync when it exists.
+	 *
+	 * @param array<int,string> $selected_ids
+	 */
+	private static function sync_shipping_enabled_list( array $selected_ids ): void {
+		self::sync_enabled_list( 'ys_ec_shipping_enabled_list', array_values( self::SHIPPING_METHOD_IDS ), $selected_ids );
+	}
+
+	/**
+	 * @param array<int,string> $owned_ids
+	 * @param array<int,string> $selected_ids
+	 */
+	private static function sync_enabled_list( string $setting_key, array $owned_ids, array $selected_ids ): void {
+		$raw = (string) Settings::get( $setting_key, '' );
+		if ( '' === $raw ) {
+			return;
+		}
+
+		$current = json_decode( $raw, true );
+		if ( ! is_array( $current ) ) {
+			return;
+		}
+
+		$owned_ids    = array_values( array_unique( array_map( 'sanitize_key', $owned_ids ) ) );
+		$selected_ids = array_values( array_unique( array_map( 'sanitize_key', $selected_ids ) ) );
+		$next         = [];
+
+		foreach ( $current as $id ) {
+			$id = sanitize_key( (string) $id );
+			if ( '' !== $id && ! in_array( $id, $owned_ids, true ) ) {
+				$next[] = $id;
+			}
+		}
+
+		foreach ( $selected_ids as $id ) {
+			if ( '' !== $id && ! in_array( $id, $next, true ) ) {
+				$next[] = $id;
+			}
+		}
+
+		Settings::update( $setting_key, wp_json_encode( $next ) );
+	}
+
 	public static function render_page(): void {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_die( esc_html__( 'Permission denied.', 'ys-cart-ecpay' ), 403 );
@@ -107,7 +194,7 @@ final class EcpaySettings {
 		$nonce_action = self::NONCE_ACTION;
 
 		if ( class_exists( YSAdminApp::class ) ) {
-			YSAdminApp::open( 'ECPay Settings', 'Payment / ECPay' );
+			YSAdminApp::open( '綠界金流設定', '金物流 / 綠界' );
 		}
 
 		$template = YS_CART_ECPAY_DIR . 'templates/admin/ecpay-settings.php';
@@ -142,17 +229,17 @@ final class EcpaySettings {
 				'store_map'        => rest_url( 'ys-ecommerce-headless/v1/stores/ecpay/map-url' ),
 			],
 			'payment_methods'       => [
-				'credit'  => 'Credit Card',
-				'atm'     => 'ATM',
-				'cvs'     => 'CVS Code',
-				'barcode' => 'Barcode',
+				'credit'  => '信用卡',
+				'atm'     => 'ATM 虛擬帳號',
+				'cvs'     => '超商代碼',
+				'barcode' => '超商條碼',
 			],
 			'shipping_methods'      => [
-				'ship_family'  => [ 'label' => 'FamilyMart', 'id' => 'ys_ec_ecpay_ship_family' ],
-				'ship_unimart' => [ 'label' => '7-ELEVEN', 'id' => 'ys_ec_ecpay_ship_unimart' ],
-				'ship_hilife'  => [ 'label' => 'Hi-Life', 'id' => 'ys_ec_ecpay_ship_hilife' ],
-				'ship_tcat'    => [ 'label' => 'TCAT', 'id' => 'ys_ec_ecpay_ship_tcat' ],
-				'ship_post'    => [ 'label' => 'Post', 'id' => 'ys_ec_ecpay_ship_post' ],
+				'ship_family'  => [ 'label' => '全家超商取貨', 'id' => 'ys_ec_ecpay_ship_family' ],
+				'ship_unimart' => [ 'label' => '7-ELEVEN 超商取貨', 'id' => 'ys_ec_ecpay_ship_unimart' ],
+				'ship_hilife'  => [ 'label' => '萊爾富超商取貨', 'id' => 'ys_ec_ecpay_ship_hilife' ],
+				'ship_tcat'    => [ 'label' => '黑貓宅配', 'id' => 'ys_ec_ecpay_ship_tcat' ],
+				'ship_post'    => [ 'label' => '郵局宅配', 'id' => 'ys_ec_ecpay_ship_post' ],
 			],
 		];
 
@@ -163,8 +250,17 @@ final class EcpaySettings {
 			$out[ $prefix . '_hash_iv_is_set' ] = '' !== (string) Settings::get( $keys['hash_iv'], '' );
 		}
 
+		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
+		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );
 		foreach ( Settings::METHOD_KEYS as $alias => $setting_key ) {
-			$out[ $alias . '_enabled' ] = '1' === (string) Settings::get( $setting_key, '0' );
+			$enabled = '1' === (string) Settings::get( $setting_key, '0' );
+			if ( isset( self::PAYMENT_GATEWAY_IDS[ $alias ] ) && null !== $gateway_enabled_list ) {
+				$enabled = $enabled && in_array( self::PAYMENT_GATEWAY_IDS[ $alias ], $gateway_enabled_list, true );
+			}
+			if ( isset( self::SHIPPING_METHOD_IDS[ $alias ] ) && null !== $shipping_enabled_list ) {
+				$enabled = $enabled && in_array( self::SHIPPING_METHOD_IDS[ $alias ], $shipping_enabled_list, true );
+			}
+			$out[ $alias . '_enabled' ] = $enabled;
 		}
 
 		foreach ( Settings::SENDER_KEYS as $alias => $setting_key ) {
@@ -176,6 +272,24 @@ final class EcpaySettings {
 
 	private static function normalize_tab( string $tab ): string {
 		return array_key_exists( $tab, self::TABS ) ? $tab : self::DEFAULT_TAB;
+	}
+
+	/**
+	 * @return array<int,string>|null
+	 */
+	private static function read_enabled_list( string $setting_key ): ?array {
+		$raw = (string) Settings::get( $setting_key, '' );
+		if ( '' === $raw ) {
+			return null;
+		}
+
+		$list = json_decode( $raw, true );
+		if ( ! is_array( $list ) ) {
+			return null;
+		}
+
+		$normalized = array_values( array_unique( array_filter( array_map( static fn( $id ): string => sanitize_key( (string) $id ), $list ) ) ) );
+		return [] === $normalized ? null : $normalized;
 	}
 }
 
