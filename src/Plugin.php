@@ -27,6 +27,7 @@ use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimart;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
+use YangSheep\YSCartEcpay\Support\Settings;
 
 final class Plugin {
 	private static ?self $instance = null;
@@ -73,7 +74,7 @@ final class Plugin {
 	}
 
 	public function register_gateways(): void {
-		if ( ! class_exists( YSGatewayRegistry::class ) ) {
+		if ( ! class_exists( YSGatewayRegistry::class ) || ! Settings::enabled() ) {
 			return;
 		}
 
@@ -84,15 +85,29 @@ final class Plugin {
 	}
 
 	public function register_shipping_methods(): void {
-		if ( ! class_exists( YSShippingRegistry::class ) ) {
+		if ( ! class_exists( YSShippingRegistry::class ) || ! Settings::enabled() ) {
 			return;
 		}
 
-		YSShippingRegistry::register( new EcpayShippingFamily() );
-		YSShippingRegistry::register( new EcpayShippingUnimart() );
-		YSShippingRegistry::register( new EcpayShippingHilife() );
-		YSShippingRegistry::register( new EcpayShippingTcat() );
-		YSShippingRegistry::register( new EcpayShippingPost() );
+		if ( Settings::shipping_enabled( 'ship_family' ) ) {
+			YSShippingRegistry::register( new EcpayShippingFamily() );
+		}
+
+		if ( Settings::shipping_enabled( 'ship_unimart' ) ) {
+			YSShippingRegistry::register( new EcpayShippingUnimart() );
+		}
+
+		if ( Settings::shipping_enabled( 'ship_hilife' ) ) {
+			YSShippingRegistry::register( new EcpayShippingHilife() );
+		}
+
+		if ( Settings::shipping_enabled( 'ship_tcat' ) ) {
+			YSShippingRegistry::register( new EcpayShippingTcat() );
+		}
+
+		if ( Settings::shipping_enabled( 'ship_post' ) ) {
+			YSShippingRegistry::register( new EcpayShippingPost() );
+		}
 	}
 
 	/**

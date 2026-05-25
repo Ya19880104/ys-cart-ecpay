@@ -17,13 +17,23 @@ final class EcpayStoreSelector {
 		'ys_ec_ecpay_ship_hilife'  => 'HILIFE',
 	];
 
+	private const METHOD_ALIASES = [
+		'ys_ec_ecpay_ship_family'  => 'ship_family',
+		'ys_ec_ecpay_ship_unimart' => 'ship_unimart',
+		'ys_ec_ecpay_ship_hilife'  => 'ship_hilife',
+	];
+
 	/**
 	 * Map callback: ecpay/store-callback; logistics notify: ecpay/logistics-notify.
 	 *
 	 * @return array{action_url:string,fields:array<string,string>,temp_id:string}|false
 	 */
 	public static function build_map_form_data( string $shipping_id, string $context = 'checkout', int $order_id = 0 ) {
-		if ( ! isset( self::SUBTYPES[ $shipping_id ] ) || ! Settings::has_logistics_credentials() ) {
+		$method_alias = self::METHOD_ALIASES[ $shipping_id ] ?? '';
+		if ( ! isset( self::SUBTYPES[ $shipping_id ] )
+			|| '' === $method_alias
+			|| ! Settings::shipping_enabled( $method_alias )
+			|| ! Settings::has_logistics_credentials() ) {
 			return false;
 		}
 
