@@ -1,9 +1,9 @@
 <?php
 defined( 'ABSPATH' ) || exit;
 
-$tab = (string) ( $settings['tab'] ?? 'api' );
-$tabs = (array) ( $settings['tabs'] ?? [] );
-$page_url = (string) ( $settings['page_url'] ?? admin_url( 'admin.php?page=ys-ecommerce-ecpay' ) );
+$tab                   = (string) ( $settings['tab'] ?? 'api' );
+$tabs                  = (array) ( $settings['tabs'] ?? [] );
+$page_url              = (string) ( $settings['page_url'] ?? admin_url( 'admin.php?page=ys-provider-ecpay' ) );
 $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_url( 'admin.php?page=ys-ec-shipping' ) );
 ?>
 <div class="ysca-page-root">
@@ -41,6 +41,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					</span>
 					<strong><?php esc_html_e( '啟用綠界 ECPay', 'ys-cart-ecpay' ); ?></strong>
 				</label>
+				<p class="description"><?php esc_html_e( '供應商啟用後，才會顯示並註冊對應的金流、物流方法。', 'ys-cart-ecpay' ); ?></p>
 			</div>
 		</div>
 
@@ -59,11 +60,11 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						</label>
 						<label class="ysca-field">
 							<span class="ysca-field__label"><?php esc_html_e( 'Hash Key', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_key_is_set'] ? __( '已儲存；留空表示沿用目前金鑰。', 'ys-cart-ecpay' ) : '' ); ?>">
+							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_key_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
 						<label class="ysca-field">
 							<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_iv_is_set'] ? __( '已儲存；留空表示沿用目前金鑰。', 'ys-cart-ecpay' ) : '' ); ?>">
+							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_iv_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
 					</div>
 				</div>
@@ -83,11 +84,11 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						</label>
 						<label class="ysca-field">
 							<span class="ysca-field__label"><?php esc_html_e( 'Hash Key', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_key_is_set'] ? __( '已儲存；留空表示沿用目前金鑰。', 'ys-cart-ecpay' ) : '' ); ?>">
+							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_key_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
 						<label class="ysca-field">
 							<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_iv_is_set'] ? __( '已儲存；留空表示沿用目前金鑰。', 'ys-cart-ecpay' ) : '' ); ?>">
+							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_iv_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
 					</div>
 				</div>
@@ -97,7 +98,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 		<?php if ( 'payment' === $tab ) : ?>
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '付款方式', 'ys-cart-ecpay' ); ?></h2>
+					<h2><?php esc_html_e( '金流方式', 'ys-cart-ecpay' ); ?></h2>
 					<?php foreach ( (array) $settings['payment_methods'] as $key => $label ) : ?>
 						<div class="ys-ec-form-group">
 							<label class="ysca-switch-label">
@@ -119,7 +120,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					<h2><?php esc_html_e( '寄件人資料', 'ys-cart-ecpay' ); ?></h2>
 					<div class="ysca-form-grid">
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件人姓名', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_sender_name" value="<?php echo esc_attr( $settings['sender_name'] ); ?>"></label>
-						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件人手機', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_sender_phone" value="<?php echo esc_attr( $settings['sender_phone'] ); ?>"></label>
+						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件人電話', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_sender_phone" value="<?php echo esc_attr( $settings['sender_phone'] ); ?>"></label>
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '郵遞區號', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--compact" type="text" name="ys_ec_ecpay_sender_zipcode" value="<?php echo esc_attr( $settings['sender_zipcode'] ); ?>"></label>
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件地址', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--lg" type="text" name="ys_ec_ecpay_sender_address" value="<?php echo esc_attr( $settings['sender_address'] ); ?>"></label>
 					</div>
@@ -142,8 +143,8 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						</div>
 					<?php endforeach; ?>
 					<p class="description ysca-mt-md">
-						<?php esc_html_e( '此處開關會同步 YS CART 物流啟用清單；排序、運費與免運門檻仍由 YS CART 物流設定管理。', 'ys-cart-ecpay' ); ?>
-						<a href="<?php echo esc_url( $shipping_settings_url ); ?>"><?php esc_html_e( '開啟物流設定', 'ys-cart-ecpay' ); ?></a>
+						<?php esc_html_e( '運費、免運門檻與排序由 YS CART 物流設定管理。', 'ys-cart-ecpay' ); ?>
+						<a href="<?php echo esc_url( $shipping_settings_url ); ?>"><?php esc_html_e( '前往物流設定', 'ys-cart-ecpay' ); ?></a>
 					</p>
 				</div>
 			</div>
@@ -152,7 +153,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 		<?php if ( 'diagnostics' === $tab ) : ?>
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '回傳網址', 'ys-cart-ecpay' ); ?></h2>
+					<h2><?php esc_html_e( '回呼網址', 'ys-cart-ecpay' ); ?></h2>
 					<table class="widefat striped">
 						<tbody>
 							<?php foreach ( (array) $settings['callback_urls'] as $label => $url ) : ?>
@@ -175,4 +176,3 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 		</div>
 	</form>
 </div>
-

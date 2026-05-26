@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Gateways\YSGatewayInterface;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 abstract class EcpayGatewayBase implements YSGatewayInterface {
@@ -14,7 +15,7 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	abstract protected function choose_payment(): string;
 
 	public function get_description(): string {
-		return '使用綠界 ECPay AIO 付款。';
+		return '使用綠界 ECPay AIO 金流付款。';
 	}
 
 	public function get_icon(): string {
@@ -22,6 +23,11 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	}
 
 	public function is_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' )
+			&& ! \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'payment', $this->get_id(), Plugin::manifest() ) ) {
+			return false;
+		}
+
 		return Settings::gateway_enabled( $this->gateway_key() ) && Settings::has_payment_credentials();
 	}
 
@@ -46,11 +52,11 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	public function process_payment( int $order_id ): array {
 		$order = YSOrder::find( $order_id );
 		if ( ! $order ) {
-			return [ 'success' => false, 'message' => __( 'Order not found.', 'ys-cart-ecpay' ) ];
+			return [ 'success' => false, 'message' => __( '找不到訂單。', 'ys-cart-ecpay' ) ];
 		}
 
 		if ( ! Settings::has_payment_credentials() ) {
-			return [ 'success' => false, 'message' => __( 'ECPay payment settings are incomplete.', 'ys-cart-ecpay' ) ];
+			return [ 'success' => false, 'message' => __( '綠界金流設定尚未完成。', 'ys-cart-ecpay' ) ];
 		}
 
 		$merchant_trade_no = $this->make_merchant_trade_no( $order_id );
@@ -82,7 +88,7 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 
 	public function process_refund( int $order_id, float $amount, string $reason = '', array $context = [] ): array {
 		unset( $order_id, $amount, $reason, $context );
-		return [ 'success' => false, 'message' => __( 'ECPay refunds are not implemented in this provider version.', 'ys-cart-ecpay' ) ];
+		return [ 'success' => false, 'message' => __( '此版本尚未提供綠界退款功能。', 'ys-cart-ecpay' ) ];
 	}
 
 	public function supports_token(): bool {
@@ -91,7 +97,7 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 
 	public function process_token_charge( int $subscription_id, float $override_amount = 0.0 ): array {
 		unset( $subscription_id, $override_amount );
-		return [ 'success' => false, 'message' => __( 'ECPay token charges are not supported.', 'ys-cart-ecpay' ) ];
+		return [ 'success' => false, 'message' => __( '綠界目前不支援訂閱扣款。', 'ys-cart-ecpay' ) ];
 	}
 
 	public function get_settings_fields(): array {

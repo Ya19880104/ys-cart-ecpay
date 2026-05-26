@@ -29,11 +29,13 @@ $admin     = v006_read('src/Admin/EcpaySettings.php');
 $shipping  = v006_read('src/Shipping/Ecpay/EcpayShipping.php');
 $logistics = v006_read('src/Api/EcpayLogisticsController.php');
 $template  = v006_read('templates/admin/ecpay-settings.php');
+$manifest  = v006_read('manifest.php');
 
 v006_check(
-    'provider admin_url stays a relative YS CART admin path',
-    false === strpos($plugin, "admin_url( 'admin.php?page=ys-ecommerce-ecpay' )")
-        && false !== strpos($plugin, "'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay'")
+    'provider admin page is manifest-owned and uses lifecycle slug',
+    false !== strpos($manifest, "'slug'                => 'ys-provider-ecpay'")
+        && false === strpos($plugin, "'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay'")
+        && false === strpos($plugin, 'ys_ec_admin_payment_menus')
 );
 
 v006_check(

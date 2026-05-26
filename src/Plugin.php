@@ -59,84 +59,83 @@ final class Plugin {
 		EcpaySettings::register();
 		EcpayPrintController::register();
 
+		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
 		add_action( 'ys_ec_register_gateways', [ $this, 'register_gateways' ] );
 		add_action( 'ys_ec_register_shipping_methods', [ $this, 'register_shipping_methods' ] );
-		add_filter( 'ys_ec_providers', [ $this, 'register_provider' ] );
-		add_action( 'ys_ec_admin_payment_menus', [ $this, 'register_admin_menu' ], 10, 2 );
 		add_action( 'ys_ec_register_admin_rest_routes', [ $this, 'register_admin_routes' ] );
 		add_action( 'ys_ec_register_storefront_routes', [ $this, 'register_storefront_routes' ] );
 		add_action( 'rest_api_init', [ $this, 'register_public_routes' ] );
 		add_filter( 'ys_ec_shipping_requester', [ $this, 'register_shipping_requester' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
-		add_filter( 'ys_ec_admin_nav_groups', [ $this, 'register_admin_nav_group' ] );
-		add_filter( 'ys_ec_external_admin_pages', [ $this, 'register_external_admin_page' ] );
-	}
-
-	public function register_gateways(): void {
-		if ( ! class_exists( YSGatewayRegistry::class ) || ! Settings::enabled() ) {
-			return;
-		}
-
-		YSGatewayRegistry::register( new EcpayCreditGateway() );
-		YSGatewayRegistry::register( new EcpayAtmGateway() );
-		YSGatewayRegistry::register( new EcpayCvsGateway() );
-		YSGatewayRegistry::register( new EcpayBarcodeGateway() );
-	}
-
-	public function register_shipping_methods(): void {
-		if ( ! class_exists( YSShippingRegistry::class ) || ! Settings::enabled() ) {
-			return;
-		}
-
-		if ( Settings::shipping_enabled( 'ship_family' ) ) {
-			YSShippingRegistry::register( new EcpayShippingFamily() );
-		}
-
-		if ( Settings::shipping_enabled( 'ship_unimart' ) ) {
-			YSShippingRegistry::register( new EcpayShippingUnimart() );
-		}
-
-		if ( Settings::shipping_enabled( 'ship_hilife' ) ) {
-			YSShippingRegistry::register( new EcpayShippingHilife() );
-		}
-
-		if ( Settings::shipping_enabled( 'ship_tcat' ) ) {
-			YSShippingRegistry::register( new EcpayShippingTcat() );
-		}
-
-		if ( Settings::shipping_enabled( 'ship_post' ) ) {
-			YSShippingRegistry::register( new EcpayShippingPost() );
-		}
 	}
 
 	/**
-	 * @param array<string,array<string,mixed>> $providers
-	 * @return array<string,array<string,mixed>>
+	 * @param array<int,array<string,mixed>> $manifests
+	 * @return array<int,array<string,mixed>>
 	 */
-	public function register_provider( array $providers ): array {
-		$providers['ecpay'] = [
-			'name'        => '綠界 ECPay',
-			'icon'        => 'dashicons-money-alt',
-			'description' => '綠界全方位金流與台灣本地物流，整合 YS CART 付款、超商取貨、宅配與物流狀態。',
-			'payment'     => [ '信用卡', 'ATM 虛擬帳號', '超商代碼', '超商條碼' ],
-			'shipping'    => [ '7-ELEVEN 超商取貨', '全家超商取貨', '萊爾富超商取貨', '黑貓宅配', '郵局宅配' ],
-			'setting_key' => 'ys_ec_ecpay_enabled',
-			'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay',
-		];
+	public function register_manifest( array $manifests ): array {
+		$manifests[] = self::manifest();
 
-		return $providers;
+		return $manifests;
 	}
 
-	public function register_admin_menu( string $parent_slug, string $capability ): void {
-		add_submenu_page(
-			$parent_slug,
-			'綠界金流設定',
-			'綠界',
-			$capability,
-			'ys-ecommerce-ecpay',
-			[ EcpaySettings::class, 'render_page' ]
-		);
+	/**
+	 * @return array<string,mixed>
+	 */
+	public static function manifest(): array {
+		static $manifest = null;
+
+		if ( null === $manifest ) {
+			$manifest = require YS_CART_ECPAY_DIR . 'manifest.php';
+		}
+
+		return $manifest;
+	}
+
+	public function register_gateways(): void {
+		if ( ! class_exists( YSGatewayRegistry::class ) || ! $this->is_payment_enabled() ) {
+			return;
+		}
+
+		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_credit' ) ) {
+			YSGatewayRegistry::register( new EcpayCreditGateway() );
+		}
+		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_atm' ) ) {
+			YSGatewayRegistry::register( new EcpayAtmGateway() );
+		}
+		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_cvs' ) ) {
+			YSGatewayRegistry::register( new EcpayCvsGateway() );
+		}
+		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_barcode' ) ) {
+			YSGatewayRegistry::register( new EcpayBarcodeGateway() );
+		}
+	}
+
+	public function register_shipping_methods(): void {
+		if ( ! class_exists( YSShippingRegistry::class ) || ! $this->is_shipping_enabled() ) {
+			return;
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_family' ) ) {
+			YSShippingRegistry::register( new EcpayShippingFamily() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_unimart' ) ) {
+			YSShippingRegistry::register( new EcpayShippingUnimart() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_hilife' ) ) {
+			YSShippingRegistry::register( new EcpayShippingHilife() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_tcat' ) ) {
+			YSShippingRegistry::register( new EcpayShippingTcat() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_post' ) ) {
+			YSShippingRegistry::register( new EcpayShippingPost() );
+		}
 	}
 
 	public function register_admin_routes( $registrar = null ): void {
@@ -144,6 +143,10 @@ final class Plugin {
 	}
 
 	public function register_storefront_routes( string $namespace ): void {
+		if ( ! $this->is_shipping_enabled() ) {
+			return;
+		}
+
 		register_rest_route(
 			$namespace,
 			'/stores/ecpay/map-url',
@@ -156,7 +159,14 @@ final class Plugin {
 	}
 
 	public function register_public_routes(): void {
-		EcpayPaymentController::register_routes();
+		if ( $this->is_payment_enabled() ) {
+			EcpayPaymentController::register_routes();
+		}
+
+		if ( ! $this->is_shipping_enabled() ) {
+			return;
+		}
+
 		EcpayLogisticsController::register_routes();
 
 		register_rest_route(
@@ -171,13 +181,21 @@ final class Plugin {
 	}
 
 	public function ecpay_map_url( \WP_REST_Request $request ): \WP_REST_Response {
+		if ( ! $this->is_shipping_enabled() ) {
+			return YSRestResponder::error( 'provider_disabled', '綠界物流尚未啟用。' );
+		}
+
 		$params      = YSRequestParser::params( $request );
 		$shipping_id = sanitize_text_field( $params['shipping_id'] ?? '' );
 		$context     = sanitize_key( $params['context'] ?? 'checkout' );
 		$order_id    = absint( $params['order_id'] ?? 0 );
 
 		if ( '' === $shipping_id ) {
-			return YSRestResponder::error( 'missing_shipping_id', 'Missing shipping method ID.' );
+			return YSRestResponder::error( 'missing_shipping_id', '缺少物流方式 ID。' );
+		}
+
+		if ( ! $this->is_method_enabled( 'shipping', $shipping_id ) ) {
+			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
 		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id );
@@ -185,11 +203,15 @@ final class Plugin {
 			return YSRestResponder::success( 'map_url_ready', '', $result );
 		}
 
-		return YSRestResponder::error( 'map_url_failed', 'ECPay logistics settings are incomplete or unsupported.' );
+		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
 	}
 
 	public function register_shipping_requester( $requester, $method ) {
 		if ( null !== $requester ) {
+			return $requester;
+		}
+
+		if ( ! $this->is_shipping_enabled() ) {
 			return $requester;
 		}
 
@@ -205,6 +227,10 @@ final class Plugin {
 			return $adapter;
 		}
 
+		if ( ! $this->is_shipping_enabled() ) {
+			return $adapter;
+		}
+
 		if ( 'ecpay' === $provider_key ) {
 			return new EcpayShippingAdapter();
 		}
@@ -217,40 +243,65 @@ final class Plugin {
 	 * @return array<string,string>
 	 */
 	public function register_shipping_provider_label( array $labels ): array {
+		if ( ! $this->is_shipping_enabled() ) {
+			return $labels;
+		}
+
 		$labels['ecpay'] = 'ECPay';
 
 		return $labels;
 	}
 
-	/**
-	 * @param array<string,array<string,mixed>> $groups
-	 * @return array<string,array<string,mixed>>
-	 */
-	public function register_admin_nav_group( array $groups ): array {
-		if ( ! isset( $groups['providers'] ) || ! is_array( $groups['providers'] ) ) {
-			$groups['providers'] = [
-				'label' => 'Payment / Logistics',
-				'icon'  => 'dashicons-store',
-				'slugs' => [],
-			];
+	private function is_provider_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_provider_enabled( 'ys_ecpay', self::manifest() );
 		}
 
-		if ( ! isset( $groups['providers']['slugs'] ) || ! is_array( $groups['providers']['slugs'] ) ) {
-			$groups['providers']['slugs'] = [];
-		}
-
-		$groups['providers']['slugs'][] = 'ys-ecommerce-ecpay';
-		$groups['providers']['slugs']   = array_values( array_unique( array_map( 'sanitize_key', $groups['providers']['slugs'] ) ) );
-
-		return $groups;
+		return Settings::enabled();
 	}
 
-	/**
-	 * @param array<int,string> $pages
-	 * @return array<int,string>
-	 */
-	public function register_external_admin_page( array $pages ): array {
-		$pages[] = 'ys-ecommerce-ecpay';
-		return array_values( array_unique( $pages ) );
+	private function is_payment_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_capability_enabled( 'ys_ecpay', 'payment', self::manifest() );
+		}
+
+		return $this->is_provider_enabled();
+	}
+
+	private function is_shipping_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_capability_enabled( 'ys_ecpay', 'shipping', self::manifest() );
+		}
+
+		return $this->is_provider_enabled();
+	}
+
+	private function is_method_enabled( string $domain, string $method_id ): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( $domain, $method_id, self::manifest() );
+		}
+
+		if ( 'payment' === $domain ) {
+			$legacy_map = [
+				'ys_ec_ecpay_credit'  => 'credit',
+				'ys_ec_ecpay_atm'     => 'atm',
+				'ys_ec_ecpay_cvs'     => 'cvs',
+				'ys_ec_ecpay_barcode' => 'barcode',
+			];
+			return isset( $legacy_map[ $method_id ] ) && Settings::gateway_enabled( $legacy_map[ $method_id ] );
+		}
+
+		if ( 'shipping' === $domain ) {
+			$legacy_map = [
+				'ys_ec_ecpay_ship_family'  => 'ship_family',
+				'ys_ec_ecpay_ship_unimart' => 'ship_unimart',
+				'ys_ec_ecpay_ship_hilife'  => 'ship_hilife',
+				'ys_ec_ecpay_ship_tcat'    => 'ship_tcat',
+				'ys_ec_ecpay_ship_post'    => 'ship_post',
+			];
+			return isset( $legacy_map[ $method_id ] ) && Settings::shipping_enabled( $legacy_map[ $method_id ] );
+		}
+
+		return false;
 	}
 }

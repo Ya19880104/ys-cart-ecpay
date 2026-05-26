@@ -37,6 +37,7 @@ function v009_check(string $label, bool $ok): void
 $plugin = v009_read('src/Plugin.php');
 $store  = v009_read('src/Shipping/Ecpay/EcpayStoreSelector.php');
 $main   = v009_read('ys-cart-ecpay.php');
+$manifest = v009_read('manifest.php');
 
 echo "## Provider registration gating contract\n";
 
@@ -46,30 +47,39 @@ v009_check(
 );
 
 v009_check(
-    'Gateways are not registered when ECPay provider is disabled',
-    (bool) preg_match('/function\s+register_gateways\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSGatewayRegistry::register).)*Settings::enabled\s*\(/s', $plugin)
-        && false !== strpos($plugin, '! Settings::enabled()')
+    'Provider card and settings page are manifest-first',
+    false !== strpos($plugin, "add_filter( 'ys_ec_provider_manifests'")
+        && false !== strpos($manifest, "'id'                 => 'ys_ecpay'")
+        && false !== strpos($manifest, "'slug'                => 'ys-provider-ecpay'")
+        && false === strpos($plugin, "ys_ec_providers")
+        && false === strpos($plugin, "ys_ec_admin_payment_menus")
 );
 
 v009_check(
-    'Shipping methods are not registered when ECPay provider is disabled',
-    (bool) preg_match('/function\s+register_shipping_methods\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSShippingRegistry::register).)*Settings::enabled\s*\(/s', $plugin)
-        && false !== strpos($plugin, '! Settings::enabled()')
+    'Gateways are not registered when ECPay payment capability is disabled',
+    (bool) preg_match('/function\s+register_gateways\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSGatewayRegistry::register).)*is_payment_enabled\s*\(/s', $plugin)
+        && false !== strpos($plugin, "is_capability_enabled( 'ys_ecpay', 'payment'")
 );
 
-$shipping_aliases = [
-    'ship_family'  => 'EcpayShippingFamily',
-    'ship_unimart' => 'EcpayShippingUnimart',
-    'ship_hilife'  => 'EcpayShippingHilife',
-    'ship_tcat'    => 'EcpayShippingTcat',
-    'ship_post'    => 'EcpayShippingPost',
+v009_check(
+    'Shipping methods are not registered when ECPay shipping capability is disabled',
+    (bool) preg_match('/function\s+register_shipping_methods\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSShippingRegistry::register).)*is_shipping_enabled\s*\(/s', $plugin)
+        && false !== strpos($plugin, "is_capability_enabled( 'ys_ecpay', 'shipping'")
+);
+
+$shipping_methods = [
+    'ys_ec_ecpay_ship_family'  => 'EcpayShippingFamily',
+    'ys_ec_ecpay_ship_unimart' => 'EcpayShippingUnimart',
+    'ys_ec_ecpay_ship_hilife'  => 'EcpayShippingHilife',
+    'ys_ec_ecpay_ship_tcat'    => 'EcpayShippingTcat',
+    'ys_ec_ecpay_ship_post'    => 'EcpayShippingPost',
 ];
 
-foreach ($shipping_aliases as $alias => $class_name) {
+foreach ($shipping_methods as $method_id => $class_name) {
     v009_check(
-        "{$class_name} registration requires its ECPay method switch",
+        "{$class_name} registration requires its ECPay lifecycle method switch",
         (bool) preg_match(
-            "/Settings::shipping_enabled\s*\(\s*'{$alias}'\s*\).*?YSShippingRegistry::register\s*\(\s*new\s+{$class_name}\s*\(/s",
+            "/is_method_enabled\s*\(\s*'shipping'\s*,\s*'{$method_id}'\s*\).*?YSShippingRegistry::register\s*\(\s*new\s+{$class_name}\s*\(/s",
             $plugin
         )
     );
@@ -78,13 +88,20 @@ foreach ($shipping_aliases as $alias => $class_name) {
 v009_check(
     'CVS map form data requires the declared ECPay shipping method switch',
     false !== strpos($store, 'METHOD_ALIASES')
+        && false !== strpos($store, "YSProviderLifecycleState::is_method_enabled( 'shipping', \$shipping_id")
         && false !== strpos($store, 'Settings::shipping_enabled( $method_alias )')
 );
 
 v009_check(
+    'Store map route fails closed by lifecycle method state',
+    false !== strpos($plugin, "is_method_enabled( 'shipping', \$shipping_id")
+        && false !== strpos($plugin, 'shipping_method_disabled')
+);
+
+v009_check(
     'Release version is bumped for provider registration gating fix',
-    false !== strpos($main, 'Version: 0.2.3')
-        && false !== strpos($main, "YS_CART_ECPAY_VERSION', '0.2.3'")
+    false !== strpos($main, 'Version: 0.2.4')
+        && false !== strpos($main, "YS_CART_ECPAY_VERSION', '0.2.4'")
 );
 
 echo "\nREGRESSION v009_provider_registration_gating_contract PASS={$pass} FAIL={$fail}\n";

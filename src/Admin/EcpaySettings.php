@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Admin;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Admin\YSAdminApp;
+use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpaySettings {
@@ -13,9 +14,9 @@ final class EcpaySettings {
 	private const DEFAULT_TAB = 'api';
 	private const TABS = [
 		'api'         => 'API 設定',
-		'payment'     => '付款方式',
+		'payment'     => '金流方式',
 		'shipping'    => '物流方式',
-		'diagnostics' => '診斷資訊',
+		'diagnostics' => '串接資訊',
 	];
 	private const PAYMENT_GATEWAY_IDS = [
 		'credit'  => 'ys_ec_ecpay_credit',
@@ -37,14 +38,16 @@ final class EcpaySettings {
 
 	public static function handle_save(): void {
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Permission denied.', 'ys-cart-ecpay' ), 403 );
+			wp_die( esc_html__( '權限不足。', 'ys-cart-ecpay' ), 403 );
 		}
 
 		check_admin_referer( self::NONCE_ACTION );
 
 		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_POST['ys_ec_ecpay_tab'] ?? self::DEFAULT_TAB ) ) ) );
 
-		Settings::update( Settings::ENABLED, isset( $_POST['ys_ec_ecpay_enabled'] ) ? '1' : '0' );
+		$provider_enabled = isset( $_POST['ys_ec_ecpay_enabled'] );
+		Settings::update( Settings::ENABLED, $provider_enabled ? '1' : '0' );
+		self::sync_provider_lifecycle( $provider_enabled );
 
 		if ( 'api' === $tab ) {
 			self::save_credentials_group( 'payment', Settings::PAYMENT_KEYS );
@@ -52,22 +55,26 @@ final class EcpaySettings {
 		}
 
 		if ( 'payment' === $tab ) {
-			$aliases = [ 'credit', 'atm', 'cvs', 'barcode' ];
+			$aliases      = [ 'credit', 'atm', 'cvs', 'barcode' ];
+			$selected_ids = self::selected_ids_from_post( $aliases, self::PAYMENT_GATEWAY_IDS );
 			self::save_method_switches( $aliases );
-			self::sync_gateway_enabled_list( self::selected_ids_from_post( $aliases, self::PAYMENT_GATEWAY_IDS ) );
+			self::sync_gateway_enabled_list( $selected_ids );
+			self::sync_lifecycle_methods( 'payment', self::PAYMENT_GATEWAY_IDS, $selected_ids );
 		}
 
 		if ( 'shipping' === $tab ) {
-			$aliases = [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ];
+			$aliases      = [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ];
+			$selected_ids = self::selected_ids_from_post( $aliases, self::SHIPPING_METHOD_IDS );
 			self::save_method_switches( $aliases );
-			self::sync_shipping_enabled_list( self::selected_ids_from_post( $aliases, self::SHIPPING_METHOD_IDS ) );
+			self::sync_shipping_enabled_list( $selected_ids );
+			self::sync_lifecycle_methods( 'shipping', self::SHIPPING_METHOD_IDS, $selected_ids );
 			self::save_sender_fields();
 		}
 
 		wp_safe_redirect(
 			add_query_arg(
 				[
-					'page'    => 'ys-ecommerce-ecpay',
+					'page'    => 'ys-provider-ecpay',
 					'tab'     => $tab,
 					'updated' => '1',
 				],
@@ -84,7 +91,7 @@ final class EcpaySettings {
 		Settings::update( $keys['test_mode'], isset( $_POST[ 'ys_ec_ecpay_' . $prefix . '_test_mode' ] ) ? '1' : '0' );
 		Settings::update(
 			$keys['merchant_id'],
-			sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $prefix . '_merchant_id' ] ?? '' ) ) )
+			sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $prefix . '_merchant_id'] ?? '' ) ) )
 		);
 
 		foreach ( [ 'hash_key', 'hash_iv' ] as $secret_key ) {
@@ -116,7 +123,7 @@ final class EcpaySettings {
 	}
 
 	/**
-	 * @param array<int,string> $aliases
+	 * @param array<int,string>    $aliases
 	 * @param array<string,string> $ids
 	 * @return array<int,string>
 	 */
@@ -133,7 +140,7 @@ final class EcpaySettings {
 	}
 
 	/**
-	 * Keep YS CART's canonical gateway visibility list in sync when it exists.
+	 * Keep YS CART's legacy gateway visibility list in sync when it exists.
 	 *
 	 * @param array<int,string> $selected_ids
 	 */
@@ -142,7 +149,7 @@ final class EcpaySettings {
 	}
 
 	/**
-	 * Keep YS CART's canonical shipping visibility list in sync when it exists.
+	 * Keep YS CART's legacy shipping visibility list in sync when it exists.
 	 *
 	 * @param array<int,string> $selected_ids
 	 */
@@ -187,21 +194,21 @@ final class EcpaySettings {
 
 	public static function render_page(): void {
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( esc_html__( 'Permission denied.', 'ys-cart-ecpay' ), 403 );
+			wp_die( esc_html__( '權限不足。', 'ys-cart-ecpay' ), 403 );
 		}
 
-		$settings = self::settings_for_render();
+		$settings     = self::settings_for_render();
 		$nonce_action = self::NONCE_ACTION;
 
 		if ( class_exists( YSAdminApp::class ) ) {
-			YSAdminApp::open( '綠界金流設定', '金物流 / 綠界' );
+			YSAdminApp::open( '綠界 ECPay 設定', '金物流 / 綠界' );
 		}
 
 		$template = YS_CART_ECPAY_DIR . 'templates/admin/ecpay-settings.php';
 		if ( is_readable( $template ) ) {
 			include $template;
 		} else {
-			echo '<div class="notice notice-error"><p>' . esc_html__( 'ECPay settings template is missing.', 'ys-cart-ecpay' ) . '</p></div>';
+			echo '<div class="notice notice-error"><p>' . esc_html__( '找不到綠界設定樣板。', 'ys-cart-ecpay' ) . '</p></div>';
 		}
 
 		if ( class_exists( YSAdminApp::class ) ) {
@@ -215,10 +222,10 @@ final class EcpaySettings {
 	public static function settings_for_render(): array {
 		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_GET['tab'] ?? self::DEFAULT_TAB ) ) ) );
 		$out = [
-			'enabled'               => '1' === (string) Settings::get( Settings::ENABLED, '0' ),
+			'enabled'               => self::is_provider_enabled(),
 			'tab'                   => $tab,
 			'tabs'                  => self::TABS,
-			'page_url'              => admin_url( 'admin.php?page=ys-ecommerce-ecpay' ),
+			'page_url'              => admin_url( 'admin.php?page=ys-provider-ecpay' ),
 			'shipping_settings_url' => admin_url( 'admin.php?page=ys-ec-shipping' ),
 			'callback_urls'         => [
 				'payment_notify'   => rest_url( 'ys-ecommerce/v1/ecpay/notify' ),
@@ -244,10 +251,10 @@ final class EcpaySettings {
 		];
 
 		foreach ( [ 'payment' => Settings::PAYMENT_KEYS, 'logistics' => Settings::LOGISTICS_KEYS ] as $prefix => $keys ) {
-			$out[ $prefix . '_test_mode' ] = '1' === (string) Settings::get( $keys['test_mode'], '1' );
-			$out[ $prefix . '_merchant_id' ] = (string) Settings::get( $keys['merchant_id'], '' );
+			$out[ $prefix . '_test_mode' ]       = '1' === (string) Settings::get( $keys['test_mode'], '1' );
+			$out[ $prefix . '_merchant_id' ]     = (string) Settings::get( $keys['merchant_id'], '' );
 			$out[ $prefix . '_hash_key_is_set' ] = '' !== (string) Settings::get( $keys['hash_key'], '' );
-			$out[ $prefix . '_hash_iv_is_set' ] = '' !== (string) Settings::get( $keys['hash_iv'], '' );
+			$out[ $prefix . '_hash_iv_is_set' ]  = '' !== (string) Settings::get( $keys['hash_iv'], '' );
 		}
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
@@ -274,6 +281,58 @@ final class EcpaySettings {
 		return array_key_exists( $tab, self::TABS ) ? $tab : self::DEFAULT_TAB;
 	}
 
+	private static function is_provider_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_provider_enabled( 'ys_ecpay', Plugin::manifest() );
+		}
+
+		return '1' === (string) Settings::get( Settings::ENABLED, '0' );
+	}
+
+	private static function sync_provider_lifecycle( bool $enabled ): void {
+		if ( ! class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return;
+		}
+
+		\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::set_provider_enabled( 'ys_ecpay', $enabled, Plugin::manifest() );
+	}
+
+	/**
+	 * @param array<string,string> $owned_ids_by_alias
+	 * @param array<int,string>   $selected_ids
+	 */
+	private static function sync_lifecycle_methods( string $domain, array $owned_ids_by_alias, array $selected_ids ): void {
+		if ( ! class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return;
+		}
+
+		$state        = \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::get_methods_state( $domain );
+		$owned_ids    = array_values( array_unique( array_map( 'sanitize_key', array_values( $owned_ids_by_alias ) ) ) );
+		$selected_ids = array_values( array_unique( array_map( 'sanitize_key', $selected_ids ) ) );
+		$order        = 0;
+
+		foreach ( $state as $row ) {
+			if ( is_array( $row ) && isset( $row['order'] ) ) {
+				$order = max( $order, (int) $row['order'] + 1 );
+			}
+		}
+
+		foreach ( $owned_ids as $method_id ) {
+			if ( '' === $method_id ) {
+				continue;
+			}
+
+			if ( ! isset( $state[ $method_id ] ) || ! is_array( $state[ $method_id ] ) ) {
+				$state[ $method_id ] = [ 'order' => $order++ ];
+			}
+
+			$state[ $method_id ]['enabled']     = in_array( $method_id, $selected_ids, true );
+			$state[ $method_id ]['provider_id'] = 'ys_ecpay';
+		}
+
+		\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::update_methods_state( $domain, $state );
+	}
+
 	/**
 	 * @return array<int,string>|null
 	 */
@@ -292,4 +351,3 @@ final class EcpaySettings {
 		return [] === $normalized ? null : $normalized;
 	}
 }
-

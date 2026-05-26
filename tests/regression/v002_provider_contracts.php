@@ -15,8 +15,9 @@ function read_required(string $path): string {
     return (string) file_get_contents($path);
 }
 
-$main   = read_required($root . '/ys-cart-ecpay.php');
-$plugin = read_required($root . '/src/Plugin.php');
+$main     = read_required($root . '/ys-cart-ecpay.php');
+$plugin   = read_required($root . '/src/Plugin.php');
+$manifest = read_required($root . '/manifest.php');
 
 $requiredMainStrings = [
     'Plugin Name: YS CART - ECPay',
@@ -34,15 +35,14 @@ foreach ($requiredMainStrings as $needle) {
 }
 
 $requiredPluginStrings = [
+    'ys_ec_provider_manifests',
+    'register_manifest',
     'ys_ec_register_gateways',
     'ys_ec_register_shipping_methods',
-    'ys_ec_providers',
-    'ys_ec_admin_payment_menus',
     'ys_ec_register_storefront_routes',
     'ys_ec_shipping_requester',
     'ys_ec_shipping_carrier_adapter',
     'ys_ec_shipping_provider_labels',
-    'ys_ec_external_admin_pages',
     'ys_ec_ecpay_credit',
     'ys_ec_ecpay_atm',
     'ys_ec_ecpay_cvs',
@@ -52,7 +52,6 @@ $requiredPluginStrings = [
     'ys_ec_ecpay_ship_hilife',
     'ys_ec_ecpay_ship_tcat',
     'ys_ec_ecpay_ship_post',
-    'ys-ecommerce-ecpay',
 ];
 
 foreach ($requiredPluginStrings as $needle) {
@@ -61,12 +60,12 @@ foreach ($requiredPluginStrings as $needle) {
     }
 }
 
-if (preg_match("/'admin_url'\s*=>\s*admin_url\s*\(/", $plugin)) {
-    fail_contract('Provider admin_url must be a relative wp-admin path because YS CART wraps it with admin_url().');
+if (false !== strpos($plugin, 'ys_ec_providers') || false !== strpos($plugin, 'ys_ec_admin_payment_menus')) {
+    fail_contract('ECPay must use manifest-first provider registration, not legacy provider/menu hooks.');
 }
 
-if (false === strpos($plugin, "'admin_url'   => 'admin.php?page=ys-ecommerce-ecpay'")) {
-    fail_contract('Provider admin_url must be admin.php?page=ys-ecommerce-ecpay.');
+if (false === strpos($manifest, "'slug'                => 'ys-provider-ecpay'")) {
+    fail_contract('Manifest admin page must use ys-provider-ecpay.');
 }
 
 echo "v002_provider_contracts passed\n";

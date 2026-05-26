@@ -26,20 +26,23 @@ function v007_check(string $label, bool $ok): void
     $fail++;
 }
 
-$plugin = file_get_contents($root . '/src/Plugin.php') ?: '';
+$plugin   = file_get_contents($root . '/src/Plugin.php') ?: '';
+$manifest = file_get_contents($root . '/manifest.php') ?: '';
 
 echo "## ECPay admin shell nav placement\n";
 
 v007_check(
-    'ECPay registers YS CART admin nav group placement',
-    false !== strpos($plugin, "ys_ec_admin_nav_groups")
-        && false !== strpos($plugin, 'register_admin_nav_group')
+    'ECPay exposes a manifest admin page for YS CART provider navigation',
+    false !== strpos($manifest, "'admin_page'")
+        && false !== strpos($manifest, "'slug'                => 'ys-provider-ecpay'")
+        && false !== strpos($manifest, "'render_callback'")
 );
 
 v007_check(
-    'ECPay settings slug is declared under the providers nav group',
-    preg_match("/\\\$groups\\['providers'\\]\\['slugs'\\]\\[\\]\\s*=\\s*'ys-ecommerce-ecpay'/", $plugin) === 1
-        && false !== strpos($plugin, 'array_values( array_unique')
+    'ECPay does not hard-code admin nav groups or legacy provider menu hooks',
+    false === strpos($plugin, 'ys_ec_admin_nav_groups')
+        && false === strpos($plugin, 'ys_ec_admin_payment_menus')
+        && false === strpos($plugin, 'add_submenu_page')
 );
 
 echo "\nREGRESSION v007_admin_shell_nav_contract PASS={$pass} FAIL={$fail}\n";

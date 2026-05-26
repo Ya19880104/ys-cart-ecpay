@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayStoreSelector {
@@ -32,7 +33,7 @@ final class EcpayStoreSelector {
 		$method_alias = self::METHOD_ALIASES[ $shipping_id ] ?? '';
 		if ( ! isset( self::SUBTYPES[ $shipping_id ] )
 			|| '' === $method_alias
-			|| ! Settings::shipping_enabled( $method_alias )
+			|| ! self::is_method_enabled( $shipping_id, $method_alias )
 			|| ! Settings::has_logistics_credentials() ) {
 			return false;
 		}
@@ -81,6 +82,12 @@ final class EcpayStoreSelector {
 			wp_die( 'Invalid map session.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
 
+		$shipping_id  = (string) ( $map_data['shipping_id'] ?? '' );
+		$method_alias = self::METHOD_ALIASES[ $shipping_id ] ?? '';
+		if ( '' === $shipping_id || '' === $method_alias || ! self::is_method_enabled( $shipping_id, $method_alias ) ) {
+			wp_die( 'Shipping method disabled.', 'ECPay Store Callback', [ 'response' => 403 ] );
+		}
+
 		if ( ! self::verify_map_payload( $params, $map_data ) ) {
 			wp_die( 'Invalid CheckMacValue.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
@@ -118,6 +125,14 @@ final class EcpayStoreSelector {
 			$out[ (string) $key ] = sanitize_text_field( wp_unslash( (string) $value ) );
 		}
 		return $out;
+	}
+
+	private static function is_method_enabled( string $shipping_id, string $method_alias ): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
+			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $shipping_id, Plugin::manifest() );
+		}
+
+		return Settings::shipping_enabled( $method_alias );
 	}
 
 	/**

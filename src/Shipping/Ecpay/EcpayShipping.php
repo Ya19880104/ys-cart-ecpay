@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Shipping\YSShippingInterface;
+use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 abstract class EcpayShipping implements YSShippingInterface {
@@ -17,6 +18,11 @@ abstract class EcpayShipping implements YSShippingInterface {
 	}
 
 	public function is_enabled(): bool {
+		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' )
+			&& ! \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $this->get_id(), Plugin::manifest() ) ) {
+			return false;
+		}
+
 		return Settings::shipping_enabled( $this->settings_key() ) && Settings::has_logistics_credentials();
 	}
 
