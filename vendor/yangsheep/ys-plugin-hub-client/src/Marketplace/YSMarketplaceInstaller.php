@@ -37,6 +37,14 @@ final class YSMarketplaceInstaller {
                 __( '無法取得下載連結', 'ys-plugin-hub-client' )
             );
         }
+        if ( ! self::is_allowed_download_url( $download_url ) ) {
+            YSHubClientLogRepo::error( 'install', sprintf( 'Blocked install package URL for %s.', $slug ), array( 'url' => $download_url ) );
+            return new \WP_Error(
+                'ys_hub_package_host_blocked',
+                __( 'The plugin package URL is not from an allowed YS Hub host.', 'ys-plugin-hub-client' )
+            );
+        }
+
 
         // 載入必要的 WP 類別（Plugin_Upgrader 依賴多個 admin includes）
         require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -106,6 +114,14 @@ final class YSMarketplaceInstaller {
                 __( '無法取得下載連結', 'ys-plugin-hub-client' )
             );
         }
+        if ( ! self::is_allowed_download_url( $download_url ) ) {
+            YSHubClientLogRepo::error( 'update', sprintf( 'Blocked update package URL for %s.', $slug ), array( 'url' => $download_url ) );
+            return new \WP_Error(
+                'ys_hub_package_host_blocked',
+                __( 'The plugin package URL is not from an allowed YS Hub host.', 'ys-plugin-hub-client' )
+            );
+        }
+
 
         require_once ABSPATH . 'wp-admin/includes/file.php';
         require_once ABSPATH . 'wp-admin/includes/misc.php';
@@ -198,5 +214,10 @@ final class YSMarketplaceInstaller {
         }
 
         return '';
+    }
+
+    private static function is_allowed_download_url( string $download_url ): bool {
+        return function_exists( 'ys_hub_client_is_allowed_package_url' )
+            && \ys_hub_client_is_allowed_package_url( $download_url );
     }
 }

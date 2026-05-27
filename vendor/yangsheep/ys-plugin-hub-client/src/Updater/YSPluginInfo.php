@@ -28,7 +28,7 @@ class YSPluginInfo {
      */
     public static function from_hub_response( array $plugin_data ): object {
         $info = new \stdClass();
-        $download_url = $plugin_data['package'] ?? $plugin_data['download_url'] ?? '';
+        $download_url = self::safe_download_url( $plugin_data );
 
         $info->name          = $plugin_data['name'] ?? '';
         $info->slug          = $plugin_data['slug'] ?? '';
@@ -73,7 +73,7 @@ class YSPluginInfo {
      */
     public static function to_update_object( array $plugin_data, string $plugin_file ): object {
         $update = new \stdClass();
-        $download_url = $plugin_data['package'] ?? $plugin_data['download_url'] ?? '';
+        $download_url = self::safe_download_url( $plugin_data );
 
         $update->id          = $plugin_data['slug'] ?? '';
         $update->slug        = $plugin_data['slug'] ?? '';
@@ -90,5 +90,17 @@ class YSPluginInfo {
         }
 
         return $update;
+    }
+
+    private static function safe_download_url( array $plugin_data ): string {
+        $download_url = (string) ( $plugin_data['package'] ?? $plugin_data['download_url'] ?? '' );
+        if ( '' === $download_url ) {
+            return '';
+        }
+
+        return function_exists( 'ys_hub_client_is_allowed_package_url' )
+            && \ys_hub_client_is_allowed_package_url( $download_url )
+                ? $download_url
+                : '';
     }
 }

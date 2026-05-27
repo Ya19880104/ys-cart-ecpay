@@ -39,17 +39,85 @@ define( 'YS_HUB_CLIENT_BASENAME', plugin_basename( __FILE__ ) );
 /**
  * Hub 伺服器 URL（寫死，不可變更）
  */
-$ys_hub_client_default_hub_url = 'https://yangsheep.com.tw';
-$ys_hub_client_hub_url         = defined( 'YS_CART_HUB_URL' )
-    ? (string) YS_CART_HUB_URL
-    : (string) get_option( 'ys_cart_hub_url', $ys_hub_client_default_hub_url );
-$ys_hub_client_hub_url         = rtrim( trim( $ys_hub_client_hub_url ), '/' );
+if ( ! function_exists( 'ys_hub_client_allowed_hosts' ) ) {
+    function ys_hub_client_allowed_hosts(): array {
+        $hosts = array( 'yangsheep.com.tw', '*.yangsheep.com.tw' );
+        if ( function_exists( 'apply_filters' ) ) {
+            $hosts = (array) apply_filters( 'ys_hub_client_allowed_hosts', $hosts );
+        }
 
-if ( '' === $ys_hub_client_hub_url || 1 !== preg_match( '#^https://#i', $ys_hub_client_hub_url ) ) {
-    $ys_hub_client_hub_url = $ys_hub_client_default_hub_url;
+        return array_values( array_filter( array_map(
+            static function ( $host ): string {
+                return strtolower( trim( (string) $host ) );
+            },
+            $hosts
+        ) ) );
+    }
 }
 
-define( 'YS_HUB_CLIENT_HUB_URL', $ys_hub_client_hub_url );
+if ( ! function_exists( 'ys_hub_client_url_part' ) ) {
+    function ys_hub_client_url_part( string $url, int $component ): string {
+        $value = function_exists( 'wp_parse_url' )
+            ? wp_parse_url( $url, $component )
+            : parse_url( $url, $component );
+
+        return strtolower( trim( (string) $value ) );
+    }
+}
+
+if ( ! function_exists( 'ys_hub_client_is_allowed_host' ) ) {
+    function ys_hub_client_is_allowed_host( string $host ): bool {
+        $host = strtolower( trim( $host ) );
+        if ( '' === $host ) {
+            return false;
+        }
+
+        foreach ( ys_hub_client_allowed_hosts() as $allowed ) {
+            if ( $host === $allowed ) {
+                return true;
+            }
+
+            if ( 0 === strpos( $allowed, '*.' ) ) {
+                $suffix = substr( $allowed, 1 );
+                if ( strlen( $host ) > strlen( $suffix ) && substr( $host, -strlen( $suffix ) ) === $suffix ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+}
+
+if ( ! function_exists( 'ys_hub_client_is_allowed_package_url' ) ) {
+    function ys_hub_client_is_allowed_package_url( string $url ): bool {
+        return 'https' === ys_hub_client_url_part( $url, PHP_URL_SCHEME )
+            && ys_hub_client_is_allowed_host( ys_hub_client_url_part( $url, PHP_URL_HOST ) );
+    }
+}
+
+if ( ! function_exists( 'ys_hub_client_sanitize_hub_url' ) ) {
+    function ys_hub_client_sanitize_hub_url( string $url, string $fallback ): string {
+        $url      = rtrim( trim( $url ), '/' );
+        $fallback = rtrim( trim( $fallback ), '/' );
+
+        if ( ! ys_hub_client_is_allowed_package_url( $url ) ) {
+            return $fallback;
+        }
+
+        return function_exists( 'esc_url_raw' ) ? rtrim( esc_url_raw( $url ), '/' ) : $url;
+    }
+}
+
+$ys_hub_client_default_hub_url = 'https://yangsheep.com.tw';
+$ys_hub_client_requested_url   = defined( 'YS_CART_HUB_URL' )
+    ? (string) YS_CART_HUB_URL
+    : (string) get_option( 'ys_cart_hub_url', $ys_hub_client_default_hub_url );
+
+define(
+    'YS_HUB_CLIENT_HUB_URL',
+    ys_hub_client_sanitize_hub_url( $ys_hub_client_requested_url, $ys_hub_client_default_hub_url )
+);
 
 /* ──────────────────────────────────────────────
  * Fallback PSR-4 Autoloader
