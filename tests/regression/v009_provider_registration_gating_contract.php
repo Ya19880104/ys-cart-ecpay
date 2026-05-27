@@ -100,8 +100,10 @@ v009_check(
 
 v009_check(
     'Release version is bumped for provider registration gating fix',
-    false !== strpos($main, 'Version: 0.2.4')
-        && false !== strpos($main, "YS_CART_ECPAY_VERSION', '0.2.4'")
+    preg_match('/Version:\s*([0-9.]+)/', $main, $version_match)
+        && preg_match("/YS_CART_ECPAY_VERSION', '([0-9.]+)'/", $main, $constant_match)
+        && version_compare((string) ($version_match[1] ?? ''), '0.2.4', '>=')
+        && version_compare((string) ($constant_match[1] ?? ''), '0.2.4', '>=')
 );
 
 echo "\nREGRESSION v009_provider_registration_gating_contract PASS={$pass} FAIL={$fail}\n";
