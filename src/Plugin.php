@@ -57,7 +57,7 @@ final class Plugin {
 
 	public function init(): void {
 		EcpaySettings::register();
-		EcpayPrintController::register();
+		add_action( 'init', [ $this, 'sync_print_route' ], 20 );
 
 		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
 		add_action( 'ys_ec_register_gateways', [ $this, 'register_gateways' ] );
@@ -68,6 +68,15 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_requester', [ $this, 'register_shipping_requester' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
+	}
+
+	public function sync_print_route(): void {
+		if ( $this->has_enabled_shipping_methods() ) {
+			EcpayPrintController::register();
+			return;
+		}
+
+		EcpayPrintController::unregister();
 	}
 
 	/**
@@ -143,7 +152,7 @@ final class Plugin {
 	}
 
 	public function register_storefront_routes( string $namespace ): void {
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return;
 		}
 
@@ -159,11 +168,11 @@ final class Plugin {
 	}
 
 	public function register_public_routes(): void {
-		if ( $this->is_payment_enabled() ) {
+		if ( $this->has_enabled_payment_methods() ) {
 			EcpayPaymentController::register_routes();
 		}
 
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return;
 		}
 
@@ -211,7 +220,7 @@ final class Plugin {
 			return $requester;
 		}
 
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return $requester;
 		}
 
@@ -227,7 +236,7 @@ final class Plugin {
 			return $adapter;
 		}
 
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return $adapter;
 		}
 
@@ -243,7 +252,7 @@ final class Plugin {
 	 * @return array<string,string>
 	 */
 	public function register_shipping_provider_label( array $labels ): array {
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return $labels;
 		}
 
@@ -274,6 +283,34 @@ final class Plugin {
 		}
 
 		return $this->is_provider_enabled();
+	}
+
+	private function has_enabled_payment_methods(): bool {
+		if ( ! $this->is_payment_enabled() ) {
+			return false;
+		}
+
+		foreach ( self::REGISTERED_GATEWAY_IDS as $method_id ) {
+			if ( $this->is_method_enabled( 'payment', $method_id ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function has_enabled_shipping_methods(): bool {
+		if ( ! $this->is_shipping_enabled() ) {
+			return false;
+		}
+
+		foreach ( self::REGISTERED_SHIPPING_IDS as $method_id ) {
+			if ( $this->is_method_enabled( 'shipping', $method_id ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private function is_method_enabled( string $domain, string $method_id ): bool {

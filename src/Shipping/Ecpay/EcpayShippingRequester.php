@@ -173,6 +173,7 @@ final class EcpayShippingRequester {
 		set_transient( 'ys_ec_ecpay_print_' . $key, [
 			'api_url' => Settings::logistics_endpoint( '/helper/printTradeDocument' ),
 			'fields'  => $fields,
+			'method_id' => $this->method->get_id(),
 		], 10 * MINUTE_IN_SECONDS );
 
 		return add_query_arg(
