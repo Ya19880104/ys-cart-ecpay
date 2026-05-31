@@ -9,6 +9,12 @@ use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayPaymentClient {
+	private int $last_http_status = 0;
+
+	public function get_last_http_status(): int {
+		return $this->last_http_status;
+	}
+
 	/**
 	 * @param object $order
 	 * @return array{action_url:string,fields:array<string,string>}
@@ -47,6 +53,92 @@ final class EcpayPaymentClient {
 		];
 	}
 
+	/**
+	 * Query ECPay before YS CART times out a pending payment.
+	 *
+	 * @return array{success:bool,data:array<string,string>|null,message:string}
+	 */
+	public function query_trade( string $merchant_trade_no ): array {
+		$credentials = Settings::payment_credentials();
+		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
+			return [
+				'success' => false,
+				'data'    => null,
+				'message' => 'ECPay payment settings are incomplete.',
+			];
+		}
+
+		$fields = [
+			'MerchantID'      => $credentials['merchant_id'],
+			'MerchantTradeNo' => $merchant_trade_no,
+			'TimeStamp'       => (string) time(),
+			'PlatformID'      => '',
+		];
+		$fields['CheckMacValue'] = CheckMacValue::generate(
+			$fields,
+			$credentials['hash_key'],
+			$credentials['hash_iv'],
+			'sha256'
+		);
+
+		$response = wp_remote_post(
+			Settings::payment_query_endpoint(),
+			[
+				'timeout'     => 20,
+				'redirection' => 0,
+				'sslverify'   => true,
+				'headers'     => [ 'Content-Type' => 'application/x-www-form-urlencoded' ],
+				'body'        => http_build_query( $fields ),
+			]
+		);
+
+		if ( is_wp_error( $response ) ) {
+			$this->last_http_status = 0;
+			return [
+				'success' => false,
+				'data'    => null,
+				'message' => $response->get_error_message(),
+			];
+		}
+
+		$this->last_http_status = (int) wp_remote_retrieve_response_code( $response );
+		$raw                    = (string) wp_remote_retrieve_body( $response );
+		$data                   = [];
+		parse_str( $raw, $data );
+		$data = array_map( static fn ( mixed $value ): string => is_scalar( $value ) ? trim( (string) $value ) : '', $data );
+
+		if ( $this->last_http_status < 200 || $this->last_http_status >= 300 ) {
+			return [
+				'success' => false,
+				'data'    => $data,
+				'message' => 'ECPay query request failed.',
+			];
+		}
+
+		if ( isset( $data['CheckMacValue'] )
+			&& ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
+			return [
+				'success' => false,
+				'data'    => $data,
+				'message' => 'Invalid ECPay query CheckMacValue.',
+			];
+		}
+
+		if ( empty( $data['MerchantTradeNo'] ) && empty( $data['TradeStatus'] ) ) {
+			return [
+				'success' => false,
+				'data'    => $data,
+				'message' => (string) ( $data['RtnMsg'] ?? $data['Message'] ?? 'ECPay query returned no trade data.' ),
+			];
+		}
+
+		return [
+			'success' => true,
+			'data'    => $data,
+			'message' => '',
+		];
+	}
+
 	private function clean_item_name( object $order ): string {
 		$base = 'YS CART Order ' . (string) ( $order->order_number ?? $order->id ?? '' );
 		$base = wp_strip_all_tags( $base );
@@ -56,4 +148,3 @@ final class EcpayPaymentClient {
 		return '' !== trim( $base ) ? $base : 'YS CART Order';
 	}
 }
-

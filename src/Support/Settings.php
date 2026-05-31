@@ -114,6 +114,13 @@ final class Settings {
 			: 'https://payment.ecpay.com.tw/Cashier/AioCheckOut/V5';
 	}
 
+	public static function payment_query_endpoint(): string {
+		$credentials = self::payment_credentials();
+		return $credentials['test_mode']
+			? 'https://payment-stage.ecpay.com.tw/Cashier/QueryTradeInfo/V5'
+			: 'https://payment.ecpay.com.tw/Cashier/QueryTradeInfo/V5';
+	}
+
 	public static function logistics_endpoint( string $path = '' ): string {
 		$credentials = self::logistics_credentials();
 		$base = $credentials['test_mode']

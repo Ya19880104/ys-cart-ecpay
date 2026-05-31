@@ -18,6 +18,7 @@ use YangSheep\YSCartEcpay\Payment\EcpayAtmGateway;
 use YangSheep\YSCartEcpay\Payment\EcpayBarcodeGateway;
 use YangSheep\YSCartEcpay\Payment\EcpayCreditGateway;
 use YangSheep\YSCartEcpay\Payment\EcpayCvsGateway;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamily;
@@ -64,6 +65,7 @@ final class Plugin {
 		add_action( 'ys_ec_register_shipping_methods', [ $this, 'register_shipping_methods' ] );
 		add_action( 'ys_ec_register_admin_rest_routes', [ $this, 'register_admin_routes' ] );
 		add_action( 'ys_ec_register_storefront_routes', [ $this, 'register_storefront_routes' ] );
+		add_action( 'ys_ec_register_payment_reconcilers', [ $this, 'register_payment_reconcilers' ] );
 		add_action( 'rest_api_init', [ $this, 'register_public_routes' ] );
 		add_filter( 'ys_ec_shipping_requester', [ $this, 'register_shipping_requester' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
@@ -283,6 +285,18 @@ final class Plugin {
 		}
 
 		return $this->is_provider_enabled();
+	}
+
+	public function register_payment_reconcilers( $registry ): void {
+		if ( ! $this->has_enabled_payment_methods()
+			|| ! Settings::has_payment_credentials()
+			|| ! is_object( $registry )
+			|| ! method_exists( $registry, 'register' )
+			|| ! interface_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentReconcilerInterface' ) ) {
+			return;
+		}
+
+		$registry->register( new EcpayPaymentReconciler() );
 	}
 
 	private function has_enabled_payment_methods(): bool {
