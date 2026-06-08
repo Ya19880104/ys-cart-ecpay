@@ -86,11 +86,11 @@ return [
 		'icon'                => 'dashicons-money-alt',
 	],
 	'callback_routes'    => [
-		'payment_notify'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/notify', 'methods' => [ 'POST' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
-		'payment_info'     => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/payment-info', 'methods' => [ 'POST' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
-		'payment_return'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/return', 'methods' => [ 'GET', 'POST' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
-		'logistics_notify' => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/logistics-notify', 'methods' => [ 'POST' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
-		'store_callback'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/store-callback', 'methods' => [ 'POST' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
+		'payment_notify'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/notify', 'methods' => [ 'POST' ], 'permission_callback' => [ \YangSheep\YSCartEcpay\Api\EcpayPaymentController::class, 'notify_permission' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
+		'payment_info'     => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/payment-info', 'methods' => [ 'POST' ], 'permission_callback' => [ \YangSheep\YSCartEcpay\Api\EcpayPaymentController::class, 'payment_info_permission' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
+		'payment_return'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/return', 'methods' => [ 'GET', 'POST' ], 'permission_callback' => [ \YangSheep\YSCartEcpay\Api\EcpayPaymentController::class, 'return_permission' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
+		'logistics_notify' => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/logistics-notify', 'methods' => [ 'POST' ], 'permission_callback' => [ \YangSheep\YSCartEcpay\Api\EcpayLogisticsController::class, 'notify_permission' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
+		'store_callback'   => [ 'namespace' => 'ys-ecommerce/v1', 'route' => '/ecpay/store-callback', 'methods' => [ 'POST' ], 'permission_callback' => [ \YangSheep\YSCartEcpay\Plugin::class, 'store_callback_permission' ], 'signature_scheme' => 'ecpay_check_mac_value' ],
 	],
 	'allowed_hosts'      => [
 		'payment-stage.ecpay.com.tw',

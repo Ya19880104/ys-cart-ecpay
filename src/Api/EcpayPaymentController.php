@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\Settings;
@@ -18,20 +19,54 @@ final class EcpayPaymentController {
 		register_rest_route( 'ys-ecommerce/v1', '/ecpay/notify', [
 			'methods'             => 'POST',
 			'callback'            => [ $controller, 'notify' ],
-			'permission_callback' => '__return_true',
+			'permission_callback' => [ self::class, 'notify_permission' ],
 		] );
 
 		register_rest_route( 'ys-ecommerce/v1', '/ecpay/payment-info', [
 			'methods'             => 'POST',
 			'callback'            => [ $controller, 'payment_info' ],
-			'permission_callback' => '__return_true',
+			'permission_callback' => [ self::class, 'payment_info_permission' ],
 		] );
 
 		register_rest_route( 'ys-ecommerce/v1', '/ecpay/return', [
 			'methods'             => [ 'GET', 'POST' ],
 			'callback'            => [ $controller, 'return_page' ],
-			'permission_callback' => '__return_true',
+			'permission_callback' => [ self::class, 'return_permission' ],
 		] );
+	}
+
+	public static function notify_permission( \WP_REST_Request $request ) {
+		return self::inbound_permission( 'ecpay_notify', [
+			'body_max_bytes' => 65536,
+			'rate_limit'     => [ 300, 60 ],
+			'allowed_types'  => [ 'application/x-www-form-urlencoded' ],
+		], $request );
+	}
+
+	public static function payment_info_permission( \WP_REST_Request $request ) {
+		return self::inbound_permission( 'ecpay_payment_info', [
+			'body_max_bytes' => 65536,
+			'rate_limit'     => [ 300, 60 ],
+			'allowed_types'  => [ 'application/x-www-form-urlencoded' ],
+		], $request );
+	}
+
+	public static function return_permission( \WP_REST_Request $request ) {
+		return self::inbound_permission( 'ecpay_return', [
+			'body_max_bytes' => 65536,
+			'rate_limit'     => [ 600, 60 ],
+			'allowed_types'  => [],
+			'verify_ip'      => false,
+		], $request );
+	}
+
+	private static function inbound_permission( string $context, array $opts, \WP_REST_Request $request ) {
+		if ( ! class_exists( YSInboundPermission::class ) ) {
+			return true;
+		}
+
+		$callback = YSInboundPermission::build( $context, $opts );
+		return $callback( $request );
 	}
 
 	public function notify( \WP_REST_Request $request ): void {

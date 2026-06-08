@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Api;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\Settings;
@@ -16,8 +17,21 @@ final class EcpayLogisticsController {
 		register_rest_route( 'ys-ecommerce/v1', '/ecpay/logistics-notify', [
 			'methods'             => 'POST',
 			'callback'            => [ $controller, 'notify' ],
-			'permission_callback' => '__return_true',
+			'permission_callback' => [ self::class, 'notify_permission' ],
 		] );
+	}
+
+	public static function notify_permission( \WP_REST_Request $request ) {
+		if ( ! class_exists( YSInboundPermission::class ) ) {
+			return true;
+		}
+
+		$callback = YSInboundPermission::build( 'ecpay_logistics_notify', [
+			'body_max_bytes' => 65536,
+			'rate_limit'     => [ 300, 60 ],
+			'allowed_types'  => [ 'application/x-www-form-urlencoded' ],
+		] );
+		return $callback( $request );
 	}
 
 	public function notify( \WP_REST_Request $request ): void {
