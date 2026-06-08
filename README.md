@@ -34,6 +34,27 @@ Standalone ECPay provider plugin for YS CART.
 - Logistics notify: `/wp-json/ys-ecommerce/v1/ecpay/logistics-notify`
 - Store map form: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url`
 
+Payment notify, payment info, return, store callback, and logistics notify are
+provider-facing callback routes. Browser UI should request only the store-map
+form route when the customer needs convenience-store selection.
+
+## Headless Logistics
+
+For ECPay CVS shipping, request the store-map form with the selected shipping
+method ID:
+
+```json
+{
+  "shipping_id": "ys_ec_ecpay_ship_unimart"
+}
+```
+
+Submit the returned `action_url` and `fields` as a top-level browser form post
+or popup form post. Do not expose ECPay hash keys or callback verification logic
+to browser code.
+The bundled SDK exposes `YsCartEcpay.requestStoreMapForm(apiBase, shippingId)`
+for this request.
+
 ## Release
 
 ```bash

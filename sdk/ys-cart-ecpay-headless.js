@@ -1,6 +1,11 @@
 (function (global) {
   'use strict';
 
+  var ROUTES = {
+    storeMapUrl: '/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url',
+    storeCallback: '/wp-json/ys-ecommerce/v1/ecpay/store-callback'
+  };
+
   function postJson(url, payload) {
     return fetch(url, {
       method: 'POST',
@@ -9,6 +14,12 @@
       body: JSON.stringify(payload || {})
     }).then(function (res) {
       return res.json();
+    });
+  }
+
+  function requestStoreMapForm(apiBase, shippingId) {
+    return postJson(apiBase.replace(/\/$/, '') + ROUTES.storeMapUrl, {
+      shipping_id: shippingId
     });
   }
 
@@ -29,8 +40,9 @@
   }
 
   global.YsCartEcpay = {
+    routes: ROUTES,
+    requestStoreMapForm: requestStoreMapForm,
     requestMapForm: postJson,
     submitForm: submitForm
   };
 })(window);
-
