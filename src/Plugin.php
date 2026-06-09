@@ -215,6 +215,8 @@ final class Plugin {
 		$shipping_id = sanitize_text_field( $params['shipping_id'] ?? '' );
 		$context     = sanitize_key( $params['context'] ?? 'checkout' );
 		$order_id    = absint( $params['order_id'] ?? 0 );
+		$cart_scope  = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
+		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
 
 		if ( '' === $shipping_id ) {
 			return YSRestResponder::error( 'missing_shipping_id', '缺少物流方式 ID。' );
@@ -224,12 +226,21 @@ final class Plugin {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
-		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id );
+		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url );
 		if ( $result ) {
 			return YSRestResponder::success( 'map_url_ready', '', $result );
 		}
 
 		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
+	}
+
+	private static function sanitize_cart_scope( string $scope ): string {
+		$scope = sanitize_key( $scope );
+		if ( '' === $scope || ! preg_match( '/^[a-z0-9_]{1,32}$/', $scope ) ) {
+			return 'default';
+		}
+
+		return $scope;
 	}
 
 	public function register_shipping_requester( $requester, $method ) {

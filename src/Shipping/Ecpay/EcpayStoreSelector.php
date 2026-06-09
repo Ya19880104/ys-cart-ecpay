@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\Ecommerce\Services\Setup\YSPageResolver;
 
 final class EcpayStoreSelector {
 	private const MAP_PATH = '/Express/map';
@@ -29,7 +30,13 @@ final class EcpayStoreSelector {
 	 *
 	 * @return array{action_url:string,fields:array<string,string>,temp_id:string}|false
 	 */
-	public static function build_map_form_data( string $shipping_id, string $context = 'checkout', int $order_id = 0 ) {
+	public static function build_map_form_data(
+		string $shipping_id,
+		string $context = 'checkout',
+		int $order_id = 0,
+		string $cart_scope = 'default',
+		string $return_url = ''
+	) {
 		$method_alias = self::METHOD_ALIASES[ $shipping_id ] ?? '';
 		if ( ! isset( self::SUBTYPES[ $shipping_id ] )
 			|| '' === $method_alias
@@ -38,6 +45,8 @@ final class EcpayStoreSelector {
 			return false;
 		}
 
+		$cart_scope        = self::sanitize_cart_scope( $cart_scope );
+		$return_url        = self::sanitize_return_url( $return_url, $cart_scope );
 		$credentials       = Settings::logistics_credentials();
 		$temp_id           = wp_generate_uuid4();
 		$merchant_trade_no = substr( preg_replace( '/[^A-Za-z0-9]/', '', 'YSMAP' . time() . wp_rand( 100, 999 ) ) ?: 'YSMAP', 0, 20 );
@@ -48,6 +57,8 @@ final class EcpayStoreSelector {
 			'user_id'           => get_current_user_id(),
 			'context'           => $context,
 			'order_id'          => $order_id,
+			'cart_scope'        => $cart_scope,
+			'return_url'         => $return_url,
 			'merchant_trade_no' => $merchant_trade_no,
 			'created_at'        => current_time( 'timestamp' ),
 		], 30 * MINUTE_IN_SECONDS );
@@ -108,6 +119,11 @@ final class EcpayStoreSelector {
 			'shipping_id'    => (string) ( $map_data['shipping_id'] ?? '' ),
 			'context'        => (string) ( $map_data['context'] ?? 'checkout' ),
 			'order_id'       => (int) ( $map_data['order_id'] ?? 0 ),
+			'cart_scope'     => self::sanitize_cart_scope( (string) ( $map_data['cart_scope'] ?? 'default' ) ),
+			'return_url'     => self::sanitize_return_url(
+				(string) ( $map_data['return_url'] ?? '' ),
+				(string) ( $map_data['cart_scope'] ?? 'default' )
+			),
 			'selected_at'    => current_time( 'mysql' ),
 		];
 
@@ -179,13 +195,49 @@ final class EcpayStoreSelector {
 		return CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 	}
 
+	private static function sanitize_cart_scope( string $scope ): string {
+		$scope = sanitize_key( $scope );
+		if ( '' === $scope || ! preg_match( '/^[a-z0-9_]{1,32}$/', $scope ) ) {
+			return 'default';
+		}
+
+		return $scope;
+	}
+
+	private static function sanitize_return_url( string $return_url, string $cart_scope = 'default' ): string {
+		$fallback = self::checkout_url();
+		if ( 'default' !== $cart_scope ) {
+			$fallback = add_query_arg( [ 'cart_scope' => $cart_scope ], $fallback );
+		}
+
+		$return_url = trim( $return_url );
+		if ( '' === $return_url ) {
+			return $fallback;
+		}
+
+		$return_url = wp_validate_redirect( esc_url_raw( $return_url ), $fallback );
+		if ( 'default' !== $cart_scope ) {
+			$return_url = add_query_arg( [ 'cart_scope' => $cart_scope ], $return_url );
+		}
+
+		return $return_url ?: $fallback;
+	}
+
+	private static function checkout_url(): string {
+		if ( class_exists( YSPageResolver::class ) ) {
+			return YSPageResolver::checkout_url();
+		}
+
+		return home_url( '/checkout/' );
+	}
+
 	/**
 	 * @param array<string,mixed> $store_info
 	 */
 	private static function render_callback_page( array $store_info ): void {
 		$json_data    = wp_json_encode( $store_info );
 		$origin       = esc_url( home_url() );
-		$checkout_url = esc_url( home_url( '/checkout/' ) );
+		$checkout_url = esc_url( $store_info['return_url'] ?? self::checkout_url() );
 		$context      = (string) ( $store_info['context'] ?? 'checkout' );
 
 		while ( ob_get_level() > 0 ) {
