@@ -57,6 +57,14 @@ v005_check(
 );
 
 v005_check(
+    false !== strpos($selector, 'validate_map_owner')
+    && false !== strpos($selector, 'get_current_user_id()')
+    && false !== strpos($selector, "map_data['user_id']")
+    && false !== strpos($selector, 'Invalid map session owner.'),
+    'store callback must reject logged-in user mismatch for transient-bound map sessions'
+);
+
+v005_check(
     false !== strpos($plugin, 'EcpayPrintController::register()'),
     'plugin must register ECPay print controller'
 );
@@ -69,4 +77,3 @@ v005_check(
 );
 
 echo "v005_review_security_contracts passed\n";
-

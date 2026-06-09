@@ -82,6 +82,10 @@ final class EcpayStoreSelector {
 			wp_die( 'Invalid map session.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
 
+		if ( ! self::validate_map_owner( $map_data ) ) {
+			wp_die( 'Invalid map session owner.', 'ECPay Store Callback', [ 'response' => 403 ] );
+		}
+
 		$shipping_id  = (string) ( $map_data['shipping_id'] ?? '' );
 		$method_alias = self::METHOD_ALIASES[ $shipping_id ] ?? '';
 		if ( '' === $shipping_id || '' === $method_alias || ! self::is_method_enabled( $shipping_id, $method_alias ) ) {
@@ -133,6 +137,17 @@ final class EcpayStoreSelector {
 		}
 
 		return Settings::shipping_enabled( $method_alias );
+	}
+
+	private static function validate_map_owner( array $map_data ): bool {
+		$stored_user_id  = (int) ( $map_data['user_id'] ?? 0 );
+		$current_user_id = get_current_user_id();
+
+		if ( $stored_user_id <= 0 || $current_user_id <= 0 ) {
+			return true;
+		}
+
+		return $stored_user_id === $current_user_id;
 	}
 
 	/**
