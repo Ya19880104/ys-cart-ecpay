@@ -69,6 +69,9 @@ final class EcpayPaymentReconciler implements YSPaymentReconcilerInterface {
 		$detail = [
 			'payment_type'     => (string) ( $params['PaymentType'] ?? '' ),
 			'trade_status'     => (string) ( $params['TradeStatus'] ?? '' ),
+			// 補單路徑也帶回金額（綠界 QueryTradeInfo 回應含 TradeAmt），讓核心金額守衛能
+			// 嚴格核對，與 notify controller 層及 JKOPay／NewebPay 對帳路徑一致（縱深防禦）。
+			'paid_amount'      => isset( $params['TradeAmt'] ) && is_numeric( $params['TradeAmt'] ) ? (float) $params['TradeAmt'] : 0.0,
 			'trade_no'         => (string) ( $params['TradeNo'] ?? '' ),
 			'gateway_trade_no' => (string) ( $params['TradeNo'] ?? '' ),
 			'mer_trade_no'     => (string) ( $params['MerchantTradeNo'] ?? '' ),

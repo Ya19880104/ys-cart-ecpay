@@ -85,5 +85,10 @@ v011_check(
         && version_compare((string) ($constant_match[1] ?? ''), '0.2.6', '>=')
 );
 
+v011_check(
+    'Reconcile path feeds paid_amount from TradeAmt for core amount verification',
+    1 === preg_match('/[\'"]paid_amount[\'"]\s*=>[\s\S]{0,80}TradeAmt/', $reconciler)
+);
+
 echo "\nREGRESSION v011_payment_reconciler_contract PASS={$pass} FAIL={$fail}\n";
 exit($fail > 0 ? 1 : 0);

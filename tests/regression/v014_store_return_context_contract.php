@@ -28,10 +28,10 @@ $main     = $read( 'ys-cart-ecpay.php' );
 $plugin   = $read( 'src/Plugin.php' );
 $selector = $read( 'src/Shipping/Ecpay/EcpayStoreSelector.php' );
 
+preg_match( "/YS_CART_ECPAY_VERSION', '([0-9.]+)'/", $main, $v014_ver );
 $check(
-	'version bumped for store return context fix',
-	strpos( $main, 'Version: 0.2.8' ) !== false
-		&& strpos( $main, "define( 'YS_CART_ECPAY_VERSION', '0.2.8' )" ) !== false
+	'version >= 0.2.8 for store return context fix',
+	version_compare( $v014_ver[1] ?? '0', '0.2.8', '>=' )
 );
 
 $check(
