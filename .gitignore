@@ -20,3 +20,5 @@
 /vendor/**/tests/
 /vendor/**/composer.json
 /vendor/**/composer.lock
+/tests
+/tests/
