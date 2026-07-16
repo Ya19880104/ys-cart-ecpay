@@ -121,6 +121,16 @@ final class Settings {
 			: 'https://payment.ecpay.com.tw/Cashier/QueryTradeInfo/V5';
 	}
 
+	/**
+	 * 信用卡請退款操作端點（CreditDetail/DoAction）— v0.3.0 信用卡退刷用。
+	 */
+	public static function payment_do_action_endpoint(): string {
+		$credentials = self::payment_credentials();
+		return $credentials['test_mode']
+			? 'https://payment-stage.ecpay.com.tw/CreditDetail/DoAction'
+			: 'https://payment.ecpay.com.tw/CreditDetail/DoAction';
+	}
+
 	public static function logistics_endpoint( string $path = '' ): string {
 		$credentials = self::logistics_credentials();
 		$base = $credentials['test_mode']
