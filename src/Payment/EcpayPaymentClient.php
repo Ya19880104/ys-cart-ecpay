@@ -140,19 +140,25 @@ final class EcpayPaymentClient {
 	}
 
 	/**
-	 * 信用卡退刷（CreditDetail/DoAction，Action=R）
+	 * 信用卡請退款操作（CreditDetail/DoAction）
+	 *
+	 * Action 語意（依交易關帳狀態，caller 決定）：
+	 *   - R＝退刷（已關帳/已請款交易）
+	 *   - N＝放棄請款（未關帳交易；僅能全額）
 	 *
 	 * @deferred-sandbox（v0.3.0）：payload 欄位與回應格式依綠界文件實作
 	 * （MerchantID/MerchantTradeNo/TradeNo/Action/TotalAmount + CheckMacValue，
 	 * 回應為 urlencoded、RtnCode=1 成功），尚未以綠界測試環境實際對拍——
-	 * 對拍通過前不得對外宣稱支援退刷。
+	 * 對拍通過前不得對外宣稱支援退刷；「未關帳」失敗碼清單見
+	 * docs/credit-refund-sandbox-gate.md G-2。
 	 *
 	 * @param string $merchant_trade_no 商店訂單編號（建單時的 MerchantTradeNo）
 	 * @param string $trade_no          綠界交易編號（付款回調存的 TradeNo）
-	 * @param float  $amount            退刷金額（元；綠界信用卡退刷以整數新台幣計）
+	 * @param float  $amount            金額（元；綠界信用卡以整數新台幣計）
+	 * @param string $action            'R'（退刷）或 'N'（放棄請款）
 	 * @return array{success:bool, data:?array, message:string}
 	 */
-	public function do_action_refund( string $merchant_trade_no, string $trade_no, float $amount ): array {
+	public function do_action_refund( string $merchant_trade_no, string $trade_no, float $amount, string $action = 'R' ): array {
 		$credentials = Settings::payment_credentials();
 		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
 			return [
@@ -162,7 +168,14 @@ final class EcpayPaymentClient {
 			];
 		}
 
-		// fail-closed 前置驗證：識別碼與金額缺一不可。
+		// fail-closed 前置驗證：識別碼、金額、動作缺一不可。
+		if ( ! in_array( $action, [ 'R', 'N' ], true ) ) {
+			return [
+				'success' => false,
+				'data'    => null,
+				'message' => '不支援的 DoAction 動作（僅允許 R／N）。',
+			];
+		}
 		if ( '' === $merchant_trade_no || '' === $trade_no ) {
 			return [
 				'success' => false,
@@ -183,7 +196,7 @@ final class EcpayPaymentClient {
 			'MerchantID'      => $credentials['merchant_id'],
 			'MerchantTradeNo' => $merchant_trade_no,
 			'TradeNo'         => $trade_no,
-			'Action'          => 'R',
+			'Action'          => $action,
 			'TotalAmount'     => (string) $total_amount,
 			'PlatformID'      => '',
 		];
