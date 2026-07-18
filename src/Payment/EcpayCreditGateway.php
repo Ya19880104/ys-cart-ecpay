@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Payment;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Utils\YSLogger;
 
 final class EcpayCreditGateway extends EcpayGatewayBase {
 	public function get_id(): string {
@@ -82,8 +83,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		}
 
 		// ── crash-safe 冪等（refund_request_id）──
+		// v0.3.0（CODEX 終審 F4）：request_id 為冪等防線的 key，**不得為空**——
+		// core YSRefundHandler 各路徑皆會提供；外部直呼缺 key 一律拒絕（fail-closed）。
 		$request_id = (string) ( $context['refund_request_id'] ?? '' );
-		$history    = is_array( $payment_detail['_ys_ecpay_refunds'] ?? null ) ? $payment_detail['_ys_ecpay_refunds'] : [];
+		if ( '' === $request_id ) {
+			return [ 'success' => false, 'message' => '缺少 refund_request_id（冪等鍵），已拒絕退款操作。' ];
+		}
+		$history = is_array( $payment_detail['_ys_ecpay_refunds'] ?? null ) ? $payment_detail['_ys_ecpay_refunds'] : [];
 
 		if ( '' !== $request_id && isset( $history[ $request_id ] ) ) {
 			$entry = $history[ $request_id ];
@@ -113,16 +119,16 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			}
 		}
 
-		$persist = function ( array $entry ) use ( $order_id, $request_id ): void {
-			if ( '' === $request_id ) {
-				return;
-			}
+		// v0.3.0（CODEX 終審 F4）：persist 回傳寫入結果——call site 必檢查；
+		// 寫失敗＝冪等紀錄與實況脫鉤，一律 CRITICAL log（凍結安全網＝送出前的
+		// pending 寫入已成功，後續寫失敗不會解除凍結）。
+		$persist = function ( array $entry ) use ( $order_id, $request_id ): bool {
 			$fresh  = YSOrder::find( $order_id );
 			$detail = json_decode( (string) ( $fresh->payment_detail ?? '{}' ), true ) ?: [];
 			$hist   = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-			$hist[ $request_id ]          = array_merge( $hist[ $request_id ] ?? [], $entry );
+			$hist[ $request_id ]          = array_merge( is_array( $hist[ $request_id ] ?? null ) ? $hist[ $request_id ] : [], $entry );
 			$detail['_ys_ecpay_refunds']  = $hist;
-			YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $detail ) ] );
+			return (bool) YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $detail ) ] );
 		};
 
 		$client  = new EcpayPaymentClient();
@@ -199,7 +205,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 			if ( ! empty( $result['indeterminate'] ) ) {
 				// 傳輸不確定：綠界端可能已生效——attempt 維持 pending，等人工核定。
-				$persist( [ 'executed' => implode( ',', $executed ), 'note' => '結果未明（' . (string) ( $result['message'] ?? '' ) . '）' ] );
+				if ( ! $persist( [ 'executed' => implode( ',', $executed ), 'note' => '結果未明（' . (string) ( $result['message'] ?? '' ) . '）' ] ) ) {
+					YSLogger::error( 'ecpay', 'CRITICAL: indeterminate note persist failed（凍結仍由送出前 pending 保證）', [
+						'order_id'   => $order_id,
+						'request_id' => $request_id,
+					] );
+				}
 				return [
 					'success' => false,
 					'message' => '退款請求結果未明（傳輸中斷），為避免重複退款已凍結此請求；請先於綠界後台確認實際狀態，再人工核定。',
@@ -208,12 +219,17 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 			if ( empty( $result['success'] ) ) {
 				// provider 明確拒絕：可安全重試。
-				$persist( [
+				if ( ! $persist( [
 					'status'   => 'failed',
 					'executed' => implode( ',', $executed ),
 					'rtn_code' => (string) ( $result['data']['RtnCode'] ?? '' ),
 					'rtn_msg'  => (string) ( $result['message'] ?? '' ),
-				] );
+				] ) ) {
+					YSLogger::error( 'ecpay', 'CRITICAL: failed-status persist failed（attempt 停留 pending＝凍結，需人工核定）', [
+						'order_id'   => $order_id,
+						'request_id' => $request_id,
+					] );
+				}
 				return [
 					'success' => false,
 					'message' => '綠界退款失敗（動作 ' . $action . '）：' . (string) ( $result['message'] ?? '未知錯誤' ),
@@ -222,18 +238,28 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		}
 
 		$done_trade_no = (string) ( $result['data']['TradeNo'] ?? $trade_no );
-		$persist( [
+		$done_note     = '';
+		if ( ! $persist( [
 			'status'   => 'done',
 			'executed' => implode( ',', $executed ),
 			'trade_no' => $done_trade_no,
-		] );
+		] ) ) {
+			// 金流已退成功但 done 標記寫失敗：attempt 停留 pending＝本單凍結——
+			// CRITICAL log＋訊息導引 CLI 核定（wp ys-ecpay refund-attempts resolve）。
+			YSLogger::error( 'ecpay', 'CRITICAL: done-status persist failed（本單退款凍結，需 CLI 核定）', [
+				'order_id'   => $order_id,
+				'request_id' => $request_id,
+				'trade_no'   => $done_trade_no,
+			] );
+			$done_note = '（⚠ 冪等紀錄寫入失敗：本單後續退款已凍結，請以 wp ys-ecpay refund-attempts resolve 核定）';
+		}
 
 		return [
 			'success'        => true,
 			'transaction_id' => $done_trade_no,
-			'message'        => 'authorized' === $close['state']
+			'message'        => ( 'authorized' === $close['state']
 				? '（未請款交易，以取消授權方式全額退款）'
-				: ( [ 'E', 'N' ] === $plan ? '（要關帳交易，已取消關帳並取消授權全額退款）' : '' ),
+				: ( [ 'E', 'N' ] === $plan ? '（要關帳交易，已取消關帳並取消授權全額退款）' : '' ) ) . $done_note,
 		];
 	}
 }

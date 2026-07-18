@@ -179,5 +179,26 @@ $assert(
 	'gate 改受控正式環境驗證（stage 不可用）；mock 定位為結構測試；標記改 @deferred-live-verification'
 );
 
+// ── F4（round-5）：人工核定入口 + persist 檢查 + request_id 必填 ──
+$cli_src    = $read( 'src/Cli/EcpayRefundAttemptCommand.php' );
+$plugin_src = $read( 'src/Plugin.php' );
+$assert(
+	str_contains( $cli_src, "add_command( 'ys-ecpay refund-attempts'" )
+	&& str_contains( $cli_src, "'pending' !== ( \$entry['status'] ?? '' )" )
+	&& str_contains( $cli_src, "in_array( \$mark, [ 'done', 'failed' ], true )" )
+	&& str_contains( $plugin_src, 'EcpayRefundAttemptCommand::register()' ),
+	'CLI 核定入口：wp ys-ecpay refund-attempts（CAS：僅 pending 可核定）並於 Plugin 註冊'
+);
+$assert(
+	str_contains( $credit, '缺少 refund_request_id（冪等鍵），已拒絕退款操作' ),
+	'refund_request_id 必填（缺 key 一律拒絕）'
+);
+$assert(
+	str_contains( $credit, 'function ( array $entry ) use ( $order_id, $request_id ): bool' )
+	&& 3 === substr_count( $credit, 'if ( ! $persist(' )
+	&& str_contains( $credit, 'done-status persist failed' ),
+	'persist 回傳檢查：三個 call site 全檢查、done 寫失敗 CRITICAL＋CLI 導引'
+);
+
 echo "\nv0.3.0 credit refund contract: {$pass} PASS / {$fail} FAIL\n";
 exit( $fail > 0 ? 1 : 0 );

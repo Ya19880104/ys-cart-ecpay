@@ -59,6 +59,7 @@ final class Plugin {
 
 	public function init(): void {
 		EcpaySettings::register();
+		\YangSheep\YSCartEcpay\Cli\EcpayRefundAttemptCommand::register();
 		add_action( 'init', [ $this, 'sync_print_route' ], 20 );
 
 		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
