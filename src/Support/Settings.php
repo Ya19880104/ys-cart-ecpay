@@ -12,10 +12,12 @@ final class Settings {
 	public const ENABLED = 'ys_ec_ecpay_enabled';
 
 	public const PAYMENT_KEYS = [
-		'test_mode'   => 'ys_ec_ecpay_payment_test_mode',
-		'merchant_id' => 'ys_ec_ecpay_payment_merchant_id',
-		'hash_key'    => 'ys_ec_ecpay_payment_hash_key',
-		'hash_iv'     => 'ys_ec_ecpay_payment_hash_iv',
+		'test_mode'         => 'ys_ec_ecpay_payment_test_mode',
+		'merchant_id'       => 'ys_ec_ecpay_payment_merchant_id',
+		'hash_key'          => 'ys_ec_ecpay_payment_hash_key',
+		'hash_iv'           => 'ys_ec_ecpay_payment_hash_iv',
+		// v0.3.0：信用卡明細查詢檢查碼（CreditDetail/QueryTrade 必填；綠界後台取得），加密儲存。
+		'credit_check_code' => 'ys_ec_ecpay_payment_credit_check_code',
 	];
 
 	public const LOGISTICS_KEYS = [
@@ -86,12 +88,19 @@ final class Settings {
 		$raw_key = (string) self::get( $keys['hash_key'], '' );
 		$raw_iv  = (string) self::get( $keys['hash_iv'], '' );
 
-		return [
+		$credentials = [
 			'test_mode'   => '1' === (string) self::get( $keys['test_mode'], '1' ),
 			'merchant_id' => (string) self::get( $keys['merchant_id'], '' ),
 			'hash_key'    => self::decrypt_secret( $raw_key ),
 			'hash_iv'     => self::decrypt_secret( $raw_iv ),
 		];
+
+		// 信用卡查詢檢查碼（僅 PAYMENT_KEYS 有；logistics 群組無此欄位）
+		if ( isset( $keys['credit_check_code'] ) ) {
+			$credentials['credit_check_code'] = self::decrypt_secret( (string) self::get( $keys['credit_check_code'], '' ) );
+		}
+
+		return $credentials;
 	}
 
 	public static function decrypt_secret( string $stored ): string {

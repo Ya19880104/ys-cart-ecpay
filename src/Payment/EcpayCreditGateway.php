@@ -95,14 +95,22 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 					'message'        => '（冪等重放：此退刷請求先前已成功）',
 				];
 			}
-			if ( 'pending' === ( $entry['status'] ?? '' ) ) {
-				// 前次送出後結果未明（可能已在綠界端生效）→ 禁止盲重送，防重複退刷。
+			// pending 由下方「全單凍結」統一擋（不分 request_id）。
+			// failed → 允許重試（往下走）。
+		}
+
+		// ── 全單凍結（CODEX 終審 F3）：本訂單只要存在**任何**結果未明（pending）的
+		// 退款 attempt——不論 request_id 是否相同（涵蓋 UI 逾時後換新 UUID、core pending
+		// TTL 過期換號等所有路徑）——一律拒絕任何新的款項操作，直到人工核定把該
+		// attempt 標為 done/failed。這是金流層的最後防線，不依賴上游 key 穩定性。
+		foreach ( $history as $frozen_id => $frozen_entry ) {
+			if ( 'pending' === ( $frozen_entry['status'] ?? '' ) ) {
 				return [
 					'success' => false,
-					'message' => '前次退刷請求結果未明，為避免重複退刷已拒絕重送；請先於綠界後台確認該筆交易，再以新請求處理。',
+					'message' => '此訂單有一筆結果未明的退款請求（' . sanitize_text_field( (string) $frozen_id ) . '）凍結中：'
+						. '為避免重複退款，已拒絕所有新的退款操作；請先於綠界後台確認該筆實際狀態並人工核定後再試。',
 				];
 			}
-			// failed → 允許重試（往下走）。
 		}
 
 		$persist = function ( array $entry ) use ( $order_id, $request_id ): void {
@@ -147,8 +155,9 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// ── 步驟 3：依官方狀態機決定動作序列 ──
 		switch ( $close['state'] ) {
 			case 'authorized':
+			case 'cancelled': // 操作取消 → 依官方流程執行 N（僅全額）
 				if ( ! $is_full ) {
-					return [ 'success' => false, 'message' => '此交易尚未請款（已授權），僅支援全額取消授權；請以全額退款處理。' ];
+					return [ 'success' => false, 'message' => '此交易尚未請款（已授權／前次操作已取消），僅支援全額取消授權；請以全額退款處理。' ];
 				}
 				$plan = [ 'N' ];
 				break;
@@ -162,6 +171,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		}
 
 		// ── 步驟 4：送出前持久化 pending（此後 crash／不確定都拒絕盲重送）──
+		// 🔴 寫入失敗＝冪等防線不存在 → 一律中止、不得送金流（CODEX 終審 F3）。
 		if ( '' !== $request_id ) {
 			$history[ $request_id ] = [
 				'status' => 'pending',
@@ -171,7 +181,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'time'   => current_time( 'mysql' ),
 			];
 			$payment_detail['_ys_ecpay_refunds'] = $history;
-			YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
+			$persisted = YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
+			if ( ! $persisted ) {
+				return [
+					'success' => false,
+					'message' => '退款請求無法持久化（冪等防線寫入失敗），已中止；未執行任何金流操作，請重試。',
+				];
+			}
 		}
 
 		// ── 步驟 5：依序執行動作；傳輸不確定＝維持 pending（禁重送），明確拒絕才標 failed ──

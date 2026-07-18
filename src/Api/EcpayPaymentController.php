@@ -88,6 +88,17 @@ final class EcpayPaymentController {
 
 		$detail = $this->detail_from_payload( $params );
 		if ( '1' === (string) ( $params['RtnCode'] ?? '' ) ) {
+			// v0.3.0：持久化信用卡授權單號 gwsr（NeedExtraPaidInfo=Y 回傳、已過
+			// CheckMacValue 驗證）——退款的關帳狀態查詢（CreditDetail/QueryTrade）依賴它。
+			$gwsr = sanitize_text_field( (string) ( $params['gwsr'] ?? '' ) );
+			if ( '' !== $gwsr ) {
+				$existing_detail         = json_decode( (string) ( $order->payment_detail ?? '{}' ), true ) ?: [];
+				$existing_detail['gwsr'] = $gwsr;
+				YSOrder::update( (int) $order->id, [
+					'payment_detail' => wp_json_encode( $existing_detail ),
+				] );
+			}
+
 			YSOrder::update( (int) $order->id, [
 				'gateway_trade_no' => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
 			] );

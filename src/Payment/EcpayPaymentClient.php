@@ -38,6 +38,9 @@ final class EcpayPaymentClient {
 			'ChoosePayment'     => $choose_payment,
 			'EncryptType'       => '1',
 			'PaymentInfoURL'    => rest_url( 'ys-ecommerce/v1/ecpay/payment-info' ),
+			// v0.3.0：要求綠界回傳額外付款資訊（含信用卡授權單號 gwsr）——
+			// 信用卡退款的關帳狀態查詢（CreditDetail/QueryTrade）以 gwsr 為 key。
+			'NeedExtraPaidInfo' => 'Y',
 		];
 
 		$fields['CheckMacValue'] = CheckMacValue::generate(
@@ -157,15 +160,21 @@ final class EcpayPaymentClient {
 		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => 'ECPay payment settings are incomplete.' ];
 		}
+
+		// CreditCheckCode 為官方必填（綠界後台「信用卡收單」查詢檢查碼）——未設定即無法查詢。
+		$credit_check_code = (string) ( $credentials['credit_check_code'] ?? '' );
+		if ( '' === $credit_check_code ) {
+			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '尚未設定「信用卡查詢檢查碼」（CreditCheckCode），請至綠界設定頁填入後再執行退款。' ];
+		}
 		if ( '' === $gwsr || $amount <= 0 ) {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '缺少授權單號（gwsr）或金額，無法查詢關帳狀態。' ];
 		}
 
 		$fields = [
-			'MerchantID'     => $credentials['merchant_id'],
-			'CreditRefundId' => $gwsr,
-			'CreditAmount'   => (string) $amount,
-			'CreditCheckCode' => '',
+			'MerchantID'      => $credentials['merchant_id'],
+			'CreditRefundId'  => $gwsr,
+			'CreditAmount'    => (string) $amount,
+			'CreditCheckCode' => $credit_check_code,
 		];
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' );
 
@@ -192,11 +201,31 @@ final class EcpayPaymentClient {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => 'ECPay credit query failed.' ];
 		}
 
-		$status_text = (string) ( $data['RtnValue']['status'] ?? $data['status'] ?? '' );
-		$state_map   = [
-			'已授權' => 'authorized',
-			'要關帳' => 'to_close',
-			'已關帳' => 'closed',
+		// 官方判定規則：以 close_data 中「最後一筆**正金額**紀錄」的 status 為準
+		// （「要關帳」等狀態位於 close_data；頂層 status 僅作 fallback）。
+		$rtn_value  = is_array( $data['RtnValue'] ?? null ) ? $data['RtnValue'] : $data;
+		$close_rows = is_array( $rtn_value['close_data'] ?? null ) ? $rtn_value['close_data'] : [];
+
+		$status_text = '';
+		foreach ( $close_rows as $row ) {
+			if ( ! is_array( $row ) ) {
+				continue;
+			}
+			$row_amount = (float) ( $row['amount'] ?? 0 );
+			$row_status = (string) ( $row['status'] ?? '' );
+			if ( $row_amount > 0 && '' !== $row_status ) {
+				$status_text = $row_status; // 迭代到最後一筆正金額紀錄
+			}
+		}
+		if ( '' === $status_text ) {
+			$status_text = (string) ( $rtn_value['status'] ?? '' );
+		}
+
+		$state_map = [
+			'已授權'  => 'authorized',
+			'要關帳'  => 'to_close',
+			'已關帳'  => 'closed',
+			'操作取消' => 'cancelled', // 前次操作已取消 → 可執行 N（放棄請款）
 		];
 		$state = $state_map[ $status_text ] ?? 'unknown';
 

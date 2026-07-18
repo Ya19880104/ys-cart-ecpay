@@ -44,11 +44,39 @@ $assert(
 
 $assert(
 	str_contains( $client, 'function query_credit_close_status' )
-	&& str_contains( $client, "'已授權' => 'authorized'" )
-	&& str_contains( $client, "'要關帳' => 'to_close'" )
-	&& str_contains( $client, "'已關帳' => 'closed'" )
+	&& str_contains( $client, "'已授權'  => 'authorized'" )
+	&& str_contains( $client, "'要關帳'  => 'to_close'" )
+	&& str_contains( $client, "'已關帳'  => 'closed'" )
+	&& str_contains( $client, "'操作取消' => 'cancelled'" )
 	&& str_contains( $client, "\$state_map[ \$status_text ] ?? 'unknown'" ),
-	'client 關帳狀態查詢：官方狀態映射＋未映射一律 unknown（fail-closed）'
+	'client 關帳狀態查詢：官方狀態映射（含操作取消）＋未映射一律 unknown（fail-closed）'
+);
+
+// F1（round-4）：查詢前置欄位齊備
+$controller_src = $read( 'src/Api/EcpayPaymentController.php' );
+$settings_admin = $read( 'src/Admin/EcpaySettings.php' );
+$template_src   = $read( 'templates/admin/ecpay-settings.php' );
+$assert(
+	str_contains( $client, "'CreditCheckCode' => \$credit_check_code" )
+	&& str_contains( $client, '尚未設定「信用卡查詢檢查碼」' )
+	&& str_contains( $settings, "'credit_check_code' => 'ys_ec_ecpay_payment_credit_check_code'" )
+	&& str_contains( $settings_admin, "'credit_check_code' ] as \$secret_key" )
+	&& str_contains( $template_src, 'ys_ec_ecpay_payment_credit_check_code' ),
+	'CreditCheckCode：必填檢查＋加密儲存設定鏈（Settings／save／UI 欄位）齊備'
+);
+$assert(
+	str_contains( $client, "'NeedExtraPaidInfo' => 'Y'" )
+	&& str_contains( $controller_src, "\$params['gwsr']" )
+	&& 1 === preg_match( '/CheckMacValue.*?gwsr/su', $controller_src ),
+	'建單送 NeedExtraPaidInfo=Y；notify 於 CheckMacValue 驗證後持久化 gwsr'
+);
+
+// F2（round-4）：close_data 最後一筆正金額判定
+$assert(
+	str_contains( $client, "close_data" )
+	&& str_contains( $client, '最後一筆' )
+	&& 1 === preg_match( '/foreach \( \$close_rows as \$row \).*?\$row_amount > 0/su', $client ),
+	'關帳狀態以 close_data 最後一筆正金額紀錄判定（頂層 status 僅 fallback）'
 );
 
 $assert(
@@ -75,11 +103,24 @@ $assert(
 
 $assert(
 	str_contains( $credit, "case 'authorized':" )
+	&& str_contains( $credit, "case 'cancelled':" )
 	&& str_contains( $credit, '僅支援全額取消授權' )
 	&& str_contains( $credit, "\$plan = [ 'N' ];" )
 	&& str_contains( $credit, "\$plan = \$is_full ? [ 'E', 'N' ] : [ 'R' ];" )
 	&& 1 === preg_match( '/case \'closed\':.*?\$plan = \[ \'R\' \];/su', $credit ),
-	'官方狀態機：已授權→N（部分拒絕）；要關帳全額→E,N／部分→R；已關帳→R'
+	'官方狀態機：已授權/操作取消→N（部分拒絕）；要關帳全額→E,N／部分→R；已關帳→R'
+);
+
+// F3（round-4）：全單凍結 + pending 寫入失敗中止
+$assert(
+	str_contains( $credit, 'foreach ( $history as $frozen_id => $frozen_entry )' )
+	&& str_contains( $credit, '拒絕所有新的退款操作' ),
+	'全單凍結：任何結果未明的 attempt（不分 request_id）→ 拒絕一切新退款操作'
+);
+$assert(
+	str_contains( $credit, '$persisted = YSOrder::update(' )
+	&& str_contains( $credit, '冪等防線寫入失敗' ),
+	'pending 持久化失敗 → 中止（未執行金流）'
 );
 
 $assert(
@@ -107,10 +148,9 @@ $assert(
 // ── crash-safe 冪等（沿前版） ──
 $assert(
 	str_contains( $credit, "\$context['refund_request_id']" )
-	&& str_contains( $credit, "'pending' === ( \$entry['status'] ?? '' )" )
 	&& str_contains( $credit, '冪等重放' )
-	&& str_contains( $credit, '拒絕重送' ),
-	'crash-safe 冪等：pending 拒盲重送、done 冪等重放、failed 可重試'
+	&& str_contains( $credit, '全單凍結」統一擋' ),
+	'crash-safe 冪等：done 冪等重放、pending 由全單凍結統一擋、failed 可重試'
 );
 
 // ── 能力宣告與金額/識別碼防護（沿前版） ──
