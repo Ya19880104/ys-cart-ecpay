@@ -33,27 +33,26 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	/**
-	 * 未關帳失敗碼（DoAction Action=R 對未關帳交易的回應碼）
-	 *
-	 * @deferred-sandbox：確切碼值須以綠界測試環境對拍鎖定
-	 * （docs/credit-refund-sandbox-gate.md G-2）。對拍前為空＝不會觸發 N fallback，
-	 * R 失敗一律回報失敗訊息（fail-closed，不誤送 N）。
-	 */
-	private const UNCLOSED_RTN_CODES = [];
-
-	/**
-	 * 信用卡退刷（CreditDetail/DoAction）
+	 * 信用卡退款（query-first 狀態機，CreditDetail/QueryTrade → DoAction）
 	 *
 	 * 僅信用卡 gateway 支援；ATM／超商依產品決策走人工退款（base 維持不支援）。
-	 * 設計要點（CODEX 終審修正）：
-	 *   1. **crash-safe 冪等**：以 core 傳入的 `context['refund_request_id']` 為 key，
-	 *      送出前將 attempt 持久化為 pending；同 key 已成功→冪等重放、pending（結果未明）
-	 *      →拒絕盲重送（人工至綠界後台確認）、failed→允許重試。
-	 *   2. **Action 分流**：先送 R（退刷）；若回應碼落在 UNCLOSED_RTN_CODES（未關帳）
-	 *      且為全額 → 改送 N（放棄請款）；部分金額＋未關帳 → 明確拒絕。
-	 *   3. 識別碼一律取自訂單付款紀錄；金額上限＝total－已退。
+	 * 設計要點（CODEX 終審 F2/F4 修正——依綠界官方流程）：
+	 *   1. **query-first**：先取 gwsr（付款紀錄，缺則 QueryTradeInfo 補查）→
+	 *      CreditDetail/QueryTrade 查關帳狀態 → 依官方表選動作：
+	 *        已授權（authorized）→ N（僅全額；部分明確拒絕）
+	 *        要關帳（to_close）＋全額 → E 之後接 N
+	 *        要關帳（to_close）＋部分 → R
+	 *        已關帳（closed）→ R
+	 *        unknown → 拒絕操作（fail-closed，不猜）
+	 *   2. **crash-safe 冪等**：以 core `context['refund_request_id']` 為 key；
+	 *      done→冪等重放、pending→拒絕盲重送、failed→允許重試。
+	 *   3. **傳輸不確定 ≠ 失敗**：DoAction 回 indeterminate（timeout／非 2xx／無 RtnCode）
+	 *      → attempt **維持 pending**（綠界端可能已生效，重試可能重複退款）；
+	 *      只有 provider 明確拒絕（RtnCode≠1）才標 failed 開放重試。
+	 *   4. 識別碼一律取自訂單付款紀錄；金額上限＝total－已退。
 	 *
-	 * @deferred-sandbox 綠界測試環境對拍前不得對外宣稱支援（gate 清單見 docs/credit-refund-sandbox-gate.md）。
+	 * @deferred-live-verification 驗證一律走受控正式商店小額實測（stage DoAction
+	 * 官方明載不可用）；gate 清單見 docs/credit-refund-sandbox-gate.md。
 	 */
 	public function process_refund( int $order_id, float $amount, string $reason = '', array $context = [] ): array {
 		unset( $reason );
@@ -106,17 +105,6 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// failed → 允許重試（往下走）。
 		}
 
-		// 送出前持久化 pending（送出後 crash，重來會看到 pending 而拒絕盲重送）。
-		if ( '' !== $request_id ) {
-			$history[ $request_id ] = [
-				'status' => 'pending',
-				'amount' => $amount,
-				'time'   => current_time( 'mysql' ),
-			];
-			$payment_detail['_ys_ecpay_refunds'] = $history;
-			YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
-		}
-
 		$persist = function ( array $entry ) use ( $order_id, $request_id ): void {
 			if ( '' === $request_id ) {
 				return;
@@ -129,49 +117,107 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $detail ) ] );
 		};
 
-		// ── Action 分流：先 R（退刷）──
-		$client = new EcpayPaymentClient();
-		$result = $client->do_action_refund( $merchant_trade_no, $trade_no, $amount, 'R' );
-		$action = 'R';
+		$client  = new EcpayPaymentClient();
+		$is_full = round( $amount, 2 ) >= round( $total, 2 );
 
-		// 未關帳 → 全額改送 N（放棄請款）；部分金額明確拒絕。
-		if ( empty( $result['success'] )
-			&& in_array( (string) ( $result['data']['RtnCode'] ?? '' ), self::UNCLOSED_RTN_CODES, true ) ) {
-			if ( round( $amount, 2 ) < round( $total, 2 ) ) {
-				$persist( [ 'status' => 'failed', 'action' => 'R', 'rtn_msg' => '未關帳交易不支援部分退刷' ] );
-				return [
-					'success' => false,
-					'message' => '此交易尚未關帳，不支援部分退刷；請待關帳後退刷，或以全額放棄請款處理。',
-				];
+		// ── 步驟 1：取得授權單號 gwsr（查詢關帳狀態的 key）──
+		// 付款紀錄優先；缺（歷史訂單）→ QueryTradeInfo 補查（回應含 gwsr）並回寫。
+		$gwsr = (string) ( $payment_detail['gwsr'] ?? $payment_detail['ecpay_gwsr'] ?? '' );
+		if ( '' === $gwsr ) {
+			$query = $client->query_trade( $merchant_trade_no );
+			$gwsr  = (string) ( $query['data']['gwsr'] ?? '' );
+			if ( '' !== $gwsr ) {
+				$payment_detail['gwsr'] = $gwsr;
+				YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
 			}
-			$action = 'N';
-			$result = $client->do_action_refund( $merchant_trade_no, $trade_no, $amount, 'N' );
+		}
+		if ( '' === $gwsr ) {
+			return [ 'success' => false, 'message' => '無法取得綠界授權單號（gwsr），無法判定關帳狀態；請於綠界後台人工處理退款。' ];
 		}
 
-		if ( empty( $result['success'] ) ) {
-			$persist( [
-				'status'   => 'failed',
-				'action'   => $action,
-				'rtn_code' => (string) ( $result['data']['RtnCode'] ?? '' ),
-				'rtn_msg'  => (string) ( $result['message'] ?? '' ),
-			] );
+		// ── 步驟 2：查關帳狀態（query-first；查詢失敗＝未動錢，可安全重試）──
+		$close = $client->query_credit_close_status( $gwsr, (int) round( $total ) );
+		if ( 'unknown' === ( $close['state'] ?? 'unknown' ) ) {
 			return [
 				'success' => false,
-				'message' => '綠界退刷失敗：' . (string) ( $result['message'] ?? '未知錯誤' ),
+				'message' => '無法確認交易關帳狀態（' . (string) ( $close['message'] ?? '' ) . '），已中止退款操作；請稍後重試或於綠界後台人工處理。',
 			];
+		}
+
+		// ── 步驟 3：依官方狀態機決定動作序列 ──
+		switch ( $close['state'] ) {
+			case 'authorized':
+				if ( ! $is_full ) {
+					return [ 'success' => false, 'message' => '此交易尚未請款（已授權），僅支援全額取消授權；請以全額退款處理。' ];
+				}
+				$plan = [ 'N' ];
+				break;
+			case 'to_close':
+				$plan = $is_full ? [ 'E', 'N' ] : [ 'R' ];
+				break;
+			case 'closed':
+			default:
+				$plan = [ 'R' ];
+				break;
+		}
+
+		// ── 步驟 4：送出前持久化 pending（此後 crash／不確定都拒絕盲重送）──
+		if ( '' !== $request_id ) {
+			$history[ $request_id ] = [
+				'status' => 'pending',
+				'amount' => $amount,
+				'state'  => (string) $close['state'],
+				'plan'   => implode( ',', $plan ),
+				'time'   => current_time( 'mysql' ),
+			];
+			$payment_detail['_ys_ecpay_refunds'] = $history;
+			YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
+		}
+
+		// ── 步驟 5：依序執行動作；傳輸不確定＝維持 pending（禁重送），明確拒絕才標 failed ──
+		$executed = [];
+		$result   = [ 'success' => false, 'indeterminate' => false, 'data' => null, 'message' => '' ];
+		foreach ( $plan as $action ) {
+			$result     = $client->do_action_refund( $merchant_trade_no, $trade_no, $amount, $action );
+			$executed[] = $action;
+
+			if ( ! empty( $result['indeterminate'] ) ) {
+				// 傳輸不確定：綠界端可能已生效——attempt 維持 pending，等人工核定。
+				$persist( [ 'executed' => implode( ',', $executed ), 'note' => '結果未明（' . (string) ( $result['message'] ?? '' ) . '）' ] );
+				return [
+					'success' => false,
+					'message' => '退款請求結果未明（傳輸中斷），為避免重複退款已凍結此請求；請先於綠界後台確認實際狀態，再人工核定。',
+				];
+			}
+
+			if ( empty( $result['success'] ) ) {
+				// provider 明確拒絕：可安全重試。
+				$persist( [
+					'status'   => 'failed',
+					'executed' => implode( ',', $executed ),
+					'rtn_code' => (string) ( $result['data']['RtnCode'] ?? '' ),
+					'rtn_msg'  => (string) ( $result['message'] ?? '' ),
+				] );
+				return [
+					'success' => false,
+					'message' => '綠界退款失敗（動作 ' . $action . '）：' . (string) ( $result['message'] ?? '未知錯誤' ),
+				];
+			}
 		}
 
 		$done_trade_no = (string) ( $result['data']['TradeNo'] ?? $trade_no );
 		$persist( [
 			'status'   => 'done',
-			'action'   => $action,
+			'executed' => implode( ',', $executed ),
 			'trade_no' => $done_trade_no,
 		] );
 
 		return [
 			'success'        => true,
 			'transaction_id' => $done_trade_no,
-			'message'        => 'N' === $action ? '（未關帳交易，以放棄請款方式全額退款）' : '',
+			'message'        => 'authorized' === $close['state']
+				? '（未請款交易，以取消授權方式全額退款）'
+				: ( [ 'E', 'N' ] === $plan ? '（要關帳交易，已取消關帳並取消授權全額退款）' : '' ),
 		];
 	}
 }

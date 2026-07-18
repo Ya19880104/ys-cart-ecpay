@@ -123,12 +123,26 @@ final class Settings {
 
 	/**
 	 * 信用卡請退款操作端點（CreditDetail/DoAction）— v0.3.0 信用卡退刷用。
+	 *
+	 * ⚠ 綠界官方明載：**測試環境（stage）因無實際授權，DoAction 不可用**——
+	 * stage URL 僅保留結構一致性；實際驗證一律走受控正式商店小額實測
+	 * （見 docs/credit-refund-sandbox-gate.md）。
 	 */
 	public static function payment_do_action_endpoint(): string {
 		$credentials = self::payment_credentials();
 		return $credentials['test_mode']
 			? 'https://payment-stage.ecpay.com.tw/CreditDetail/DoAction'
 			: 'https://payment.ecpay.com.tw/CreditDetail/DoAction';
+	}
+
+	/**
+	 * 信用卡交易關帳狀態查詢端點（CreditDetail/QueryTrade/V2）— query-first 退款分流用。
+	 */
+	public static function payment_credit_query_endpoint(): string {
+		$credentials = self::payment_credentials();
+		return $credentials['test_mode']
+			? 'https://payment-stage.ecpay.com.tw/CreditDetail/QueryTrade/V2'
+			: 'https://payment.ecpay.com.tw/CreditDetail/QueryTrade/V2';
 	}
 
 	public static function logistics_endpoint( string $path = '' ): string {
