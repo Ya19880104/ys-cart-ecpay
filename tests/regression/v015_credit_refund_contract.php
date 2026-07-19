@@ -187,7 +187,16 @@ $assert(
 	&& str_contains( $cli_src, "'pending' !== ( \$entry['status'] ?? '' )" )
 	&& str_contains( $cli_src, "in_array( \$mark, [ 'done', 'failed' ], true )" )
 	&& str_contains( $plugin_src, 'EcpayRefundAttemptCommand::register()' ),
-	'CLI 核定入口：wp ys-ecpay refund-attempts（CAS：僅 pending 可核定）並於 Plugin 註冊'
+	'CLI 核定入口：wp ys-ecpay refund-attempts（僅 pending 可核定）並於 Plugin 註冊'
+);
+// ── R6-F6：resolve 必須是真 CAS（conditional UPDATE），不得是 read-modify-write ──
+$assert(
+	str_contains( $cli_src, 'SELECT payment_detail FROM' )
+	&& str_contains( $cli_src, 'AND payment_detail = %s' )
+	&& str_contains( $cli_src, '1 !== (int) $updated' )
+	&& str_contains( $cli_src, 'CAS 失敗' )
+	&& ! str_contains( $cli_src, 'YSOrder::update(' ),
+	'resolve＝真 CAS：raw 讀取＋conditional UPDATE（WHERE payment_detail=舊值）＋rows==1 檢查，無 YSOrder::update 無條件覆寫'
 );
 $assert(
 	str_contains( $credit, '缺少 refund_request_id（冪等鍵），已拒絕退款操作' ),

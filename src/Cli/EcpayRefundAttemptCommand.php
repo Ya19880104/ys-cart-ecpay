@@ -79,12 +79,22 @@ final class EcpayRefundAttemptCommand {
 			\WP_CLI::error( '--request 不得為空。' );
 		}
 
-		// CAS：寫入前重讀最新狀態，僅 pending 可核定。
-		$order = $order_id > 0 ? YSOrder::find( $order_id ) : null;
-		if ( ! $order ) {
+		// 真 CAS（CODEX 終審 R6-F6）：直接讀 orders 表 payment_detail 原始字串
+		//（繞開任何模型層快取），改寫後以「WHERE id AND payment_detail=舊 raw」
+		// 條件寫入——affected rows==1 才算成功；0＝期間被其他程序（gateway 回寫、
+		// 後台操作、另一 CLI）改寫，中止並要求重查。先前的 read-modify-write
+		//（YSOrder::update 無條件覆寫）存在 lost-update 窗口，並非 CAS。
+		global $wpdb;
+		$table   = YSOrder::table();
+		$old_raw = $wpdb->get_var( $wpdb->prepare(
+			"SELECT payment_detail FROM {$table} WHERE id = %d",
+			$order_id
+		) );
+		if ( null === $old_raw ) {
 			\WP_CLI::error( "訂單 {$order_id} 不存在。" );
 		}
-		$detail  = json_decode( (string) ( $order->payment_detail ?? '{}' ), true ) ?: [];
+
+		$detail  = json_decode( (string) $old_raw, true ) ?: [];
 		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 		$entry   = $history[ $request_id ] ?? null;
 
@@ -106,11 +116,17 @@ final class EcpayRefundAttemptCommand {
 			$entry['trade_no'] = sanitize_text_field( (string) $assoc['trade-no'] );
 		}
 
-		$history[ $request_id ]         = $entry;
-		$detail['_ys_ecpay_refunds']    = $history;
-		$written = YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $detail ) ] );
-		if ( ! $written ) {
-			\WP_CLI::error( '核定寫入失敗，請重試。' );
+		$history[ $request_id ]      = $entry;
+		$detail['_ys_ecpay_refunds'] = $history;
+
+		$updated = $wpdb->query( $wpdb->prepare(
+			"UPDATE {$table} SET payment_detail = %s WHERE id = %d AND payment_detail = %s",
+			wp_json_encode( $detail ),
+			$order_id,
+			(string) $old_raw
+		) );
+		if ( 1 !== (int) $updated ) {
+			\WP_CLI::error( 'CAS 失敗：payment_detail 於核定期間已被其他程序改寫，未寫入任何變更；請重新 list 確認最新狀態後再操作。' );
 		}
 
 		\WP_CLI::success( sprintf(
