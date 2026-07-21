@@ -58,9 +58,11 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	public function process_refund( int $order_id, float $amount, string $reason = '', array $context = [] ): array {
 		unset( $reason );
 
+		// R7-F1：pre-DoAction 業務拒絕（金流確定未動）→ outcome=rejected_terminal
+		//         （可安全重試）；字面值＝與 core YSRefundHandler::REFUND_OUTCOME_* 一致。
 		$order = YSOrder::find( $order_id );
 		if ( ! $order ) {
-			return [ 'success' => false, 'message' => '訂單不存在。' ];
+			return [ 'success' => false, 'outcome' => 'rejected_terminal', 'message' => '訂單不存在。' ];
 		}
 
 		// 金額驗證：正數且不得超過可退餘額（fail-closed）。
@@ -70,6 +72,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		if ( $amount <= 0 || round( $amount, 2 ) > round( $refundable, 2 ) ) {
 			return [
 				'success' => false,
+				'outcome' => 'rejected_terminal',
 				'message' => sprintf( '退刷金額不正確（可退餘額 %s）。', number_format( max( 0, $refundable ), 2 ) ),
 			];
 		}
@@ -79,7 +82,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		$trade_no          = (string) ( $payment_detail['trade_no'] ?? $order->gateway_trade_no ?? '' );
 		$merchant_trade_no = (string) ( $payment_detail['mer_trade_no'] ?? '' );
 		if ( '' === $trade_no || '' === $merchant_trade_no ) {
-			return [ 'success' => false, 'message' => '找不到綠界交易識別碼，無法退刷（訂單可能非綠界信用卡付款）。' ];
+			return [ 'success' => false, 'outcome' => 'rejected_terminal', 'message' => '找不到綠界交易識別碼，無法退刷（訂單可能非綠界信用卡付款）。' ];
 		}
 
 		// ── crash-safe 冪等（refund_request_id）──
@@ -87,7 +90,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// core YSRefundHandler 各路徑皆會提供；外部直呼缺 key 一律拒絕（fail-closed）。
 		$request_id = (string) ( $context['refund_request_id'] ?? '' );
 		if ( '' === $request_id ) {
-			return [ 'success' => false, 'message' => '缺少 refund_request_id（冪等鍵），已拒絕退款操作。' ];
+			return [ 'success' => false, 'outcome' => 'rejected_terminal', 'message' => '缺少 refund_request_id（冪等鍵），已拒絕退款操作。' ];
 		}
 		$history = is_array( $payment_detail['_ys_ecpay_refunds'] ?? null ) ? $payment_detail['_ys_ecpay_refunds'] : [];
 
@@ -111,8 +114,10 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// attempt 標為 done/failed。這是金流層的最後防線，不依賴上游 key 穩定性。
 		foreach ( $history as $frozen_id => $frozen_entry ) {
 			if ( 'pending' === ( $frozen_entry['status'] ?? '' ) ) {
+				// 結果未明的既有 attempt → indeterminate（core 亦凍結，不重送）。
 				return [
 					'success' => false,
+					'outcome' => 'indeterminate',
 					'message' => '此訂單有一筆結果未明的退款請求（' . sanitize_text_field( (string) $frozen_id ) . '）凍結中：'
 						. '為避免重複退款，已拒絕所有新的退款操作；請先於綠界後台確認該筆實際狀態並人工核定後再試。',
 				];
@@ -146,14 +151,17 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			}
 		}
 		if ( '' === $gwsr ) {
-			return [ 'success' => false, 'message' => '無法取得綠界授權單號（gwsr），無法判定關帳狀態；請於綠界後台人工處理退款。' ];
+			// 未送 DoAction＝金流未動 → rejected_terminal（可安全重試/人工）。
+			return [ 'success' => false, 'outcome' => 'rejected_terminal', 'message' => '無法取得綠界授權單號（gwsr），無法判定關帳狀態；請於綠界後台人工處理退款。' ];
 		}
 
 		// ── 步驟 2：查關帳狀態（query-first；查詢失敗＝未動錢，可安全重試）──
 		$close = $client->query_credit_close_status( $gwsr, (int) round( $total ) );
 		if ( 'unknown' === ( $close['state'] ?? 'unknown' ) ) {
+			// query-first：關帳狀態查詢失敗＝未送 DoAction、金流未動 → rejected_terminal。
 			return [
 				'success' => false,
+				'outcome' => 'rejected_terminal',
 				'message' => '無法確認交易關帳狀態（' . (string) ( $close['message'] ?? '' ) . '），已中止退款操作；請稍後重試或於綠界後台人工處理。',
 			];
 		}
@@ -163,7 +171,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			case 'authorized':
 			case 'cancelled': // 操作取消 → 依官方流程執行 N（僅全額）
 				if ( ! $is_full ) {
-					return [ 'success' => false, 'message' => '此交易尚未請款（已授權／前次操作已取消），僅支援全額取消授權；請以全額退款處理。' ];
+					return [ 'success' => false, 'outcome' => 'rejected_terminal', 'message' => '此交易尚未請款（已授權／前次操作已取消），僅支援全額取消授權；請以全額退款處理。' ];
 				}
 				$plan = [ 'N' ];
 				break;
@@ -191,6 +199,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			if ( ! $persisted ) {
 				return [
 					'success' => false,
+					'outcome' => 'rejected_terminal',
 					'message' => '退款請求無法持久化（冪等防線寫入失敗），已中止；未執行任何金流操作，請重試。',
 				];
 			}
@@ -211,8 +220,10 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 						'request_id' => $request_id,
 					] );
 				}
+				// R7-F1：DoAction 傳輸不確定 → indeterminate（core 維持凍結、禁重送）。
 				return [
 					'success' => false,
+					'outcome' => 'indeterminate',
 					'message' => '退款請求結果未明（傳輸中斷），為避免重複退款已凍結此請求；請先於綠界後台確認實際狀態，再人工核定。',
 				];
 			}
@@ -230,8 +241,10 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 						'request_id' => $request_id,
 					] );
 				}
+				// R7-F1：DoAction 明確拒絕（RtnCode≠1，金流未動）→ rejected_terminal（可重試）。
 				return [
 					'success' => false,
+					'outcome' => 'rejected_terminal',
 					'message' => '綠界退款失敗（動作 ' . $action . '）：' . (string) ( $result['message'] ?? '未知錯誤' ),
 				];
 			}

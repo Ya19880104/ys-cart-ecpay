@@ -209,5 +209,23 @@ $assert(
 	'persist 回傳檢查：三個 call site 全檢查、done 寫失敗 CRITICAL＋CLI 導引'
 );
 
+// ── R7-F1：process_refund 各失敗點回 typed outcome（indeterminate vs rejected_terminal）──
+$assert(
+	str_contains( $credit, "'outcome' => 'indeterminate'" )
+	&& str_contains( $credit, "'outcome' => 'rejected_terminal'" ),
+	'R7-F1：process_refund 回 typed outcome（DoAction 不確定→indeterminate 凍結、明確拒絕→rejected_terminal）'
+);
+// pre-DoAction 業務拒絕（訂單/金額/識別碼/gwsr/unknown/尚未請款/persist）皆 terminal——
+// 至少 6 處 rejected_terminal（金流未動、可安全重試）。
+$assert(
+	substr_count( $credit, "'outcome' => 'rejected_terminal'" ) >= 6,
+	'R7-F1：pre-DoAction 業務拒絕全標 rejected_terminal（金流未動、可重試）'
+);
+// 全單凍結（既有 pending attempt）與 DoAction 傳輸不確定＝indeterminate（core 凍結）。
+$assert(
+	substr_count( $credit, "'outcome' => 'indeterminate'" ) >= 2,
+	'R7-F1：全單凍結＋DoAction 不確定＝indeterminate（core 維持凍結）'
+);
+
 echo "\nv0.3.0 credit refund contract: {$pass} PASS / {$fail} FAIL\n";
 exit( $fail > 0 ? 1 : 0 );
