@@ -227,5 +227,24 @@ $assert(
 	'R7-F1：全單凍結＋DoAction 不確定＝indeterminate（core 維持凍結）'
 );
 
+// ── R8-F3：雙 ledger 協調——監聽核心核定同步本外掛 ledger（解除死結）──
+$assert(
+	str_contains( $cli_src, 'public static function register_core_sync' )
+	&& str_contains( $cli_src, "add_action( 'ys_ec_refund_finalization_resolved'" )
+	&& str_contains( $cli_src, 'core-finalization-sync' )
+	&& str_contains( $plugin_src, 'register_core_sync()' ),
+	'R8-F3：監聽 ys_ec_refund_finalization_resolved 同步本外掛 attempt（Plugin 已註冊）'
+);
+$assert(
+	str_contains( $cli_src, 'AND payment_detail = %s' )
+	&& str_contains( $cli_src, "'pending' !== ( \$entry['status'] ?? '' )" ),
+	'R8-F3：同步走真 CAS＋僅 pending 才改（不覆蓋他人變更）'
+);
+$assert(
+	str_contains( $cli_src, 'wp ys-cart refund-finalization resolve' )
+	&& ! str_contains( $cli_src, '請於後台以相同退款操作補齊核心帳務' ),
+	'R8-F3：CLI 訊息改指向核心 CLI（舊「相同退款操作」指引已移除——核心凍結會擋住）'
+);
+
 echo "\nv0.3.0 credit refund contract: {$pass} PASS / {$fail} FAIL\n";
 exit( $fail > 0 ? 1 : 0 );

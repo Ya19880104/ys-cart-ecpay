@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Cli;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Utils\YSLogger;
 
 /**
  * 退款 attempt 人工核定 CLI（v0.3.0，CODEX 終審 F4）
@@ -133,7 +134,88 @@ final class EcpayRefundAttemptCommand {
 			'attempt %s 已核定為 %s。%s',
 			$request_id,
 			$mark,
-			'done' === $mark ? ' 提醒：綠界端已退款者，請於後台以相同退款操作補齊核心帳務（同請求會冪等重放）。' : ''
+			'done' === $mark
+				// R8-F3：核心 ledger 不會被本命令解除——核心的 submitting 凍結會擋在
+				// gateway 呼叫之前，「以相同退款操作補齊核心帳務」根本進不到本外掛。
+				// 正確入口＝核心 CLI（它會續作帳務並回頭同步本外掛紀錄）。
+				? ' 提醒：本命令只核定「綠界端」紀錄；核心帳務請執行'
+					. ' wp ys-cart refund-finalization resolve --order=' . $order_id
+					. ' --request=' . $request_id . ' --mark=paid'
+					. '（會續作核心帳務，並自動同步本外掛的退款紀錄）。'
+				: ''
 		) );
+	}
+
+	/**
+	 * 監聽核心 finalization 人工核定，同步核定本外掛的退款 attempt（CODEX 終審 R8-F3）
+	 *
+	 * 雙 ledger 死結：核心 `_ys_refund_finalization` 與本外掛 `_ys_ecpay_refunds` 各自
+	 * 凍結——只解其一，另一邊仍擋住所有新退款（核心 submitting 擋在 gateway 呼叫前；
+	 * 本外掛 pending 走全單凍結）。核心 CLI 核定後 fire
+	 * `ys_ec_refund_finalization_resolved`，這裡把同 request_id 的 pending attempt 一併
+	 * 標為 done（paid）／failed（aborted），達成「一個命令解除兩套 ledger」。
+	 */
+	public static function register_core_sync(): void {
+		add_action( 'ys_ec_refund_finalization_resolved', [ self::class, 'on_core_resolved' ], 10, 4 );
+	}
+
+	/**
+	 * @param int    $order_id
+	 * @param string $request_id
+	 * @param string $mark       'paid'｜'aborted'
+	 * @param array  $core_entry 核心 ledger entry（僅供除錯）
+	 */
+	public static function on_core_resolved( int $order_id, string $request_id, string $mark, array $core_entry = [] ): void {
+		unset( $core_entry );
+		if ( $order_id <= 0 || '' === $request_id || ! in_array( $mark, [ 'paid', 'aborted' ], true ) ) {
+			return;
+		}
+
+		global $wpdb;
+		$table   = YSOrder::table();
+		$old_raw = $wpdb->get_var( $wpdb->prepare(
+			"SELECT payment_detail FROM {$table} WHERE id = %d",
+			$order_id
+		) );
+		if ( null === $old_raw ) {
+			return;
+		}
+
+		$detail  = json_decode( (string) $old_raw, true ) ?: [];
+		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
+		$entry   = $history[ $request_id ] ?? null;
+		if ( ! is_array( $entry ) || 'pending' !== ( $entry['status'] ?? '' ) ) {
+			return; // 無此 attempt 或早已非 pending → 無需同步
+		}
+
+		$entry['status']      = ( 'paid' === $mark ) ? 'done' : 'failed';
+		$entry['resolved_by'] = 'core-finalization-sync';
+		$entry['resolved_at'] = current_time( 'mysql' );
+
+		$history[ $request_id ]      = $entry;
+		$detail['_ys_ecpay_refunds'] = $history;
+
+		// 真 CAS（同 resolve）：payment_detail 於期間被改寫則不寫入，避免覆蓋他人變更。
+		$updated = $wpdb->query( $wpdb->prepare(
+			"UPDATE {$table} SET payment_detail = %s WHERE id = %d AND payment_detail = %s",
+			wp_json_encode( $detail ),
+			$order_id,
+			(string) $old_raw
+		) );
+
+		if ( 1 !== (int) $updated ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 核心核定同步失敗（CAS 落敗，本外掛 attempt 仍 pending＝全單凍結）', [
+				'order_id'   => $order_id,
+				'request_id' => $request_id,
+				'mark'       => $mark,
+			] );
+			return;
+		}
+
+		YSLogger::warning( 'ecpay', '已依核心核定同步退款 attempt 狀態（解除本外掛全單凍結）', [
+			'order_id'   => $order_id,
+			'request_id' => $request_id,
+			'status'     => $entry['status'],
+		] );
 	}
 }

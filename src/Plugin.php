@@ -60,6 +60,9 @@ final class Plugin {
 	public function init(): void {
 		EcpaySettings::register();
 		\YangSheep\YSCartEcpay\Cli\EcpayRefundAttemptCommand::register();
+		// R8-F3：核心 finalization 人工核定 → 同步核定本外掛退款 attempt（解除雙 ledger
+		// 死結）。與 WP_CLI 無關，一律註冊（核心核定未來也可能由後台觸發）。
+		\YangSheep\YSCartEcpay\Cli\EcpayRefundAttemptCommand::register_core_sync();
 		add_action( 'init', [ $this, 'sync_print_route' ], 20 );
 
 		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
