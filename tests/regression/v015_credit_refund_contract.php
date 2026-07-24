@@ -230,10 +230,18 @@ $assert(
 // ── R8-F3：雙 ledger 協調——監聽核心核定同步本外掛 ledger（解除死結）──
 $assert(
 	str_contains( $cli_src, 'public static function register_core_sync' )
-	&& str_contains( $cli_src, "add_action( 'ys_ec_refund_finalization_resolved'" )
+	// R9-F3：改用 filter 回報 typed 結果（不再是單向 action）。
+	&& str_contains( $cli_src, "add_filter( 'ys_ec_refund_finalization_sync'" )
 	&& str_contains( $cli_src, 'core-finalization-sync' )
 	&& str_contains( $plugin_src, 'register_core_sync()' ),
-	'R8-F3：監聽 ys_ec_refund_finalization_resolved 同步本外掛 attempt（Plugin 已註冊）'
+	'R9-F3：以 filter ys_ec_refund_finalization_sync 同步本外掛 attempt（Plugin 已註冊）'
+);
+$assert(
+	str_contains( $cli_src, "'provider' => 'ecpay'" )
+	&& str_contains( $cli_src, "'success'  => false" )
+	&& str_contains( $cli_src, "'success'  => true" )
+	&& str_contains( $cli_src, 'wp ys-ecpay refund-attempts resolve --order=' ),
+	'R9-F3：CAS 成功/失敗皆回報 typed result；失敗時附手動補救指令'
 );
 $assert(
 	str_contains( $cli_src, 'AND payment_detail = %s' )

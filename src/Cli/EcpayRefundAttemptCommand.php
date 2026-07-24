@@ -156,19 +156,24 @@ final class EcpayRefundAttemptCommand {
 	 * 標為 done（paid）／failed（aborted），達成「一個命令解除兩套 ledger」。
 	 */
 	public static function register_core_sync(): void {
-		add_action( 'ys_ec_refund_finalization_resolved', [ self::class, 'on_core_resolved' ], 10, 4 );
+		// R9-F3：改用 **filter** 回報 typed 結果——CAS 失敗時 core 必須能把「本外掛
+		// ledger 尚未解除」透傳給操作者；舊版單向 action 只在本地記 CRITICAL，CLI 仍
+		// 顯示成功，運維會誤以為兩套 ledger 都已解除。
+		add_filter( 'ys_ec_refund_finalization_sync', [ self::class, 'on_core_resolved' ], 10, 5 );
 	}
 
 	/**
-	 * @param int    $order_id
-	 * @param string $request_id
-	 * @param string $mark       'paid'｜'aborted'
-	 * @param array  $core_entry 核心 ledger entry（僅供除錯）
+	 * @param array<int, array> $results    其他 provider 已回報的同步結果
+	 * @param int               $order_id
+	 * @param string            $request_id
+	 * @param string            $mark       'paid'｜'aborted'
+	 * @param array             $core_entry 核心 ledger entry（僅供除錯）
+	 * @return array<int, array> 附加本外掛的 typed result（provider／success／message）
 	 */
-	public static function on_core_resolved( int $order_id, string $request_id, string $mark, array $core_entry = [] ): void {
+	public static function on_core_resolved( array $results, int $order_id, string $request_id, string $mark, array $core_entry = [] ): array {
 		unset( $core_entry );
 		if ( $order_id <= 0 || '' === $request_id || ! in_array( $mark, [ 'paid', 'aborted' ], true ) ) {
-			return;
+			return $results;
 		}
 
 		global $wpdb;
@@ -178,14 +183,14 @@ final class EcpayRefundAttemptCommand {
 			$order_id
 		) );
 		if ( null === $old_raw ) {
-			return;
+			return $results;
 		}
 
 		$detail  = json_decode( (string) $old_raw, true ) ?: [];
 		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 		$entry   = $history[ $request_id ] ?? null;
 		if ( ! is_array( $entry ) || 'pending' !== ( $entry['status'] ?? '' ) ) {
-			return; // 無此 attempt 或早已非 pending → 無需同步
+			return $results; // 無此 attempt 或早已非 pending → 無需同步、無需回報
 		}
 
 		$entry['status']      = ( 'paid' === $mark ) ? 'done' : 'failed';
@@ -209,7 +214,17 @@ final class EcpayRefundAttemptCommand {
 				'request_id' => $request_id,
 				'mark'       => $mark,
 			] );
-			return;
+			// R9-F3：回報失敗給 core，讓 CLI 明確顯示「核心已核定，但本外掛未解除凍結」
+			// 並附上手動補救指令。
+			$results[] = [
+				'provider' => 'ecpay',
+				'success'  => false,
+				'message'  => 'CAS 落敗（payment_detail 於期間被改寫），退款 attempt 仍為 pending；請執行'
+					. ' wp ys-ecpay refund-attempts resolve --order=' . $order_id
+					. ' --request=' . $request_id
+					. ' --mark=' . ( 'paid' === $mark ? 'done' : 'failed' ),
+			];
+			return $results;
 		}
 
 		YSLogger::warning( 'ecpay', '已依核心核定同步退款 attempt 狀態（解除本外掛全單凍結）', [
@@ -217,5 +232,13 @@ final class EcpayRefundAttemptCommand {
 			'request_id' => $request_id,
 			'status'     => $entry['status'],
 		] );
+
+		$results[] = [
+			'provider' => 'ecpay',
+			'success'  => true,
+			'message'  => '已同步為 ' . (string) $entry['status'],
+		];
+
+		return $results;
 	}
 }
