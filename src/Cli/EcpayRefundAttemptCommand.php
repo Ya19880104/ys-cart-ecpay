@@ -160,6 +160,19 @@ final class EcpayRefundAttemptCommand {
 		// ledger 尚未解除」透傳給操作者；舊版單向 action 只在本地記 CRITICAL，CLI 仍
 		// 顯示成功，運維會誤以為兩套 ledger 都已解除。
 		add_filter( 'ys_ec_refund_finalization_sync', [ self::class, 'on_core_resolved' ], 10, 5 );
+
+		// R10-F4：向 core 宣告「ECPay 信用卡退款有 provider ledger、核定必須同步」——
+		// 若本外掛未載入（listener 缺席），core 依此宣告把「零回報」判為同步失敗，
+		// 不得被當成功（否則本外掛的全單凍結會被遺忘）。
+		add_filter( 'ys_ec_refund_finalization_requires_sync', [ self::class, 'declare_requires_sync' ], 10, 2 );
+	}
+
+	/**
+	 * @param bool   $requires   其他 filter 已宣告的結果
+	 * @param string $gateway_id core ledger entry 記錄的 gateway
+	 */
+	public static function declare_requires_sync( bool $requires, string $gateway_id ): bool {
+		return $requires || 'ys_ec_ecpay_credit' === $gateway_id;
 	}
 
 	/**
