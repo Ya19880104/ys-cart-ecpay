@@ -253,6 +253,12 @@ $assert(
 	&& ! str_contains( $cli_src, '請於後台以相同退款操作補齊核心帳務' ),
 	'R8-F3：CLI 訊息改指向核心 CLI（舊「相同退款操作」指引已移除——核心凍結會擋住）'
 );
+// R10-F4：宣告 requires_sync——listener 缺席（零回報）不得被 core 當同步成功。
+$assert(
+	str_contains( $cli_src, "add_filter( 'ys_ec_refund_finalization_requires_sync'" )
+	&& str_contains( $cli_src, "'ys_ec_ecpay_credit' === \$gateway_id" ),
+	'R10-F4：宣告 requires_sync（core 據此把零回報判為同步失敗）'
+);
 
 echo "\nv0.3.0 credit refund contract: {$pass} PASS / {$fail} FAIL\n";
 exit( $fail > 0 ? 1 : 0 );
