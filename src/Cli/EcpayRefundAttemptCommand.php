@@ -202,8 +202,28 @@ final class EcpayRefundAttemptCommand {
 		$detail  = json_decode( (string) $old_raw, true ) ?: [];
 		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 		$entry   = $history[ $request_id ] ?? null;
-		if ( ! is_array( $entry ) || 'pending' !== ( $entry['status'] ?? '' ) ) {
-			return $results; // 無此 attempt 或早已非 pending → 無需同步、無需回報
+		if ( ! is_array( $entry ) ) {
+			return $results; // 無此 attempt（非本外掛的退款）→ 無需同步、無需回報
+		}
+
+		$current = (string) ( $entry['status'] ?? '' );
+		$target  = ( 'paid' === $mark ) ? 'done' : 'failed';
+
+		// R11-F4：已達**相同**終態＝先前同步已成功——回冪等 success（否則核心重試會
+		// 因零回報＋requires_sync 被誤報「同步失敗」）；**不同**終態＝資料衝突，回失敗。
+		if ( 'pending' !== $current ) {
+			$results[] = ( $current === $target )
+				? [
+					'provider' => 'ecpay',
+					'success'  => true,
+					'message'  => '已同步為 ' . $current . '（冪等）',
+				]
+				: [
+					'provider' => 'ecpay',
+					'success'  => false,
+					'message'  => "attempt 已為 {$current}，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
+				];
+			return $results;
 		}
 
 		$entry['status']      = ( 'paid' === $mark ) ? 'done' : 'failed';
