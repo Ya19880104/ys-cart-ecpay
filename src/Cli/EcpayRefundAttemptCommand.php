@@ -183,8 +183,10 @@ final class EcpayRefundAttemptCommand {
 	 * @param array             $core_entry 核心 ledger entry（僅供除錯）
 	 * @return array<int, array> 附加本外掛的 typed result（provider／success／message）
 	 */
+	/** 本外掛的 gateway id（core sync 結果匹配 owner 用——R12-F4）。 */
+	private const GATEWAY_ID = 'ys_ec_ecpay_credit';
+
 	public static function on_core_resolved( array $results, int $order_id, string $request_id, string $mark, array $core_entry = [] ): array {
-		unset( $core_entry );
 		if ( $order_id <= 0 || '' === $request_id || ! in_array( $mark, [ 'paid', 'aborted' ], true ) ) {
 			return $results;
 		}
@@ -206,6 +208,20 @@ final class EcpayRefundAttemptCommand {
 			return $results; // 無此 attempt（非本外掛的退款）→ 無需同步、無需回報
 		}
 
+		// R12-F4：attempt fingerprint 核對——core entry 的金額必須與本外掛 attempt 一致
+		//（±0.005；防 request_id 撞號／錯單同步）。core_entry 無 amount（舊 entry）跳過。
+		$core_amount = isset( $core_entry['amount'] ) ? (float) $core_entry['amount'] : null;
+		$our_amount  = isset( $entry['amount'] ) ? (float) $entry['amount'] : null;
+		if ( null !== $core_amount && null !== $our_amount && abs( $core_amount - $our_amount ) > 0.005 ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => sprintf( 'attempt 金額不符（core %s vs ecpay %s）——疑錯單，請人工核對', $core_amount, $our_amount ),
+			];
+			return $results;
+		}
+
 		$current = (string) ( $entry['status'] ?? '' );
 		$target  = ( 'paid' === $mark ) ? 'done' : 'failed';
 
@@ -214,14 +230,16 @@ final class EcpayRefundAttemptCommand {
 		if ( 'pending' !== $current ) {
 			$results[] = ( $current === $target )
 				? [
-					'provider' => 'ecpay',
-					'success'  => true,
-					'message'  => '已同步為 ' . $current . '（冪等）',
+					'provider'   => 'ecpay',
+					'gateway_id' => self::GATEWAY_ID,
+					'success'    => true,
+					'message'    => '已同步為 ' . $current . '（冪等）',
 				]
 				: [
-					'provider' => 'ecpay',
-					'success'  => false,
-					'message'  => "attempt 已為 {$current}，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
+					'provider'   => 'ecpay',
+					'gateway_id' => self::GATEWAY_ID,
+					'success'    => false,
+					'message'    => "attempt 已為 {$current}，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
 				];
 			return $results;
 		}
@@ -250,9 +268,10 @@ final class EcpayRefundAttemptCommand {
 			// R9-F3：回報失敗給 core，讓 CLI 明確顯示「核心已核定，但本外掛未解除凍結」
 			// 並附上手動補救指令。
 			$results[] = [
-				'provider' => 'ecpay',
-				'success'  => false,
-				'message'  => 'CAS 落敗（payment_detail 於期間被改寫），退款 attempt 仍為 pending；請執行'
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => 'CAS 落敗（payment_detail 於期間被改寫），退款 attempt 仍為 pending；請執行'
 					. ' wp ys-ecpay refund-attempts resolve --order=' . $order_id
 					. ' --request=' . $request_id
 					. ' --mark=' . ( 'paid' === $mark ? 'done' : 'failed' ),
@@ -267,9 +286,10 @@ final class EcpayRefundAttemptCommand {
 		] );
 
 		$results[] = [
-			'provider' => 'ecpay',
-			'success'  => true,
-			'message'  => '已同步為 ' . (string) $entry['status'],
+			'provider'   => 'ecpay',
+			'gateway_id' => self::GATEWAY_ID,
+			'success'    => true,
+			'message'    => '已同步為 ' . (string) $entry['status'],
 		];
 
 		return $results;

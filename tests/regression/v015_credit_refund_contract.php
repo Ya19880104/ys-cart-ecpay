@@ -237,11 +237,18 @@ $assert(
 	'R9-F3：以 filter ys_ec_refund_finalization_sync 同步本外掛 attempt（Plugin 已註冊）'
 );
 $assert(
-	str_contains( $cli_src, "'provider' => 'ecpay'" )
-	&& str_contains( $cli_src, "'success'  => false" )
-	&& str_contains( $cli_src, "'success'  => true" )
+	str_contains( $cli_src, "'provider'   => 'ecpay'" )
+	&& str_contains( $cli_src, "'success'    => false" )
+	&& str_contains( $cli_src, "'success'    => true" )
 	&& str_contains( $cli_src, 'wp ys-ecpay refund-attempts resolve --order=' ),
 	'R9-F3：CAS 成功/失敗皆回報 typed result；失敗時附手動補救指令'
+);
+// R12-F4：回報帶 gateway_id（core owner 匹配）＋attempt 金額 fingerprint 核對。
+$assert(
+	str_contains( $cli_src, "private const GATEWAY_ID = 'ys_ec_ecpay_credit'" )
+	&& substr_count( $cli_src, "'gateway_id' => self::GATEWAY_ID" ) >= 4
+	&& str_contains( $cli_src, 'attempt 金額不符' ),
+	'R12-F4：全部回報帶 gateway_id＋core/ecpay attempt 金額 fingerprint 核對'
 );
 $assert(
 	str_contains( $cli_src, 'AND payment_detail = %s' )
