@@ -250,6 +250,14 @@ $assert(
 	&& str_contains( $cli_src, 'attempt 金額不符' ),
 	'R12-F4：全部回報帶 gateway_id＋core/ecpay attempt 金額 fingerprint 核對'
 );
+// R13-F4：fingerprint fail-closed——gateway 歸屬核對＋缺 amount 不放行（都不得走到
+// 冪等 success）；宣告同時寫入 core durable 登記表（外掛停用後仍在）。
+$assert(
+	str_contains( $cli_src, 'self::GATEWAY_ID !== $core_gateway' )
+	&& str_contains( $cli_src, 'attempt 金額無法核對' )
+	&& str_contains( $cli_src, "method_exists( '\\YangSheep\\Ecommerce\\Handlers\\YSRefundHandler', 'register_sync_provider' )" ),
+	'R13-F4：gateway 歸屬＋缺 amount fail-closed、register_sync_provider durable 登記'
+);
 $assert(
 	str_contains( $cli_src, 'AND payment_detail = %s' )
 	&& str_contains( $cli_src, "'pending' !== ( \$entry['status'] ?? '' )" ),

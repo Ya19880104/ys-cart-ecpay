@@ -165,6 +165,14 @@ final class EcpayRefundAttemptCommand {
 		// 若本外掛未載入（listener 缺席），core 依此宣告把「零回報」判為同步失敗，
 		// 不得被當成功（否則本外掛的全單凍結會被遺忘）。
 		add_filter( 'ys_ec_refund_finalization_requires_sync', [ self::class, 'declare_requires_sync' ], 10, 2 );
+
+		// R13-F4：宣告同時寫入 core 的 durable 登記表（option、本外掛停用後仍在）——
+		// legacy core entry（缺 pre-send 判定值）據此 fail-closed，runtime filter 缺席
+		// 不再被誤判成「無需同步」。register_sync_provider 冪等（已登記即 return）。
+		if ( class_exists( '\YangSheep\Ecommerce\Handlers\YSRefundHandler' )
+			&& method_exists( '\YangSheep\Ecommerce\Handlers\YSRefundHandler', 'register_sync_provider' ) ) {
+			\YangSheep\Ecommerce\Handlers\YSRefundHandler::register_sync_provider( self::GATEWAY_ID );
+		}
 	}
 
 	/**
@@ -208,11 +216,36 @@ final class EcpayRefundAttemptCommand {
 			return $results; // 無此 attempt（非本外掛的退款）→ 無需同步、無需回報
 		}
 
-		// R12-F4：attempt fingerprint 核對——core entry 的金額必須與本外掛 attempt 一致
-		//（±0.005；防 request_id 撞號／錯單同步）。core_entry 無 amount（舊 entry）跳過。
+		// R12-F4／R13-F4：attempt fingerprint 核對——**fail-closed**（mismatch 與「缺值
+		// 無法核對」都不得放行到冪等 success；防 request_id 撞號／錯單同步）。
+		// 人工出口＝ecpay CLI resolve（人工核對後手動核定），不會死結。
+		// (1) gateway 歸屬：core entry 的 gateway_id 必須是本外掛。
+		$core_gateway = (string) ( $core_entry['gateway_id'] ?? '' );
+		if ( self::GATEWAY_ID !== $core_gateway ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => sprintf(
+					'core entry 的 gateway（%s）非本外掛——request_id 撞號或 legacy entry 缺 gateway_id，請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
+					'' !== $core_gateway ? $core_gateway : '缺'
+				),
+			];
+			return $results;
+		}
+		// (2) 金額：兩邊都必須有值且一致（±0.005）；任一邊缺＝無法核對＝不放行。
 		$core_amount = isset( $core_entry['amount'] ) ? (float) $core_entry['amount'] : null;
 		$our_amount  = isset( $entry['amount'] ) ? (float) $entry['amount'] : null;
-		if ( null !== $core_amount && null !== $our_amount && abs( $core_amount - $our_amount ) > 0.005 ) {
+		if ( null === $core_amount || null === $our_amount ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => 'attempt 金額無法核對（core 或 ecpay entry 缺 amount）——請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
+			];
+			return $results;
+		}
+		if ( abs( $core_amount - $our_amount ) > 0.005 ) {
 			$results[] = [
 				'provider'   => 'ecpay',
 				'gateway_id' => self::GATEWAY_ID,
