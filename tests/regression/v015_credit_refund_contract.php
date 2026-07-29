@@ -258,6 +258,17 @@ $assert(
 	&& str_contains( $cli_src, "method_exists( '\\YangSheep\\Ecommerce\\Handlers\\YSRefundHandler', 'register_sync_provider' )" ),
 	'R13-F4：gateway 歸屬＋缺 amount fail-closed、register_sync_provider durable 登記'
 );
+// R14-F4：原交易 fingerprint——attempt 保存 trade_no/merchant_trade_no/gwsr（pre-send
+// 持久化）；核定同步時與訂單當前授權資訊比對，mismatch 不得走到冪等 success。
+$gw_src = $read( 'src/Payment/EcpayCreditGateway.php' );
+$assert(
+	str_contains( $gw_src, "'trade_no'          => \$trade_no," )
+	&& str_contains( $gw_src, "'merchant_trade_no' => \$merchant_trade_no," )
+	&& str_contains( $gw_src, "'gwsr'              => \$gwsr," )
+	&& str_contains( $cli_src, 'attempt 交易 fingerprint 不符' )
+	&& ( strpos( $cli_src, 'attempt 交易 fingerprint 不符' ) < strpos( $cli_src, '（冪等）' ) ),
+	'R14-F4：attempt 存原交易 fingerprint＋同步比對先於冪等 success'
+);
 $assert(
 	str_contains( $cli_src, 'AND payment_detail = %s' )
 	&& str_contains( $cli_src, "'pending' !== ( \$entry['status'] ?? '' )" ),

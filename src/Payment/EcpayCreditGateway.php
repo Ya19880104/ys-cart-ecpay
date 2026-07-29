@@ -192,6 +192,11 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'amount' => $amount,
 				'state'  => (string) $close['state'],
 				'plan'   => implode( ',', $plan ),
+				// R14-F4：原交易 fingerprint（immutable）——core 核定同步時比對，防
+				// request_id 撞號時把別筆交易的 attempt 錯誤同步。
+				'trade_no'          => $trade_no,
+				'merchant_trade_no' => $merchant_trade_no,
+				'gwsr'              => $gwsr,
 				'time'   => current_time( 'mysql' ),
 			];
 			$payment_detail['_ys_ecpay_refunds'] = $history;

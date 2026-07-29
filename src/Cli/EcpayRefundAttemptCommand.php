@@ -254,6 +254,34 @@ final class EcpayRefundAttemptCommand {
 			];
 			return $results;
 		}
+		// (3) R14-F4：原交易 fingerprint——attempt 保存的 trade_no/merchant_trade_no/gwsr
+		// 必須與**訂單當前**的授權資訊一致（防 attempt 被搬移／訂單資料被改寫後錯誤
+		// 同步）；mismatch 不得走到下方冪等 success。兩邊都有值才比（legacy attempt
+		// 缺 fingerprint 欄＝R14 之前建立，跳過本項——amount＋gateway 仍有核對）。
+		$order_trade_no = (string) ( $detail['trade_no'] ?? '' );
+		$order_mer_no   = (string) ( $detail['mer_trade_no'] ?? '' );
+		$order_gwsr     = (string) ( $detail['gwsr'] ?? $detail['ecpay_gwsr'] ?? '' );
+		$fp_checks      = [
+			'trade_no'          => [ (string) ( $entry['trade_no'] ?? '' ), $order_trade_no ],
+			'merchant_trade_no' => [ (string) ( $entry['merchant_trade_no'] ?? '' ), $order_mer_no ],
+			'gwsr'              => [ (string) ( $entry['gwsr'] ?? '' ), $order_gwsr ],
+		];
+		foreach ( $fp_checks as $field => [ $attempt_value, $order_value ] ) {
+			if ( '' !== $attempt_value && '' !== $order_value && $attempt_value !== $order_value ) {
+				$results[] = [
+					'provider'   => 'ecpay',
+					'gateway_id' => self::GATEWAY_ID,
+					'success'    => false,
+					'message'    => sprintf(
+						'attempt 交易 fingerprint 不符（%s：attempt=%s vs order=%s）——疑錯單，請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
+						$field,
+						$attempt_value,
+						$order_value
+					),
+				];
+				return $results;
+			}
+		}
 
 		$current = (string) ( $entry['status'] ?? '' );
 		$target  = ( 'paid' === $mark ) ? 'done' : 'failed';
