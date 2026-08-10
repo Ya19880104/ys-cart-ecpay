@@ -120,7 +120,7 @@ $assert(
 // v0.2.12：改斷言不變式而非實作。原斷言鎖 `$persisted = YSOrder::update(`，等於把
 // 「整包覆蓋 payment_detail」這個 race 寫成契約——修好競態反而會讓測試變紅。
 $assert(
-	str_contains( $credit, '$persisted = OrderPaymentDetail::mutate(' )
+	1 === preg_match( '/\$persisted\s*=\s*OrderPaymentDetail::mutate\(/', $credit )
 	&& str_contains( $credit, '冪等防線寫入失敗' )
 	&& 0 === preg_match( "/YSOrder::update\(\s*\\\$order_id,\s*\[\s*'payment_detail'/s", $credit ),
 	'pending 持久化失敗 → 中止（未執行金流）；payment_detail 一律經 CAS 寫入器，無整包覆蓋殘留'
