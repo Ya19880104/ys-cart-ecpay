@@ -230,12 +230,77 @@ final class Plugin {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
+		// v0.2.11：先前只驗 provider／全域啟用狀態，未驗購物車商品的「允許的物流
+		// 方式」交集，因此可對商品禁用的 sub-type 簽發已簽章的電子地圖表單（使用者
+		// 選完門市後才在送單被擋，門市 session 與 localStorage 仍已產生）。此處補上
+		// 與核心結帳同一份守門，fail-closed。
+		// 僅在購物車情境驗證：帶 order_id 時以訂單品項為準，不適用購物車交集。
+		if ( 0 === $order_id && ! $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope ) ) {
+			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
+		}
+
 		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url );
 		if ( $result ) {
 			return YSRestResponder::success( 'map_url_ready', '', $result );
 		}
 
 		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
+	}
+
+	/**
+	 * 購物車商品是否允許此物流方式（v0.2.11）
+	 *
+	 * 與核心結帳共用 YSShippingRegistry::is_method_allowed_for_cart() 這一份守門，
+	 * 避免 provider 端自建平行邏輯而與核心漂移。核心未提供此述詞時（舊版核心）
+	 * 回 true 保持相容——此時核心送單驗證仍會擋下。
+	 *
+	 * @param string $shipping_id 物流方式 ID
+	 * @param string $cart_scope  已消毒的購物車 scope
+	 */
+	private function is_shipping_allowed_for_cart( string $shipping_id, string $cart_scope ): bool {
+		if ( ! class_exists( YSShippingRegistry::class )
+			|| ! method_exists( YSShippingRegistry::class, 'is_method_allowed_for_cart' ) ) {
+			return true;
+		}
+
+		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, self::read_cart_items( $cart_scope ) );
+	}
+
+	/**
+	 * 純讀取指定 scope 的購物車品項（v0.2.11）
+	 *
+	 * 沿用核心 storefront 既有做法：以 ys_ec_cart_key_scope filter 綁定 scope，
+	 * 取 get_items_raw()（單一 SELECT，不計算總額、不觸發 cart 事件、不寫入）。
+	 * 訪客若尚無 session cookie 代表購物車必為空，直接短路以避免 get_or_create_session()
+	 * 的 setcookie() 副作用。
+	 *
+	 * @return array<int,array<string,mixed>>
+	 */
+	private static function read_cart_items( string $cart_scope ): array {
+		$handler = '\\YangSheep\\Ecommerce\\Handlers\\YSCartHandler';
+		if ( ! class_exists( $handler ) ) {
+			return [];
+		}
+
+		if ( ! is_user_logged_in() ) {
+			$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
+			if ( empty( $_COOKIE[ $cookie ] ) && empty( $_COOKIE['ys_ec_session'] ) ) {
+				return [];
+			}
+		}
+
+		$scoper = static function ( $current ) use ( $cart_scope ) {
+			return 'default' === $current ? $cart_scope : $current;
+		};
+		add_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
+		try {
+			$items = $handler::get_instance()->get_items_raw();
+			return is_array( $items ) ? $items : [];
+		} catch ( \Throwable $e ) {
+			return [];
+		} finally {
+			remove_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
+		}
 	}
 
 	private static function sanitize_cart_scope( string $scope ): string {
