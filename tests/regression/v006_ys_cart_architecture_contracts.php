@@ -94,4 +94,3 @@ v006_check(
 );
 
 echo "v006_ys_cart_architecture_contracts passed\n";
-

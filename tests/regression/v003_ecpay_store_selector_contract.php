@@ -40,4 +40,3 @@ if (preg_match('/ecpay\\/store-callback.{0,80}ecpay\\/logistics-notify/s', $sour
 }
 
 echo "v003_ecpay_store_selector_contract passed\n";
-

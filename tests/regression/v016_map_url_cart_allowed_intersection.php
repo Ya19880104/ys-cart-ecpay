@@ -9,7 +9,13 @@
  * 被核心擋下。門市 session 與選店結果已為禁用方式而產生。
  *
  * 修正＝在 map-url handler 內以核心 YSShippingRegistry::is_method_allowed_for_cart()
- * 這一份共用守門驗證，fail-closed；僅在購物車情境（order_id=0）套用。
+ * 這一份共用守門驗證，fail-closed。
+ *
+ * 初版另有兩個缺口，一併涵蓋於此：
+ *   1. 守門寫成 `0 === $order_id &&` 分流，而 order_id 直接取自請求且不驗訂單存在／
+ *      擁有者／品項，任何非零值都能整段跳過守門。現改為端點直接拒收 order_id。
+ *   2. read_cart_items 把 handler 缺失／非陣列／例外全部轉成空陣列，而核心把空車視為
+ *      「不限物流」，因此讀取失敗反而會簽發地圖表單。現以 null 表示讀取失敗並 fail-closed。
  *
  * 驗證：
  *   (a) 共用守門述詞三態（允許／禁用／無設限）
@@ -17,7 +23,9 @@
  *   (c) read_cart_items：訪客無 session cookie → 空陣列（不觸發 setcookie 副作用）
  *   (d) read_cart_items：以 scope filter 純讀 get_items_raw()，並於結束後移除 filter
  *   (e) is_shipping_allowed_for_cart：核心缺少述詞時回 true（舊核心相容）
- *   (f) 契約：handler 在 build_map_form_data 之前呼叫購物車守門，且以 order_id 分流
+ *   (f) 讀取失敗 → null 且守門 fail-closed
+ *   (g) 確定為空的購物車 → 空陣列（與讀取失敗分流），不限物流
+ *   (h) 契約：拒收 order_id、守門無條件執行且早於 build_map_form_data、無分流殘留
  *
  * Run: php tests/regression/v016_map_url_cart_allowed_intersection.php
  */
@@ -40,6 +48,7 @@ namespace YangSheep\Ecommerce\Handlers {
         public static array $items = [];
         public static int $calls = 0;
         public static ?string $scope_seen = null;
+        public static ?\Throwable $throw = null;
 
         public static function get_instance(): self {
             return new self();
@@ -48,6 +57,9 @@ namespace YangSheep\Ecommerce\Handlers {
         public function get_items_raw(): array {
             ++self::$calls;
             self::$scope_seen = \apply_filters('ys_ec_cart_key_scope', 'default');
+            if (null !== self::$throw) {
+                throw self::$throw;
+            }
             return self::$items;
         }
     }
@@ -190,17 +202,45 @@ namespace {
         '(e) provider 守門端到端：hilife 放行、unimart 擋下（禁用 sub-type 不簽發地圖）'
     );
 
-    // (f) 契約：handler 在 build_map_form_data 之前守門，且以 order_id 分流
-    $src = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Plugin.php'));
-    $pos_guard = strpos($src, 'is_shipping_allowed_for_cart( $shipping_id, $cart_scope )');
-    $pos_build = strpos($src, 'EcpayStoreSelector::build_map_form_data(');
+    // (f) 讀取失敗 ≠ 空購物車：必須 fail-closed
+    $_COOKIE = ['ys_ec_session' => 'abc'];
+    $seed([501 => '["ys_ec_ecpay_ship_hilife"]']);
+    YSCartHandler::$throw = new \RuntimeException('db down');
+    $items_fail = $read_cart_items->invoke(null, 'default');
+    $ok_on_fail = $allowed_for_cart->invoke($plugin, 'ys_ec_ecpay_ship_hilife', 'default');
+    YSCartHandler::$throw = null;
     $assert(
-        false !== $pos_guard
+        null === $items_fail && false === $ok_on_fail,
+        '(f) 購物車讀取失敗 → read_cart_items 回 null、守門 fail-closed（不得因空車被視為不限）'
+    );
+
+    // (g) 空購物車仍須與讀取失敗分流：空車＝讀取成功、不限物流
+    $_COOKIE = ['ys_ec_session' => 'abc'];
+    YSCartHandler::$items = [];
+    $items_empty = $read_cart_items->invoke(null, 'default');
+    $assert(
+        [] === $items_empty
+        && true === $allowed_for_cart->invoke($plugin, 'ys_ec_ecpay_ship_unimart', 'default'),
+        '(g) 確定為空的購物車回空陣列（非 null），不限物流'
+    );
+
+    // (h) 契約：端點拒收 order_id，且守門無條件在 build_map_form_data 之前執行。
+    //     初版以 `0 === $order_id` 分流，任何非零值都能跳過守門，而 order_id 取自
+    //     請求、不驗訂單存在／擁有者／品項。此處明確斷言該分流已不存在。
+    $src = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Plugin.php'));
+    $pos_reject = strpos($src, "'order_id_not_supported'");
+    $pos_guard  = strpos($src, 'is_shipping_allowed_for_cart( $shipping_id, $cart_scope )');
+    $pos_build  = strpos($src, 'EcpayStoreSelector::build_map_form_data(');
+    $assert(
+        false !== $pos_reject
+        && false !== $pos_guard
         && false !== $pos_build
+        && $pos_reject < $pos_guard
         && $pos_guard < $pos_build
-        && str_contains($src, '0 === $order_id && ! $this->is_shipping_allowed_for_cart')
+        && ! str_contains($src, '0 === $order_id && ! $this->is_shipping_allowed_for_cart')
+        && ! str_contains($src, '0 === $order_id &&')
         && str_contains($src, 'shipping_method_not_allowed'),
-        '(f) 守門在 build_map_form_data 之前、以 order_id=0 分流、回專屬錯誤碼'
+        '(h) 非零 order_id 先被拒收、守門無條件執行且在 build_map_form_data 之前、無 order_id 分流殘留'
     );
 
     echo "\nmap-url cart allowed intersection: {$pass} PASS / {$fail} FAIL\n";

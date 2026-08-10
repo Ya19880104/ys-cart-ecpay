@@ -230,12 +230,20 @@ final class Plugin {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
-		// v0.2.11：先前只驗 provider／全域啟用狀態，未驗購物車商品的「允許的物流
-		// 方式」交集，因此可對商品禁用的 sub-type 簽發已簽章的電子地圖表單（使用者
-		// 選完門市後才在送單被擋，門市 session 與 localStorage 仍已產生）。此處補上
-		// 與核心結帳同一份守門，fail-closed。
-		// 僅在購物車情境驗證：帶 order_id 時以訂單品項為準，不適用購物車交集。
-		if ( 0 === $order_id && ! $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope ) ) {
+		// v0.2.11：本端點不接受訂單 ID。初版以 `0 === $order_id` 分流，等於任何非零
+		// 值都能整段跳過下方守門，而 order_id 直接取自請求、不驗訂單存在、擁有者或
+		// 品項——呼叫端可自行偽造以繞過商品物流限制。現行兩個呼叫端（核心
+		// assets/js/ys-ec-store-selector.js 與 sdk/ys-cart-ecpay-headless.js）都不送
+		// 此參數，故直接拒收，不另開「載入並授權訂單」的攻擊表面。
+		if ( 0 !== $order_id ) {
+			return YSRestResponder::error( 'order_id_not_supported', '本端點不接受訂單 ID。' );
+		}
+
+		// 補上與核心結帳同一份守門：先前只驗 provider／全域啟用狀態，未驗購物車商品
+		// 的「允許的物流方式」交集，因此可對商品禁用的 sub-type 簽發已簽章的電子地圖
+		// 表單（使用者選完門市後才在送單被擋，門市 session 與 localStorage 仍已產生）。
+		// fail-closed：購物車讀取失敗亦視為不允許。
+		if ( ! $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope ) ) {
 			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
 		}
 
@@ -263,7 +271,14 @@ final class Plugin {
 			return true;
 		}
 
-		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, self::read_cart_items( $cart_scope ) );
+		$items = self::read_cart_items( $cart_scope );
+		if ( null === $items ) {
+			// 讀不到購物車 ≠ 空購物車。核心把空車視為「不限物流」，若把讀取失敗
+			// 一併轉成空陣列，失敗反而會簽發地圖表單。此處分流並 fail-closed。
+			return false;
+		}
+
+		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, $items );
 	}
 
 	/**
@@ -274,17 +289,22 @@ final class Plugin {
 	 * 訪客若尚無 session cookie 代表購物車必為空，直接短路以避免 get_or_create_session()
 	 * 的 setcookie() 副作用。
 	 *
-	 * @return array<int,array<string,mixed>>
+	 * 回傳陣列＝讀取成功（空陣列＝確定為空購物車）；回傳 null＝讀取失敗，呼叫端
+	 * 必須 fail-closed。兩者不可混為一談：核心把空購物車視為「不限物流」。
+	 *
+	 * @return array<int,array<string,mixed>>|null
 	 */
-	private static function read_cart_items( string $cart_scope ): array {
+	private static function read_cart_items( string $cart_scope ): ?array {
 		$handler = '\\YangSheep\\Ecommerce\\Handlers\\YSCartHandler';
 		if ( ! class_exists( $handler ) ) {
-			return [];
+			return null; // 核心存在但 cart handler 缺失＝安裝損壞，非空車。
 		}
 
 		if ( ! is_user_logged_in() ) {
 			$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
 			if ( empty( $_COOKIE[ $cookie ] ) && empty( $_COOKIE['ys_ec_session'] ) ) {
+				// 訪客尚無 session cookie＝購物車必然不存在，這是「確定為空」而非
+				// 讀取失敗；直接短路以避免 get_or_create_session() 的 setcookie() 副作用。
 				return [];
 			}
 		}
@@ -295,9 +315,9 @@ final class Plugin {
 		add_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
 		try {
 			$items = $handler::get_instance()->get_items_raw();
-			return is_array( $items ) ? $items : [];
+			return is_array( $items ) ? $items : null;
 		} catch ( \Throwable $e ) {
-			return [];
+			return null;
 		} finally {
 			remove_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
 		}
