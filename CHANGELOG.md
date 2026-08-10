@@ -15,3 +15,10 @@
 - 宣告 `supports_gateway_refund()`（core v2.56.4 退款能力協定）：信用卡 true、ATM／超商／條碼維持人工退款。
 - 新增「信用卡查詢檢查碼」（CreditCheckCode）設定欄位（加密儲存；關帳狀態查詢必填）；建單改送 `NeedExtraPaidInfo=Y` 並於付款通知持久化授權單號（gwsr）。
 - 訂單級退款凍結：只要存在任何結果未明的退款請求，一律拒絕新的退款操作直到人工核定（不依賴請求 ID 穩定性的金流層最後防線）。
+
+## [0.2.10] - 2026-07-28
+
+### Fixed
+
+- Stop the bundled YS Hub Client library from registering an invalid
+  WooCommerce HPOS declaration from its vendor path.
