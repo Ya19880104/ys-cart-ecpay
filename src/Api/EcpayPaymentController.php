@@ -10,6 +10,7 @@ use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayPaymentController {
@@ -92,11 +93,16 @@ final class EcpayPaymentController {
 			// CheckMacValue 驗證）——退款的關帳狀態查詢（CreditDetail/QueryTrade）依賴它。
 			$gwsr = sanitize_text_field( (string) ( $params['gwsr'] ?? '' ) );
 			if ( '' !== $gwsr ) {
-				$existing_detail         = json_decode( (string) ( $order->payment_detail ?? '{}' ), true ) ?: [];
-				$existing_detail['gwsr'] = $gwsr;
-				YSOrder::update( (int) $order->id, [
-					'payment_detail' => wp_json_encode( $existing_detail ),
-				] );
+				// v0.2.12：改走 CAS。此處與退款 ledger（`_ys_ecpay_refunds`）是同一個
+				// payment_detail 欄位的兩個併發 writer；先前的 read-modify-write 會在
+				// webhook 與退款重疊時整包覆蓋對方的寫入。
+				OrderPaymentDetail::mutate(
+					(int) $order->id,
+					static function ( array $detail ) use ( $gwsr ): array {
+						$detail['gwsr'] = $gwsr;
+						return $detail;
+					}
+				);
 			}
 
 			YSOrder::update( (int) $order->id, [

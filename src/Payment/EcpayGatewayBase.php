@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\Gateways\YSGatewayInterface;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\YSCartEcpay\Plugin;
+use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 abstract class EcpayGatewayBase implements YSGatewayInterface {
@@ -60,20 +61,24 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		}
 
 		$merchant_trade_no = $this->make_merchant_trade_no( $order_id );
-		$payment_detail   = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
-		if ( ! is_array( $payment_detail ) ) {
-			$payment_detail = [];
-		}
+		$method_id         = $this->get_id();
 
-		$payment_detail['mer_trade_no']            = $merchant_trade_no;
-		$payment_detail['ecpay_merchant_trade_no'] = $merchant_trade_no;
-		$payment_detail['payment_provider']        = 'ecpay';
-		$payment_detail['payment_method']          = $this->get_id();
+		// v0.2.12：payment_detail 走 CAS（見 OrderPaymentDetail），其餘為獨立純量欄位，
+		// 不參與 JSON 整包覆蓋，維持一般 update。
+		OrderPaymentDetail::mutate(
+			$order_id,
+			static function ( array $detail ) use ( $merchant_trade_no, $method_id ): array {
+				$detail['mer_trade_no']            = $merchant_trade_no;
+				$detail['ecpay_merchant_trade_no'] = $merchant_trade_no;
+				$detail['payment_provider']        = 'ecpay';
+				$detail['payment_method']          = $method_id;
+				return $detail;
+			}
+		);
 
 		YSOrder::update( $order_id, [
-			'payment_detail' => wp_json_encode( $payment_detail ),
-			'gateway_id'     => $this->get_id(),
-			'payment_method' => $this->get_id(),
+			'gateway_id'     => $method_id,
+			'payment_method' => $method_id,
 		] );
 
 		$form_data = ( new EcpayPaymentClient() )->build_aio_form( $order, $merchant_trade_no, $this->choose_payment() );

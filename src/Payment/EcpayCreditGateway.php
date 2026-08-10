@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Utils\YSLogger;
+use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 
 final class EcpayCreditGateway extends EcpayGatewayBase {
 	public function get_id(): string {
@@ -127,13 +128,20 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// v0.3.0（CODEX 終審 F4）：persist 回傳寫入結果——call site 必檢查；
 		// 寫失敗＝冪等紀錄與實況脫鉤，一律 CRITICAL log（凍結安全網＝送出前的
 		// pending 寫入已成功，後續寫失敗不會解除凍結）。
-		$persist = function ( array $entry ) use ( $order_id, $request_id ): bool {
-			$fresh  = YSOrder::find( $order_id );
-			$detail = json_decode( (string) ( $fresh->payment_detail ?? '{}' ), true ) ?: [];
-			$hist   = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-			$hist[ $request_id ]          = array_merge( is_array( $hist[ $request_id ] ?? null ) ? $hist[ $request_id ] : [], $entry );
-			$detail['_ys_ecpay_refunds']  = $hist;
-			return (bool) YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $detail ) ] );
+		// v0.2.12：改走 CAS。先前是 read-modify-write（find 後直接 update 整包
+		// payment_detail），與付款 webhook 回寫 gwsr、核心 finalization／CLI 併發時會
+		// 互相整包覆蓋——而被覆蓋掉的正是 `_ys_ecpay_refunds`，即「不重複退款」的唯一
+		// 依據。mutate() 內部重讀、重算、以舊值為條件寫入，落敗即重試。
+		$persist = static function ( array $entry ) use ( $order_id, $request_id ): bool {
+			return OrderPaymentDetail::mutate(
+				$order_id,
+				static function ( array $detail ) use ( $request_id, $entry ): array {
+					$hist                        = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
+					$hist[ $request_id ]         = array_merge( is_array( $hist[ $request_id ] ?? null ) ? $hist[ $request_id ] : [], $entry );
+					$detail['_ys_ecpay_refunds'] = $hist;
+					return $detail;
+				}
+			);
 		};
 
 		$client  = new EcpayPaymentClient();
@@ -147,7 +155,15 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			$gwsr  = (string) ( $query['data']['gwsr'] ?? '' );
 			if ( '' !== $gwsr ) {
 				$payment_detail['gwsr'] = $gwsr;
-				YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
+				// v0.2.12：此處先前寫回的是本方法開頭讀到的**舊快照**，因此不只有
+				// read-modify-write 視窗，而是會直接整包蓋掉期間任何其他 writer 的寫入。
+				OrderPaymentDetail::mutate(
+					$order_id,
+					static function ( array $detail ) use ( $gwsr ): array {
+						$detail['gwsr'] = $gwsr;
+						return $detail;
+					}
+				);
 			}
 		}
 		if ( '' === $gwsr ) {
@@ -199,8 +215,18 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'gwsr'              => $gwsr,
 				'time'   => current_time( 'mysql' ),
 			];
-			$payment_detail['_ys_ecpay_refunds'] = $history;
-			$persisted = YSOrder::update( $order_id, [ 'payment_detail' => wp_json_encode( $payment_detail ) ] );
+			// v0.2.12：只把本次新增的 attempt 併入「重讀到的」ledger，不再整包寫回
+			// 本方法開頭的舊快照。
+			$pending_entry = $history[ $request_id ];
+			$persisted     = OrderPaymentDetail::mutate(
+				$order_id,
+				static function ( array $detail ) use ( $request_id, $pending_entry ): array {
+					$hist                        = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
+					$hist[ $request_id ]         = $pending_entry;
+					$detail['_ys_ecpay_refunds'] = $hist;
+					return $detail;
+				}
+			);
 			if ( ! $persisted ) {
 				return [
 					'success' => false,
