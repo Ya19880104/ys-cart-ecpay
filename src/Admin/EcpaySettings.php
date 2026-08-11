@@ -94,7 +94,10 @@ final class EcpaySettings {
 			sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $prefix . '_merchant_id'] ?? '' ) ) )
 		);
 
-		foreach ( [ 'hash_key', 'hash_iv' ] as $secret_key ) {
+		foreach ( [ 'hash_key', 'hash_iv', 'credit_check_code' ] as $secret_key ) {
+			if ( ! isset( $keys[ $secret_key ] ) ) {
+				continue; // logistics 群組無 credit_check_code
+			}
 			$raw = trim( (string) wp_unslash( $_POST[ 'ys_ec_ecpay_' . $prefix . '_' . $secret_key ] ?? '' ) );
 			if ( '' !== $raw ) {
 				Settings::update( $keys[ $secret_key ], Settings::encrypt_secret( $raw ) );
@@ -255,6 +258,9 @@ final class EcpaySettings {
 			$out[ $prefix . '_merchant_id' ]     = (string) Settings::get( $keys['merchant_id'], '' );
 			$out[ $prefix . '_hash_key_is_set' ] = '' !== (string) Settings::get( $keys['hash_key'], '' );
 			$out[ $prefix . '_hash_iv_is_set' ]  = '' !== (string) Settings::get( $keys['hash_iv'], '' );
+			if ( isset( $keys['credit_check_code'] ) ) {
+				$out[ $prefix . '_credit_check_code_is_set' ] = '' !== (string) Settings::get( $keys['credit_check_code'], '' );
+			}
 		}
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );

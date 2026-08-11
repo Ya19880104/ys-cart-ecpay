@@ -66,6 +66,11 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
 							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_iv_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
+						<label class="ysca-field">
+							<span class="ysca-field__label"><?php esc_html_e( '信用卡查詢檢查碼', 'ys-cart-ecpay' ); ?></span>
+							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_credit_check_code" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( ! empty( $settings['payment_credit_check_code_is_set'] ) ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
+							<span class="ysca-field__hint"><?php esc_html_e( '綠界後台「信用卡收單」查詢檢查碼（CreditCheckCode）；信用卡退款的關帳狀態查詢必填。', 'ys-cart-ecpay' ); ?></span>
+						</label>
 					</div>
 				</div>
 			</div>
