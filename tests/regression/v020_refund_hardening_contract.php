@@ -195,7 +195,11 @@ namespace YangSheep\YSCartEcpay\Payment {
         /** @var list<array{0:string,1:mixed}> */
         public static array $calls = [];
         public static array $close = ['state' => 'closed', 'message' => ''];
-        public static array $query = ['success' => true, 'data' => []];
+        public static array $query = [
+            'success' => true,
+            'mac_verified' => true,
+            'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1'],
+        ];
         public static array $do_action_results = [];
         /** 每次 do_action 呼叫當下的 ledger 快照（證明「送出前已落盤」）。 */
         public static array $ledger_at_send = [];
@@ -255,6 +259,7 @@ namespace {
     require_once $core . 'YSPaymentDetailStore.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
+    require_once dirname(__DIR__, 2) . '/src/Payment/CoreRefundAuthorization.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayGatewayBase.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayCreditGateway.php';
 
@@ -291,7 +296,7 @@ namespace {
             'ecpay_merchant_id' => 'M1',
             '_ys_refund_finalization' => [
                 'req-1' => null === $core_entry
-                    ? ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting']
+                    ? ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false]
                     : $core_entry,
             ],
         ];
@@ -302,7 +307,11 @@ namespace {
         Settings::$test_mode = false;
         EcpayPaymentClient::$calls = [];
         EcpayPaymentClient::$close = ['state' => 'closed', 'message' => ''];
-        EcpayPaymentClient::$query = ['success' => true, 'data' => []];
+        EcpayPaymentClient::$query = [
+            'success' => true,
+            'mac_verified' => true,
+            'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1'],
+        ];
         EcpayPaymentClient::$do_action_results = [];
         EcpayPaymentClient::$ledger_at_send = [];
         \YangSheep\Ecommerce\Utils\YSLogger::$errors = [];
@@ -324,14 +333,14 @@ namespace {
     };
 
     // ══ F1：核心 entry 的嚴格 schema ═════════════════════════════════════
-    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => '0']);
+    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => '0', 'provider_done' => false, 'record_only' => false]);
     $r = $refund();
     $assert(
         !empty($r['success']) && 1 === EcpayPaymentClient::do_action_count(),
         '(a1) finalized="0"（字串零）是明確的 false → 正常放行'
     );
 
-    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => true]);
+    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => true, 'provider_done' => false, 'record_only' => false]);
     $r = $refund();
     $assert(
         empty($r['success']) && 0 === EcpayPaymentClient::do_action_count()
@@ -339,7 +348,7 @@ namespace {
         '(a2) finalized=true → 拒絕，且一次金流都不送'
     );
 
-    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'record_only' => 'no']);
+    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => 'no']);
     $r = $refund();
     $assert(
         empty($r['success']) && 0 === EcpayPaymentClient::do_action_count()
@@ -347,14 +356,14 @@ namespace {
         '(a3) 🔴 record_only="no" 無法解讀 → fail-closed（舊版 truthiness 會把它當成 true 或 false，兩種都是猜）'
     );
 
-    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => '1000abc', 'status' => 'submitting']);
+    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => '1000abc', 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false]);
     $r = $refund();
     $assert(
         empty($r['success']) && 0 === EcpayPaymentClient::do_action_count(),
         '(a4) 🔴 amount="1000abc" → 拒絕（舊版 (float) 轉型會變成 1000.0 而通過核對）'
     );
 
-    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000.0, 'status' => 'submitting']);
+    $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000.0, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false]);
     $r = $refund();
     $assert(
         !empty($r['success']) && 1 === EcpayPaymentClient::do_action_count(),
@@ -437,7 +446,11 @@ namespace {
     );
 
     $seed();
-    EcpayPaymentClient::$query = ['success' => true, 'data' => ['gwsr' => 'GW-1', 'Stage' => '3']];
+    EcpayPaymentClient::$query = [
+        'success' => true,
+        'mac_verified' => true,
+        'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1', 'gwsr' => 'GW-1', 'Stage' => '3'],
+    ];
     $r = $refund();
     $assert(
         empty($r['success'])
@@ -447,7 +460,7 @@ namespace {
     );
 
     $seed();
-    EcpayPaymentClient::$query = ['success' => false, 'message' => 'timeout', 'data' => null];
+    EcpayPaymentClient::$query = ['success' => false, 'mac_verified' => false, 'message' => 'timeout', 'data' => null];
     $r = $refund();
     $assert(
         empty($r['success']) && 0 === EcpayPaymentClient::do_action_count(),

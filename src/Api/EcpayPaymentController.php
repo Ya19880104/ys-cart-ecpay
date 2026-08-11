@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\Ecommerce\Utils\YSLogger;
@@ -147,13 +148,30 @@ final class EcpayPaymentController {
 				}
 			}
 
-			// v0.3.0：TradeNo 是退款、對帳、客服查詢的唯一交易識別碼。寫不進去卻
-			// ACK，綠界停止重送，這筆交易在我們這邊就永遠沒有交易編號。
-			if ( ! YSOrder::update( (int) $order->id, [
-				'gateway_trade_no' => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
-			] ) ) {
+			// v0.3.0：TradeNo 是退款、對帳、客服查詢的唯一交易識別碼。
+			//
+			// 🔴 兩件事都必須成立才可以 ACK：
+			//   1. TradeNo 是**非空**字串。空字串不是識別碼——把它寫進去等於宣稱
+			//      「這筆交易沒有編號」，而下游會把那當成事實。
+			//   2. 值**確實落在 DB 裡**。`YSOrder::update()` 回 true 不代表寫進去了
+			//      （affected=0 也算 true，而那可能是「訂單不存在」）。
+			$trade_no = ScalarColumnWriter::required_string(
+				sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) )
+			);
+
+			if ( null === $trade_no ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: 付款成功通知未帶 TradeNo，拒絕 ACK', [
+					'order_id' => (int) $order->id,
+				] );
+				$this->respond_text( '0|Persist Failed', 500 );
+				return;
+			}
+
+			$written = ScalarColumnWriter::write( (int) $order->id, [ 'gateway_trade_no' => $trade_no ] );
+			if ( ! ScalarColumnWriter::is_persisted( $written ) ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: gateway_trade_no 寫入失敗，拒絕 ACK 以觸發綠界重送', [
 					'order_id' => (int) $order->id,
+					'state'    => $written['state'],
 				] );
 				$this->respond_text( '0|Persist Failed', 500 );
 				return;

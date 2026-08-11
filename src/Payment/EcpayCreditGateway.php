@@ -141,15 +141,22 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// 持久化的 `stage=0`，同一筆交易就被判成一般信用卡放行。
 		//
 		// 判定依據不能取決於快取狀態。查詢失敗＝證據不完整＝不可判定（fail-closed）。
-		$query      = $client->query_trade( $merchant_trade_no );
-		$query_data = is_array( $query['data'] ?? null ) ? $query['data'] : null;
+		$query = $client->query_trade( $merchant_trade_no );
 
-		if ( null === $query_data ) {
+		// 🔴 v0.3.0：採信這份回應需要**四件事同時成立**。
+		//
+		// 舊版只看 `is_array( $query['data'] )`：非 2xx、CheckMacValue 不符、
+		// 「查無此交易」的錯誤回應——這些全都帶著 populated data，於是一份我們
+		// 無法證明來源、甚至根本不是這筆交易的回應，被拿來當退款依據。
+		$query_problem = self::query_problem( $query, $merchant_trade_no, $trade_no );
+		if ( null !== $query_problem ) {
 			return self::reject( sprintf(
-				'無法查詢綠界交易資訊（%s），卡別與關帳狀態都無法證明，已中止退款；請稍後重試或於綠界後台人工處理。',
-				sanitize_text_field( (string) ( $query['message'] ?? '未知錯誤' ) )
+				'無法採信綠界交易查詢結果（%s），卡別與關帳狀態都無法證明，已中止退款；請稍後重試或於綠界後台人工處理。',
+				sanitize_text_field( $query_problem )
 			) );
 		}
+
+		$query_data = $query['data'];
 
 		$gwsr = (string) ( $query_data['gwsr'] ?? '' );
 		if ( '' === $gwsr ) {
@@ -258,25 +265,14 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				// 核心 `_ys_refund_finalization` 才是「這筆退款請求存不存在、金額多少、
 				// 由哪個 gateway 執行」的權威來源；provider 端只憑自己的 ledger 仲裁，
 				// 等於允許任何人以任意 request_id 直接呼叫 gateway 退款。
-				$core_ledger = is_array( $detail['_ys_refund_finalization'] ?? null )
-					? $detail['_ys_refund_finalization']
-					: [];
-				$core_entry  = is_array( $core_ledger[ $request_id ] ?? null ) ? $core_ledger[ $request_id ] : null;
-
-				if ( null === $core_entry ) {
-					$decision = [ 'action' => 'no_core_request' ];
-					return null;
-				}
-				if ( 'ys_ec_ecpay_credit' !== (string) ( $core_entry['gateway_id'] ?? '' ) ) {
-					$decision = [ 'action' => 'core_gateway_mismatch', 'gateway' => (string) ( $core_entry['gateway_id'] ?? '' ) ];
-					return null;
-				}
-
 				// 🔴 v0.3.0：核心的**狀態**才是授權，光有 entry 不夠。
 				// 一筆已經 finalized、已經由 provider 完成、或根本是 record-only
 				// （人工記帳、未經金流）的請求，其 entry 一樣存在——只驗存在就等於
 				// 允許對這些請求再送一次 DoAction。
-				$schema = self::core_entry_problem( $core_entry, $amount_twd );
+				//
+				// 判定收斂在 CoreRefundAuthorization：reservation、送出前 arm、
+				// 每一次 CAS retry 共用同一份，不會再各自寬鬆。
+				$schema = CoreRefundAuthorization::problem_in( $detail, $request_id, $amount_twd );
 				if ( null !== $schema ) {
 					$decision = $schema;
 					return null;
@@ -620,6 +616,48 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	/**
+	 * 這份 QueryTradeInfo 回應可以拿來當退款依據嗎？（v0.3.0）
+	 *
+	 * 四道全部要過：
+	 *   1. `success === true`（嚴格布林，不接受 truthy）
+	 *   2. `mac_verified === true` —— 沒有 CheckMacValue 的回應無法證明來源
+	 *   3. `data` 是陣列
+	 *   4. 交易識別逐字元相符：MerchantTradeNo 必須是我們送出的那一筆；
+	 *      回應若帶 TradeNo，也必須與訂單記錄的相符
+	 *
+	 * @param array<string,mixed> $query
+	 * @return string|null null＝可採信；否則是可回報的原因
+	 */
+	private static function query_problem( array $query, string $merchant_trade_no, string $trade_no ): ?string {
+		if ( true !== ( $query['success'] ?? null ) ) {
+			return (string) ( $query['message'] ?? '查詢未成功' );
+		}
+
+		if ( true !== ( $query['mac_verified'] ?? null ) ) {
+			return 'CheckMacValue 未驗證通過（無法證明回應來源）';
+		}
+
+		$data = $query['data'] ?? null;
+		if ( ! is_array( $data ) ) {
+			return '回應內容格式異常';
+		}
+
+		$resp_mtn = isset( $data['MerchantTradeNo'] ) && is_string( $data['MerchantTradeNo'] )
+			? trim( $data['MerchantTradeNo'] )
+			: '';
+		if ( '' === $resp_mtn || ! hash_equals( $merchant_trade_no, $resp_mtn ) ) {
+			return sprintf( 'MerchantTradeNo 不符（回應 %s）', sanitize_text_field( $resp_mtn ) );
+		}
+
+		$resp_tn = isset( $data['TradeNo'] ) && is_string( $data['TradeNo'] ) ? trim( $data['TradeNo'] ) : '';
+		if ( '' !== $resp_tn && '' !== $trade_no && ! hash_equals( $trade_no, $resp_tn ) ) {
+			return sprintf( 'TradeNo 不符（回應 %s）', sanitize_text_field( $resp_tn ) );
+		}
+
+		return null;
+	}
+
+	/**
 	 * 業務拒絕（金流確定未動）——core 以 rejected_terminal 表示「可安全重試」。
 	 *
 	 * @return array{success:false, outcome:string, message:string}
@@ -657,6 +695,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			'request_id' => $request_id,
 			'phase'      => $phase,
 			'trade_no'   => $trade_no,
+		] );
+
+		// 金流已經動了。就算 attempt 寫不進去（或我們已失去授權），provider 的
+		// 事實仍必須保存下來——人工核定唯一能依據的就是它。
+		self::record_orphan_facts( $order_id, $request_id, [
+			'phase'    => $phase,
+			'trade_no' => $trade_no,
 		] );
 
 		return [
@@ -706,15 +751,20 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 					return null;
 				}
 
-				// 🔴 核心授權必須用**這一次 CAS 讀到的**值重驗：reserve 與終態寫入
-				// 之間，核心可能已經把這筆請求核定完成或改派給別的 gateway。
-				$core_ledger = is_array( $detail['_ys_refund_finalization'] ?? null )
-					? $detail['_ys_refund_finalization']
-					: [];
-				$core_entry  = is_array( $core_ledger[ $request_id ] ?? null ) ? $core_ledger[ $request_id ] : null;
-				if ( null !== $core_entry
-					&& 'ys_ec_ecpay_credit' !== (string) ( $core_entry['gateway_id'] ?? '' ) ) {
-					$decision = [ 'action' => 'core_gateway_mismatch' ];
+				// 🔴 核心授權必須用**這一次 CAS 讀到的**值完整重驗。
+				//
+				// 舊版只檢查「entry 存在且 gateway 不同」：entry 消失、status 改成
+				// 別的、金額被改、旗標被設起來——全都通過，於是 arm token 照寫、
+				// DoAction 照送、終態照落。用的是同一份 validator，不會再漂移。
+				//
+				// $expect_terminal 為 null（送出前 arm／中途註記）時必須通過；終態
+				// 寫入時允許核心已經前進（下方 authority_drift 分流）。
+				$core_problem = CoreRefundAuthorization::problem_in( $detail, $request_id, (int) $fingerprint['amount'] );
+				if ( null !== $core_problem ) {
+					$decision = [
+						'action'  => 'core_authority_lost',
+						'problem' => $core_problem,
+					];
 					return null;
 				}
 
@@ -761,8 +811,11 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 		// terminal 已存在且正好是我們想寫的終態＝先前已成功落盤，視為冪等成功。
 		//
-		// 🔴 但「名稱相同」不夠：一筆屬於**別的交易**的 attempt 也可能剛好是 done。
-		// 必須連指紋一起相符才算同一筆。
+		// 🔴 但「名稱相同」不夠。兩層都要對得上：
+		//   1. 指紋 —— 一筆屬於**別的交易**的 attempt 也可能剛好是 done
+		//   2. 這次要寫的每一個欄位 —— 既有 entry 必須**逐欄相符**。
+		//      舊版只比 status：一筆 `executed=E`（只做了第一步）的 done，會讓
+		//      我們把 `executed=E,N` 的請求當成「已經落盤過」而回報成功。
 		if ( 'terminal' === $action && null !== $expect_terminal
 			&& $expect_terminal === ( is_array( $decision ) ? (string) ( $decision['status'] ?? '' ) : '' ) ) {
 			$existing = OrderPaymentDetail::read( $order_id );
@@ -770,9 +823,17 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				? $existing['_ys_ecpay_refunds'][ $request_id ]
 				: null;
 
-			if ( null !== $entry && self::fingerprint_matches( $entry, $fingerprint ) ) {
+			if ( null !== $entry
+				&& self::fingerprint_matches( $entry, $fingerprint )
+				&& self::patch_readback_matches( $entry, $patch ) ) {
 				return true;
 			}
+
+			YSLogger::error( 'ecpay', 'CRITICAL: 既有終態與本次要寫的內容不一致（不得當成冪等）', [
+				'order_id'   => $order_id,
+				'request_id' => $request_id,
+				'expected'   => $expect_terminal,
+			] );
 		}
 
 		YSLogger::error( 'ecpay', 'attempt 狀態寫入被拒或失敗', array_merge(
@@ -785,6 +846,63 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		) );
 
 		return false;
+	}
+
+	/**
+	 * 既有 entry 是否**逐欄**等於這次要寫的 patch（v0.3.0）
+	 *
+	 * 冪等的意義是「這次要做的事先前已經做完了」。只比 status 不足以支撐那個結論
+	 * ——`executed`、`response_trade_no` 這些才是「做完了什麼」的內容。
+	 *
+	 * @param array<string,mixed> $entry
+	 * @param array<string,mixed> $patch
+	 */
+	private static function patch_readback_matches( array $entry, array $patch ): bool {
+		foreach ( $patch as $key => $expected ) {
+			if ( ! array_key_exists( $key, $entry ) ) {
+				return false;
+			}
+
+			// 型別敏感：`'1'` 與 `1`、`''` 與 `null` 都不算相符。
+			if ( $entry[ $key ] !== $expected ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * 金流已動、但我們失去了寫入權（核心把請求改派／核定）時，把 provider 的事實
+	 * 保存在一個**不需要核心授權**的地方（v0.3.0）
+	 *
+	 * 這些事實是「綠界那邊到底發生了什麼」的唯一紀錄。因為失去授權就丟掉它們，
+	 * 人工核定時將無從判斷該不該補退款。
+	 *
+	 * @param array<string,mixed> $facts
+	 */
+	private static function record_orphan_facts( int $order_id, string $request_id, array $facts ): void {
+		$written = OrderPaymentDetail::mutate(
+			$order_id,
+			static function ( array $detail ) use ( $request_id, $facts ): array {
+				$orphans = is_array( $detail['_ys_ecpay_orphan_facts'] ?? null ) ? $detail['_ys_ecpay_orphan_facts'] : [];
+
+				$existing = is_array( $orphans[ $request_id ] ?? null ) ? $orphans[ $request_id ] : [];
+				$existing[] = array_merge( $facts, [ 'recorded_at' => current_time( 'mysql' ) ] );
+
+				$orphans[ $request_id ]              = $existing;
+				$detail['_ys_ecpay_orphan_facts']    = $orphans;
+
+				return $detail;
+			}
+		);
+
+		if ( ! $written->is_persisted() ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 失去授權後的 provider 事實也寫不進去（只剩 log）', array_merge(
+				[ 'order_id' => $order_id, 'request_id' => $request_id ],
+				$facts
+			) );
+		}
 	}
 
 	/** 非終態註記；寫不進去不改變結論（凍結由送出前的 pending 保證），僅記錄。 */

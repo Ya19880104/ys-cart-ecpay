@@ -193,7 +193,11 @@ namespace YangSheep\YSCartEcpay\Payment {
         /** @var list<array{0:string,1:mixed}> */
         public static array $calls = [];
         public static array $close = ['state' => 'closed', 'message' => ''];
-        public static array $query = ['success' => true, 'data' => []];
+        public static array $query = [
+            'success' => true,
+            'mac_verified' => true,
+            'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1'],
+        ];
         /** 每個 DoAction 動作的回應（依序取用）。 */
         public static array $do_action_results = [];
 
@@ -241,6 +245,7 @@ namespace {
     require_once $core . 'YSPaymentDetailStore.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
+    require_once dirname(__DIR__, 2) . '/src/Payment/CoreRefundAuthorization.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayGatewayBase.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayCreditGateway.php';
 
@@ -282,7 +287,7 @@ namespace {
             // v0.3.0：核心的**狀態**才是授權——只有 submitting 且未 finalized／
             // 未 provider_done／非 record_only 的請求可以觸發金流動作。
             '_ys_refund_finalization' => null === $core
-                ? ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting']]
+                ? ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false]]
                 : $core,
         ];
         $wpdb->value = json_encode(array_merge($base, $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -340,8 +345,8 @@ namespace {
     //     核心 ledger 必須同時有 req-2（否則會先被「核心沒有這筆請求」擋掉，
     //     那是另一道 gate，證明不了全單凍結）。
     $w = $seed([], [
-        'req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting'],
-        'req-2' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting'],
+        'req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false],
+        'req-2' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false],
     ]);
     $w->before_write = static function (FakeWpdb $db, string $sql): void {
         if (!str_contains($sql, '_ys_ecpay_refunds')) {
@@ -464,7 +469,11 @@ namespace {
     $wpdb = new FakeWpdb();
     $wpdb->value = json_encode(['trade_no' => 'TN-1', 'mer_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1'], JSON_UNESCAPED_SLASHES);
     EcpayPaymentClient::$calls = [];
-    EcpayPaymentClient::$query = ['success' => true, 'data' => []];
+    EcpayPaymentClient::$query = [
+        'success' => true,
+        'mac_verified' => true,
+        'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1'],
+    ];
     $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
     if (($r['success'] ?? false) || EcpayPaymentClient::do_action_count() > 0) {
         $gate_ok = false;
@@ -590,12 +599,20 @@ namespace {
 
     // (s) 卡別證據：持久化的 0 不得遮掉 query 回報的正值
     $w = $seed(['ecpay_stage' => '0']);
-    EcpayPaymentClient::$query = ['success' => true, 'data' => ['gwsr' => 'GW-1', 'stage' => '3']];
+    EcpayPaymentClient::$query = [
+        'success' => true,
+        'mac_verified' => true,
+        'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1', 'gwsr' => 'GW-1', 'stage' => '3'],
+    ];
     $detail = json_decode((string) $wpdb->value, true);
     unset($detail['gwsr']); // 逼出 QueryTradeInfo 補查路徑
     $wpdb->value = json_encode($detail, JSON_UNESCAPED_SLASHES);
     $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
-    EcpayPaymentClient::$query = ['success' => true, 'data' => []];
+    EcpayPaymentClient::$query = [
+        'success' => true,
+        'mac_verified' => true,
+        'data' => ['MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => 'TN-1'],
+    ];
     $assert(
         false === ($r['success'] ?? true)
         && 0 === EcpayPaymentClient::do_action_count()

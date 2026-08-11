@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Gateways\YSGatewayInterface;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
@@ -127,13 +128,16 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		// 付款通知回來時，核心以 gateway_id 決定由哪個 provider 處理、退款以它判定
 		// 歸屬；沒寫進去卻讓使用者付了款，這筆交易在系統裡不屬於任何 gateway——
 		// 通知無人認領、退款也找不到執行者。
-		if ( ! YSOrder::update( $order_id, [
+		$identity = ScalarColumnWriter::write( $order_id, [
 			'gateway_id'     => $method_id,
 			'payment_method' => $method_id,
-		] ) ) {
+		] );
+
+		if ( ! ScalarColumnWriter::is_persisted( $identity ) ) {
 			YSLogger::error( 'ecpay', 'CRITICAL: gateway identity 寫入失敗，拒絕簽發付款表單', [
 				'order_id' => $order_id,
 				'method'   => $method_id,
+				'state'    => $identity['state'],
 			] );
 
 			return [

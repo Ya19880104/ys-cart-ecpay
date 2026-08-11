@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Api;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\Ecommerce\Utils\YSLogger;
@@ -173,11 +174,13 @@ final class EcpayLogisticsController {
 		// v0.3.0：純量欄位（tracking_number／shipping_status）同樣不得靜默失敗。
 		// 消費者是靠 tracking_number 查件的；寫不進去卻回 1|OK，這次狀態變更就永久
 		// 遺失，而訂單頁上什麼都不會顯示。
-		if ( ! YSOrder::update( (int) $order->id, $order_update ) ) {
+		$written = ScalarColumnWriter::write( (int) $order->id, $order_update );
+		if ( ! ScalarColumnWriter::is_persisted( $written ) ) {
 			YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback 的訂單欄位寫入失敗', [
 				'order_id' => (int) $order->id,
 				'status'   => $status,
 				'tracking' => $tracking,
+				'state'    => $written['state'],
 			] );
 
 			return false;

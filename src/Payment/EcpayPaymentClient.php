@@ -140,27 +140,38 @@ final class EcpayPaymentClient {
 			];
 		}
 
-		if ( isset( $data['CheckMacValue'] )
-			&& ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
-			return [
-				'success' => false,
-				'data'    => $data,
-				'message' => 'Invalid ECPay query CheckMacValue.',
-			];
+		// 🔴 v0.3.0：MAC 是否**驗過**必須明確回報，而不是「有帶就驗、沒帶就算了」。
+		//
+		// 退款是不可逆的動作，它的依據不能是一份無法證明來源的回應。呼叫端據
+		// `mac_verified` 決定要不要採信；一般查詢仍可容忍缺 MAC 的回應。
+		$mac_verified = false;
+		if ( isset( $data['CheckMacValue'] ) ) {
+			if ( ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
+				return [
+					'success'      => false,
+					'data'         => $data,
+					'mac_verified' => false,
+					'message'      => 'Invalid ECPay query CheckMacValue.',
+				];
+			}
+
+			$mac_verified = true;
 		}
 
 		if ( empty( $data['MerchantTradeNo'] ) && empty( $data['TradeStatus'] ) ) {
 			return [
-				'success' => false,
-				'data'    => $data,
-				'message' => (string) ( $data['RtnMsg'] ?? $data['Message'] ?? 'ECPay query returned no trade data.' ),
+				'success'      => false,
+				'data'         => $data,
+				'mac_verified' => $mac_verified,
+				'message'      => (string) ( $data['RtnMsg'] ?? $data['Message'] ?? 'ECPay query returned no trade data.' ),
 			];
 		}
 
 		return [
-			'success' => true,
-			'data'    => $data,
-			'message' => '',
+			'success'      => true,
+			'data'         => $data,
+			'mac_verified' => $mac_verified,
+			'message'      => '',
 		];
 	}
 
