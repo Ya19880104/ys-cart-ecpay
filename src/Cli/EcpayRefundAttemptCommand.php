@@ -12,15 +12,15 @@ use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 /**
  * 退款 attempt 人工核定 CLI（v0.3.0，CODEX 終審 F4）
  *
- * 「全單凍結」的唯一合法解除入口：管理員於綠界後台確認實際狀態後，
- * 以本命令把結果未明（pending）的 attempt 核定為 done／failed。
+ * 這個命令**只讀不寫**。
  *
- *   wp ys-ecpay refund-attempts list --order=<id>
- *   wp ys-ecpay refund-attempts resolve --order=<id> --request=<request_id> --mark=done|failed [--trade-no=<no>]
+ *   wp ys-ecpay refund-attempts list    --order=<id>
+ *   wp ys-ecpay refund-attempts resolve --order=<id> --request=<id> --mark=done|failed
  *
- * CAS 保證：resolve 於寫入前重讀最新 payment_detail，僅當該 entry 仍為
- * pending 才改寫（比對舊值＝application-level compare-and-set）；已被其他
- * 程序改寫則中止並要求重查。權限＝WP-CLI（伺服器 shell 等級，等同 admin）。
+ * `resolve` 是導引，不是權威：它顯示 attempt 現況後，把操作者導向核心 CLI。
+ * 人工復原只有一個入口——核心核定會 fire `ys_ec_refund_finalization_sync`，
+ * 本外掛的 listener 在同一個 CAS 內完成 gateway／金額／指紋三道核對後同步
+ * attempt。兩套 ledger 一次解除，核對不會被跳過，指紋也不會被人工改寫。
  */
 final class EcpayRefundAttemptCommand {
 
@@ -64,10 +64,22 @@ final class EcpayRefundAttemptCommand {
 	}
 
 	/**
-	 * 核定一筆結果未明的 attempt（CAS：僅 pending 可核定）。
+	 * 把人工核定導向**唯一的**復原入口：核心 CLI（v0.3.0）
+	 *
+	 * 🔴 這個子命令不再自行改動退款帳本。
+	 *
+	 * 先前它是第二套權威：直接把 attempt 從 pending 改成 done／failed，還接受
+	 * `--trade-no` 覆寫——那個欄位是**交易指紋**的一部分，改掉它等於讓之後所有
+	 * fingerprint 比對失去意義。更根本的問題是「兩套帳本、兩個入口」：核心的
+	 * `_ys_refund_finalization` 與本外掛的 `_ys_ecpay_refunds` 各自凍結，只解其一
+	 * 另一邊仍擋著；運維得記住要跑兩個命令、還要記得順序。
+	 *
+	 * 現在只有一條路：核心 CLI 核定 → fire `ys_ec_refund_finalization_sync` →
+	 * 本外掛的 listener（`on_core_resolved`）在同一個 CAS 內完成 gateway／金額／
+	 * 指紋三道核對後同步 attempt。一個命令解除兩套 ledger，而且核對不會被跳過。
 	 *
 	 * @subcommand resolve
-	 * @synopsis --order=<id> --request=<request_id> --mark=<done|failed> [--trade-no=<no>]
+	 * @synopsis --order=<id> --request=<request_id> --mark=<done|failed>
 	 */
 	public function resolve( array $args, array $assoc ): void {
 		$order_id   = (int) ( $assoc['order'] ?? 0 );
@@ -80,79 +92,58 @@ final class EcpayRefundAttemptCommand {
 		if ( '' === $request_id ) {
 			\WP_CLI::error( '--request 不得為空。' );
 		}
+		if ( $order_id <= 0 ) {
+			\WP_CLI::error( '--order 必須為正整數。' );
+		}
 
-		// v0.3.0：改用核心共用 CAS（YSPaymentDetailStore）。仲裁（attempt 是否存在、
-		// 是否仍為 pending）**全部在 mutator 內**，因此 CAS 落敗重讀後會拿最新的
-		// ledger 重跑一次判定——不會用第一次讀到的舊狀態去覆寫別人剛核定的結果。
-		$trade_no_override = 'done' === $mark ? sanitize_text_field( (string) ( $assoc['trade-no'] ?? '' ) ) : '';
+		if ( array_key_exists( 'trade-no', $assoc ) ) {
+			\WP_CLI::error(
+				'--trade-no 已移除：交易編號是退款指紋的一部分，人工覆寫會讓之後所有指紋比對失去意義。'
+					. '綠界端的實際交易編號請以綠界後台查詢結果為準。'
+			);
+		}
 
-		$result = OrderPaymentDetail::mutate(
-			$order_id,
-			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $mark, $trade_no_override ): ?array {
-				$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-				$entry   = is_array( $history[ $request_id ] ?? null ) ? $history[ $request_id ] : null;
+		// 唯讀確認：讓操作者在轉向核心命令之前先看到這筆 attempt 的現況。
+		$detail = OrderPaymentDetail::read( $order_id );
+		if ( null === $detail ) {
+			\WP_CLI::error( "無法讀取訂單 {$order_id} 的付款紀錄（訂單不存在或欄位損壞）。" );
+		}
 
-				if ( null === $entry ) {
-					$decision = [ 'action' => 'missing' ];
-					return null;
-				}
-				if ( 'pending' !== ( $entry['status'] ?? '' ) ) {
-					$decision = [ 'action' => 'not_pending', 'status' => (string) ( $entry['status'] ?? '?' ) ];
-					return null;
-				}
+		$entry = is_array( $detail['_ys_ecpay_refunds'][ $request_id ] ?? null )
+			? $detail['_ys_ecpay_refunds'][ $request_id ]
+			: null;
 
-				$entry['status']      = $mark;
-				$entry['resolved_by'] = 'wp-cli';
-				$entry['resolved_at'] = current_time( 'mysql' );
-				if ( '' !== $trade_no_override ) {
-					$entry['trade_no'] = $trade_no_override;
-				}
-
-				$history[ $request_id ]      = $entry;
-				$detail['_ys_ecpay_refunds'] = $history;
-				$decision                    = [ 'action' => 'resolved' ];
-
-				return $detail;
-			}
-		);
-
-		$decision = $result->get_decision();
-		$action   = is_array( $decision ) ? (string) ( $decision['action'] ?? '' ) : '';
-
-		if ( 'missing' === $action ) {
+		if ( null === $entry ) {
 			\WP_CLI::error( "attempt {$request_id} 不存在。" );
 		}
-		if ( 'not_pending' === $action ) {
+
+		$status = (string) ( $entry['status'] ?? '?' );
+		if ( 'pending' !== $status ) {
 			\WP_CLI::error( sprintf(
-				'attempt %s 目前狀態為 %s（非 pending）——可能已被其他程序核定，請重新 list 確認後再操作。',
+				'attempt %s 目前狀態為 %s（非 pending）——可能已被核心核定同步過，請重新 list 確認。',
 				$request_id,
-				is_array( $decision ) ? (string) ( $decision['status'] ?? '?' ) : '?'
-			) );
-		}
-		if ( $result->is_missing_order() ) {
-			\WP_CLI::error( "訂單 {$order_id} 不存在。" );
-		}
-		if ( ! $result->is_persisted() ) {
-			\WP_CLI::error( sprintf(
-				'核定未寫入（%s）：payment_detail 於核定期間被反覆改寫或欄位無法解讀；請重新 list 確認最新狀態後再操作。',
-				$result->get_outcome()
+				$status
 			) );
 		}
 
-		\WP_CLI::success( sprintf(
-			'attempt %s 已核定為 %s。%s',
+		\WP_CLI::log( sprintf(
+			'attempt %s：金額 %s、執行 %s、指紋 trade_no=%s／gwsr=%s',
 			$request_id,
-			$mark,
-			'done' === $mark
-				// R8-F3：核心 ledger 不會被本命令解除——核心的 submitting 凍結會擋在
-				// gateway 呼叫之前，「以相同退款操作補齊核心帳務」根本進不到本外掛。
-				// 正確入口＝核心 CLI（它會續作帳務並回頭同步本外掛紀錄）。
-				? ' 提醒：本命令只核定「綠界端」紀錄；核心帳務請執行'
-					. ' wp ys-cart refund-finalization resolve --order=' . $order_id
-					. ' --request=' . $request_id . ' --mark=paid'
-					. '（會續作核心帳務，並自動同步本外掛的退款紀錄）。'
-				: ''
+			(string) ( $entry['amount'] ?? '?' ),
+			(string) ( $entry['executed'] ?? $entry['plan'] ?? '-' ),
+			(string) ( $entry['trade_no'] ?? '-' ),
+			(string) ( $entry['gwsr'] ?? '-' )
 		) );
+
+		\WP_CLI::error(
+			'本命令不再自行核定 —— 人工復原只有一個入口，請執行：' . PHP_EOL . PHP_EOL
+				. '  wp ys-cart refund-finalization resolve'
+				. ' --order=' . $order_id
+				. ' --request=' . $request_id
+				. ' --mark=' . ( 'done' === $mark ? 'paid' : 'aborted' ) . PHP_EOL . PHP_EOL
+				. '它會續作核心帳務，並在同一次操作內同步解除本外掛的退款凍結'
+				. '（gateway／金額／交易指紋三道核對會在同一個 CAS 內重跑）。'
+		);
 	}
 
 	/**
@@ -293,7 +284,7 @@ final class EcpayRefundAttemptCommand {
 
 		$sync_decision = $sync->get_decision();
 		$sync_action   = is_array( $sync_decision ) ? (string) ( $sync_decision['action'] ?? '' ) : '';
-		$manual        = '——請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定';
+		$manual        = '——請人工核對後重新執行 wp ys-cart refund-finalization resolve';
 
 		if ( 'missing' === $sync_action ) {
 			return $results; // 無此 attempt → 不回報
@@ -349,10 +340,10 @@ final class EcpayRefundAttemptCommand {
 				'provider'   => 'ecpay',
 				'gateway_id' => self::GATEWAY_ID,
 				'success'    => false,
-				'message'    => 'CAS 落敗（payment_detail 於期間被改寫），退款 attempt 仍為 pending；請執行'
-					. ' wp ys-ecpay refund-attempts resolve --order=' . $order_id
+				'message'    => 'CAS 落敗（payment_detail 於期間被改寫），退款 attempt 仍為 pending；請重新執行'
+					. ' wp ys-cart refund-finalization resolve --order=' . $order_id
 					. ' --request=' . $request_id
-					. ' --mark=' . ( 'paid' === $mark ? 'done' : 'failed' ),
+					. ' --mark=' . $mark,
 			];
 			return $results;
 		}

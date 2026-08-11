@@ -131,31 +131,48 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 		$client = new EcpayPaymentClient();
 
-		// ── 步驟 1：取得授權單號 gwsr（關帳狀態查詢的 key；唯讀，可在 reserve 前執行）──
-		$gwsr        = (string) ( $payment_detail['gwsr'] ?? $payment_detail['ecpay_gwsr'] ?? '' );
-		$query_data  = null;
+		// ── 步驟 1：QueryTradeInfo（唯讀）——卡別判定的**唯一證據集合**由此固定 ──
+		//
+		// 🔴 v0.3.0：這次查詢**一律執行**，不再只在缺 gwsr 時才查。
+		//
+		// 舊版是「gwsr 已快取 → 跳過查詢 → 卡別只看 payment_detail」。於是同一筆
+		// 交易會因為一個**與卡別無關的快取**是否命中，而得到不同的證據集合：
+		// 快取未命中時 QueryTradeInfo 回報 `stage=3` 會擋下分期；快取命中時只看到
+		// 持久化的 `stage=0`，同一筆交易就被判成一般信用卡放行。
+		//
+		// 判定依據不能取決於快取狀態。查詢失敗＝證據不完整＝不可判定（fail-closed）。
+		$query      = $client->query_trade( $merchant_trade_no );
+		$query_data = is_array( $query['data'] ?? null ) ? $query['data'] : null;
+
+		if ( null === $query_data ) {
+			return self::reject( sprintf(
+				'無法查詢綠界交易資訊（%s），卡別與關帳狀態都無法證明，已中止退款；請稍後重試或於綠界後台人工處理。',
+				sanitize_text_field( (string) ( $query['message'] ?? '未知錯誤' ) )
+			) );
+		}
+
+		$gwsr = (string) ( $query_data['gwsr'] ?? '' );
 		if ( '' === $gwsr ) {
-			$query      = $client->query_trade( $merchant_trade_no );
-			$query_data = is_array( $query['data'] ?? null ) ? $query['data'] : null;
-			$gwsr       = (string) ( $query_data['gwsr'] ?? '' );
-			if ( '' !== $gwsr ) {
-				// gwsr 回寫只是快取（下次不必再查），寫不進去不影響本次判定，
-				// 但仍要留下紀錄——它同時是「CAS 是否健康」的早期訊號。
-				$cached = OrderPaymentDetail::mutate(
-					$order_id,
-					static function ( array $detail ) use ( $gwsr ): array {
-						$detail['gwsr'] = $gwsr;
-						return $detail;
-					}
-				);
-				if ( ! $cached->is_persisted() ) {
-					YSLogger::warning( 'ecpay', 'gwsr 快取回寫失敗（不影響本次退款判定）', array_merge(
-						[ 'order_id' => $order_id ],
-						$cached->to_log_context()
-					) );
+			// 查詢成功但沒有 gwsr → 退回已持久化的值（webhook 當時寫下的同一筆事實）。
+			$gwsr = (string) ( $payment_detail['gwsr'] ?? $payment_detail['ecpay_gwsr'] ?? '' );
+		} else {
+			// gwsr 回寫只是快取（查詢失敗時仍有依據），寫不進去不影響本次判定，
+			// 但仍要留下紀錄——它同時是「CAS 是否健康」的早期訊號。
+			$cached = OrderPaymentDetail::mutate(
+				$order_id,
+				static function ( array $detail ) use ( $gwsr ): array {
+					$detail['gwsr'] = $gwsr;
+					return $detail;
 				}
+			);
+			if ( ! $cached->is_persisted() ) {
+				YSLogger::warning( 'ecpay', 'gwsr 快取回寫失敗（不影響本次退款判定）', array_merge(
+					[ 'order_id' => $order_id ],
+					$cached->to_log_context()
+				) );
 			}
 		}
+
 		if ( '' === $gwsr ) {
 			return self::reject( '無法取得綠界授權單號（gwsr），無法判定關帳狀態；請於綠界後台人工處理退款。' );
 		}
@@ -259,25 +276,9 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				// 一筆已經 finalized、已經由 provider 完成、或根本是 record-only
 				// （人工記帳、未經金流）的請求，其 entry 一樣存在——只驗存在就等於
 				// 允許對這些請求再送一次 DoAction。
-				$core_status = (string) ( $core_entry['status'] ?? '' );
-				if ( 'submitting' !== $core_status ) {
-					$decision = [ 'action' => 'core_not_submitting', 'status' => $core_status ];
-					return null;
-				}
-				if ( ! empty( $core_entry['finalized'] ) ) {
-					$decision = [ 'action' => 'core_finalized' ];
-					return null;
-				}
-				if ( ! empty( $core_entry['provider_done'] ) ) {
-					$decision = [ 'action' => 'core_provider_done' ];
-					return null;
-				}
-				if ( ! empty( $core_entry['record_only'] ) ) {
-					$decision = [ 'action' => 'core_record_only' ];
-					return null;
-				}
-				if ( ! isset( $core_entry['amount'] ) || abs( (float) $core_entry['amount'] - (float) $amount_twd ) > 0.005 ) {
-					$decision = [ 'action' => 'core_amount_mismatch', 'core_amount' => $core_entry['amount'] ?? null ];
+				$schema = self::core_entry_problem( $core_entry, $amount_twd );
+				if ( null !== $schema ) {
+					$decision = $schema;
 					return null;
 				}
 
@@ -341,9 +342,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 		if ( 'idempotent_replay' === $action ) {
 			$entry = is_array( $decision['entry'] ?? null ) ? $decision['entry'] : [];
+			// 冪等重放回報**綠界確認的**交易編號（response_trade_no）；沒有它就退回
+			// 指紋內的 trade_no——但兩者語意不同，不能靜默混用，所以順序固定。
+			$replay_trade_no = (string) ( $entry['response_trade_no'] ?? '' );
 			return [
 				'success'        => true,
-				'transaction_id' => (string) ( $entry['trade_no'] ?? $trade_no ),
+				'transaction_id' => '' !== $replay_trade_no ? $replay_trade_no : (string) ( $entry['trade_no'] ?? $trade_no ),
 				'message'        => '（冪等重放：此退刷請求先前已成功）',
 			];
 		}
@@ -367,6 +371,16 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'核心退款請求目前為「%s」而非 submitting，已拒絕操作——只有正在送出中的請求可以觸發金流動作。',
 				sanitize_text_field( $status )
 			) );
+		}
+		if ( 'core_flag_unreadable' === $action ) {
+			$flag = is_array( $decision ) ? (string) ( $decision['flag'] ?? '?' ) : '?';
+			return self::reject( sprintf(
+				'核心退款紀錄的旗標「%s」無法解讀（非 bool／0／1），已拒絕操作；請人工核對後處理。',
+				sanitize_text_field( $flag )
+			) );
+		}
+		if ( 'core_amount_unreadable' === $action ) {
+			return self::reject( '核心退款紀錄的金額欄位無法解讀為整數，已拒絕操作；請人工核對後處理。' );
 		}
 		if ( 'core_finalized' === $action ) {
 			return self::reject( '核心退款請求已核定完成，不得再送出金流動作。' );
@@ -410,6 +424,47 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		$result   = [ 'success' => false, 'indeterminate' => false, 'data' => null, 'message' => '' ];
 
 		foreach ( $plan as $step ) {
+			// 🔴 v0.3.0：**送出之前**先落盤一筆 operation token。
+			//
+			// reservation 證明「這一筆退款是我們仲裁通過的」，但它不區分「還沒送」
+			// 與「送了但沒收到回應」。process 在 do_action_refund 中途被 kill（PHP
+			// timeout、worker 重啟）時，ledger 停在 reserve 當下的樣子——人工核定
+			// 時看不出綠界那邊到底有沒有收到請求。
+			//
+			// 寫不進去就**不送**：沒有 durable 的送出前紀錄，等於沒有事後可查證的
+			// 依據，而退款是不可逆的。
+			$op_token = self::operation_token( $request_id, $step, count( $executed ) );
+			$armed    = self::mark_attempt( $order_id, $request_id, [
+				'operation_token' => $op_token,
+				'pending_step'    => $step,
+				'sent_at'         => current_time( 'mysql' ),
+			], $fingerprint, null );
+
+			if ( ! $armed ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: 送出前紀錄寫入失敗，已中止（未送出本步）', [
+					'order_id'   => $order_id,
+					'request_id' => $request_id,
+					'step'       => $step,
+					'executed'   => implode( ',', $executed ),
+				] );
+
+				if ( $executed ) {
+					// 已經有步驟生效了 → 全單凍結，等人工核定。
+					return [
+						'success' => false,
+						'outcome' => 'indeterminate',
+						'message' => sprintf(
+							'已執行 %s，但下一步（%s）的送出前紀錄寫不進去，已中止並凍結本單退款；'
+								. '請於綠界後台確認實際狀態後人工核定。',
+							implode( ',', $executed ),
+							$step
+						),
+					];
+				}
+
+				return self::reject( '退款送出前的紀錄無法持久化，已中止；未執行任何金流操作，請重試。' );
+			}
+
 			// 🔴 v0.3.0：`executed` 只記**成功**的步驟。舊版在取得結果之前就把 step
 			// 推進陣列，於是 E 成功、N 失敗會被記成 `executed=E,N`——人工核定時看到
 			// 的是「兩步都做了」，實際上 N 從未生效。事實要分三種：已完成、嘗試過、
@@ -470,7 +525,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 						'message' => sprintf(
 							'退款部分完成（已執行 %s，%s 失敗）：前置步驟已改變綠界端交易狀態，'
 								. '不得重送完整流程。本單退款已凍結，請於綠界後台確認實際狀態後以 '
-								. 'wp ys-ecpay refund-attempts resolve 人工核定。',
+								. 'wp ys-cart refund-finalization resolve 人工核定。',
 							implode( ',', $prior_steps ),
 							$step
 						),
@@ -514,11 +569,38 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			}
 		}
 
-		$done_trade_no = (string) ( $result['data']['TradeNo'] ?? $trade_no );
-		$marked        = self::mark_attempt( $order_id, $request_id, [
-			'status'   => 'done',
-			'executed' => implode( ',', $executed ),
-			'trade_no' => $done_trade_no,
+		// 🔴 v0.3.0：回應的 TradeNo 必須是**非空字串**，而且存進獨立欄位。
+		//
+		// 舊版是 `(string) ( $result['data']['TradeNo'] ?? $trade_no )`：綠界回了
+		// `null`／`''`／數字 0 時，會靜默退回成我們自己送出去的 trade_no，於是
+		// 「綠界確認的交易編號」與「我們以為的交易編號」再也分不出來；而且它被寫
+		// 回 `trade_no`——指紋欄位——把比對基準一起改掉。
+		$raw_trade_no  = $result['data']['TradeNo'] ?? null;
+		$done_trade_no = is_string( $raw_trade_no ) ? trim( $raw_trade_no ) : '';
+
+		if ( '' === $done_trade_no ) {
+			// 金流已經動了，但回應沒有可驗證的交易編號 → 不得宣告成功。
+			YSLogger::error( 'ecpay', 'CRITICAL: 退款成功回應缺少 TradeNo，無法驗證', [
+				'order_id'   => $order_id,
+				'request_id' => $request_id,
+				'raw'        => is_scalar( $raw_trade_no ) ? (string) $raw_trade_no : gettype( $raw_trade_no ),
+			] );
+
+			self::note_attempt( $order_id, $request_id, [
+				'note' => '綠界回應缺少 TradeNo，無法驗證，已凍結待人工核定',
+			], $fingerprint, '缺 TradeNo 註記' );
+
+			return [
+				'success' => false,
+				'outcome' => 'indeterminate',
+				'message' => '綠界回應成功但未帶交易編號（TradeNo），無法驗證這筆退款；本單退款已凍結，請於綠界後台確認後人工核定。',
+			];
+		}
+
+		$marked = self::mark_attempt( $order_id, $request_id, [
+			'status'            => 'done',
+			'executed'          => implode( ',', $executed ),
+			'response_trade_no' => $done_trade_no,
 		], $fingerprint, 'done' );
 
 		if ( ! $marked ) {
@@ -542,6 +624,16 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 *
 	 * @return array{success:false, outcome:string, message:string}
 	 */
+	/**
+	 * 這一次金流動作的 durable 識別（v0.3.0）
+	 *
+	 * 由 request_id、步驟與序號決定——**不是隨機值**：同一筆請求的同一步驟重試時
+	 * 必須產生同一個 token，否則 token 本身就無法用來判斷「這是不是同一次動作」。
+	 */
+	private static function operation_token( string $request_id, string $step, int $sequence ): string {
+		return substr( hash( 'sha256', $request_id . '|' . $step . '|' . $sequence ), 0, 32 );
+	}
+
 	private static function reject( string $message ): array {
 		return [
 			'success' => false,
@@ -555,7 +647,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 *
 	 * 金流已經動了、我們的 ledger 卻沒落盤：既不能說成功（核心會就此結案），
 	 * 也不能說失敗（會開放重送 ＝ 重複退款）。attempt 停留 pending＝全單凍結，
-	 * 由 `wp ys-ecpay refund-attempts resolve` 人工核定。
+	 * 由 `wp ys-cart refund-finalization resolve` 人工核定（本外掛的凍結會由核心核定同步解除）。
 	 *
 	 * @return array{success:false, outcome:string, message:string}
 	 */
@@ -571,7 +663,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			'success' => false,
 			'outcome' => 'indeterminate',
 			'message' => '退款已送出但紀錄寫入失敗，本單退款已凍結：請先於綠界後台確認實際狀態，'
-				. '再以 wp ys-ecpay refund-attempts resolve 人工核定（請勿另開新退款）。',
+				. '再以 wp ys-cart refund-finalization resolve 人工核定（請勿另開新退款）。',
 		];
 	}
 
@@ -605,6 +697,27 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		$result = OrderPaymentDetail::mutate(
 			$order_id,
 			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $patch, $fingerprint ): ?array {
+				// 🔴 指紋欄位不可變。少了這道檢查，終態寫入時的
+				// `'trade_no' => $done_trade_no` 會把指紋裡的 trade_no 換成綠界回應
+				// 的值——之後任何一次 fingerprint_matches 都是在跟被改過的值比對。
+				$forbidden = array_intersect( array_keys( $patch ), self::FINGERPRINT_KEYS );
+				if ( $forbidden ) {
+					$decision = [ 'action' => 'fingerprint_write_attempt', 'keys' => array_values( $forbidden ) ];
+					return null;
+				}
+
+				// 🔴 核心授權必須用**這一次 CAS 讀到的**值重驗：reserve 與終態寫入
+				// 之間，核心可能已經把這筆請求核定完成或改派給別的 gateway。
+				$core_ledger = is_array( $detail['_ys_refund_finalization'] ?? null )
+					? $detail['_ys_refund_finalization']
+					: [];
+				$core_entry  = is_array( $core_ledger[ $request_id ] ?? null ) ? $core_ledger[ $request_id ] : null;
+				if ( null !== $core_entry
+					&& 'ys_ec_ecpay_credit' !== (string) ( $core_entry['gateway_id'] ?? '' ) ) {
+					$decision = [ 'action' => 'core_gateway_mismatch' ];
+					return null;
+				}
+
 				$ledger  = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 				$current = is_array( $ledger[ $request_id ] ?? null ) ? $ledger[ $request_id ] : null;
 
@@ -695,6 +808,96 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 * @param array<string,mixed> $entry
 	 * @param array<string,mixed> $fingerprint
 	 */
+	/**
+	 * 構成交易指紋的欄位（v0.3.0）
+	 *
+	 * 這些鍵一旦由 reservation 寫下就**不可變**：它們是「這一筆 attempt 指向哪一筆
+	 * 綠界交易」的唯一依據。任何後續寫入（step 註記、終態、CLI 核定、core 同步）
+	 * 都不得改動它們——改得動，指紋就不再證明任何事。
+	 *
+	 * 綠界回應帶回來的交易編號另存 `response_trade_no`，不覆蓋指紋內的 `trade_no`。
+	 */
+	private const FINGERPRINT_KEYS = [
+		'amount',
+		'trade_no',
+		'merchant_trade_no',
+		'gwsr',
+		'merchant_id',
+		'environment',
+	];
+
+	/**
+	 * 核心 ledger entry 的嚴格 schema 檢查（v0.3.0）
+	 *
+	 * 舊版用 `! empty( $core_entry['finalized'] )` 與 `(float) $core_entry['amount']`：
+	 *   - `empty()` 把 `'0'`、`0`、`'false'`、`[]` 全部視為「沒有 finalized」——一個
+	 *     以字串 `'0'` 寫入的旗標會被當成未完成而放行；反過來，任何非空字串（含
+	 *     `'no'`）都會被當成已完成而擋下。旗標的真假不該由 truthiness 決定。
+	 *   - `(float)` 轉型讓 `'1000abc'`、`'1e3'`、`true` 都變成看似合理的金額。
+	 *
+	 * 這裡改成型別敏感：旗標必須是真正的 bool（或明確的 0/1），金額必須是
+	 * canonical 整數。任何無法解讀的值一律 fail-closed。
+	 *
+	 * @param array<string,mixed> $core_entry
+	 * @return array<string,mixed>|null null＝通過
+	 */
+	private static function core_entry_problem( array $core_entry, int $amount_twd ): ?array {
+		$status = $core_entry['status'] ?? null;
+		if ( ! is_string( $status ) || 'submitting' !== $status ) {
+			return [
+				'action' => 'core_not_submitting',
+				'status' => is_scalar( $status ) ? (string) $status : gettype( $status ),
+			];
+		}
+
+		foreach ( [ 'finalized' => 'core_finalized', 'provider_done' => 'core_provider_done', 'record_only' => 'core_record_only' ] as $flag => $action ) {
+			if ( ! array_key_exists( $flag, $core_entry ) ) {
+				continue; // 沒有這個旗標＝沒有被設定過
+			}
+
+			$raw = $core_entry[ $flag ];
+			if ( is_bool( $raw ) ) {
+				if ( $raw ) {
+					return [ 'action' => $action ];
+				}
+				continue;
+			}
+			if ( 0 === $raw || '0' === $raw ) {
+				continue; // 明確的 false
+			}
+			if ( 1 === $raw || '1' === $raw ) {
+				return [ 'action' => $action ];
+			}
+
+			// 無法解讀的旗標值：不得猜。
+			return [
+				'action' => 'core_flag_unreadable',
+				'flag'   => $flag,
+				'value'  => is_scalar( $raw ) ? (string) $raw : gettype( $raw ),
+			];
+		}
+
+		$amount = $core_entry['amount'] ?? null;
+		if ( is_int( $amount ) ) {
+			$core_amount = $amount;
+		} elseif ( is_string( $amount ) && 1 === preg_match( '/^(0|[1-9][0-9]*)$/', $amount ) ) {
+			$core_amount = (int) $amount;
+		} elseif ( is_float( $amount ) && floor( $amount ) === $amount && $amount >= 0 && $amount <= PHP_INT_MAX ) {
+			$core_amount = (int) $amount; // 整數值的 float（JSON 解碼常見）
+		} else {
+			return [
+				'action'      => 'core_amount_unreadable',
+				'core_amount' => is_scalar( $amount ) ? (string) $amount : gettype( $amount ),
+			];
+		}
+
+		if ( $core_amount !== $amount_twd ) {
+			return [ 'action' => 'core_amount_mismatch', 'core_amount' => $core_amount ];
+		}
+
+		return null;
+	}
+
 	private static function fingerprint_matches( array $entry, array $fingerprint ): bool {
 		foreach ( $fingerprint as $key => $expected ) {
 			if ( ! array_key_exists( $key, $entry ) ) {

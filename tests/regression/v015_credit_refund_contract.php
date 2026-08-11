@@ -264,7 +264,8 @@ namespace {
     /** 一張「一般信用卡、已關帳」的乾淨訂單。 */
     // 一張「v0.3.0 建單」的乾淨訂單：帶環境／商店身分、實際請款金額、卡別證據，
     // 以及核心 `_ys_refund_finalization` 內對應的退款請求。
-    $seed = static function (array $extra = [], array $core = null): FakeWpdb {
+    // PHP 8.4：隱式 nullable 參數型別已 deprecated，必須明寫 `?array`。
+    $seed = static function (array $extra = [], ?array $core = null): FakeWpdb {
         global $wpdb;
         $wpdb = new FakeWpdb();
         $base = [
