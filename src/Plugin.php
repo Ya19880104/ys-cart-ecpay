@@ -255,8 +255,8 @@ final class Plugin {
 	 * 購物車商品是否允許此物流方式（v0.2.11）
 	 *
 	 * 與核心結帳共用 YSShippingRegistry::is_method_allowed_for_cart() 這一份守門，
-	 * 避免 provider 端自建平行邏輯而與核心漂移。核心未提供此述詞時（舊版核心）
-	 * 回 true 保持相容——此時核心送單驗證仍會擋下。
+	 * 避免 provider 端自建平行邏輯而與核心漂移。核心未提供此述詞、或購物車讀取
+	 * 失敗時一律回 false（fail-closed），理由見下方實作註解。
 	 *
 	 * @param string $shipping_id 物流方式 ID
 	 * @param string $cart_scope  已消毒的購物車 scope

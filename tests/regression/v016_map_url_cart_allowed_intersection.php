@@ -21,9 +21,10 @@
  *   (a) 共用守門述詞三態（允許／禁用／無設限）
  *   (b) 交集為空 → 禁用（fail-closed）
  *   (c) read_cart_items：訪客無 session cookie → 空陣列（不觸發 setcookie 副作用）
- *   (d) read_cart_items：以 scope filter 純讀 get_items_raw()，並於結束後移除 filter
- *   (e) is_shipping_allowed_for_cart：核心缺少述詞時回 true（舊核心相容）
+ *   (d) read_cart_items：以 scope filter 純讀 try_get_items_raw()，並於結束後移除 filter
+ *   (e) is_shipping_allowed_for_cart 端到端：禁用 sub-type 不簽發地圖
  *   (f) 讀取失敗 → null 且守門 fail-closed
+ *   (i) 契約：核心述詞／typed 讀取 API 缺席一律 fail-closed（不得 return true 相容舊核心）
  *   (g) 確定為空的購物車 → 空陣列（與讀取失敗分流），不限物流
  *   (h) 契約：拒收 order_id、守門無條件執行且早於 build_map_form_data、無分流殘留
  *
