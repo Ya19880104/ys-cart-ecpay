@@ -147,9 +147,17 @@ final class EcpayPaymentController {
 				}
 			}
 
-			YSOrder::update( (int) $order->id, [
+			// v0.3.0：TradeNo 是退款、對帳、客服查詢的唯一交易識別碼。寫不進去卻
+			// ACK，綠界停止重送，這筆交易在我們這邊就永遠沒有交易編號。
+			if ( ! YSOrder::update( (int) $order->id, [
 				'gateway_trade_no' => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
-			] );
+			] ) ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: gateway_trade_no 寫入失敗，拒絕 ACK 以觸發綠界重送', [
+					'order_id' => (int) $order->id,
+				] );
+				$this->respond_text( '0|Persist Failed', 500 );
+				return;
+			}
 			$transition = YSPaymentLifecycleService::mark_paid( (int) $order->id, $detail, 'webhook_ecpay_notify' );
 		} else {
 			$transition = YSPaymentLifecycleService::mark_failed( (int) $order->id, $detail, 'webhook_ecpay_notify' );

@@ -43,7 +43,20 @@ final class EcpayLogisticsController {
 		}
 
 		$order = $this->find_order( $params );
-		if ( $order && ! $this->update_order_shipping( $order, $params ) ) {
+		if ( ! $order ) {
+			// v0.3.0：查無訂單**不得** ACK。CheckMacValue 已經驗過——這是一筆真實
+			// 的綠界通知，只是我們此刻找不到對應訂單（建單交易尚未 commit、read
+			// replica 落後、或訂單查詢本身失敗）。回 1|OK 會讓綠界停止重送，這筆
+			// 物流狀態就永久遺失。回可重試的錯誤讓它稍後再送一次。
+			YSLogger::error( 'ecpay', '物流通知找不到對應訂單，要求重送', [
+				'merchant_trade_no' => (string) ( $params['MerchantTradeNo'] ?? '' ),
+				'logistics_id'      => (string) ( $params['AllPayLogisticsID'] ?? '' ),
+			] );
+			$this->respond_text( '0|Order Not Found', 404 );
+			return;
+		}
+
+		if ( ! $this->update_order_shipping( $order, $params ) ) {
 			// v0.3.0：物流狀態沒落盤就**不得** ACK。回 1|OK 會讓綠界停止重送，
 			// 這筆狀態變更（出貨、到店、退貨）就永久遺失了。
 			$this->respond_text( '0|Persist Failed', 500 );
@@ -177,16 +190,20 @@ final class EcpayLogisticsController {
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
 			// pipeline 推進失敗代表出貨狀態機沒有前進——後續的到貨、取件、退貨判定
 			// 全都建立在它上面，這裡回 true 等於讓整條狀態機停在舊狀態且無人知情。
+			// 🔴 這個方法回的是 array{success,...}，不是 bool。`false === $advanced`
+			// 永遠不成立——等於完全沒有檢查。非空陣列在布林語境還是 true，所以
+			// 「看起來有防護」的寫法實際上一次都沒擋過。
 			$advanced = YSShippingPipelineService::advance_from_carrier_status(
 				(int) $order->id,
 				$status,
 				'webhook_ecpay'
 			);
 
-			if ( false === $advanced ) {
+			if ( is_array( $advanced ) && empty( $advanced['success'] ) ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: 物流 pipeline 推進失敗', [
 					'order_id' => (int) $order->id,
 					'status'   => $status,
+					'message'  => (string) ( $advanced['message'] ?? '' ),
 				] );
 
 				return false;

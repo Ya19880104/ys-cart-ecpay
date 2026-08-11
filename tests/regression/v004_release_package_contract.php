@@ -203,6 +203,28 @@ $assert([] === $missing_anchor, '(C2) 交付面錨點齊全：README／docs／SD
 
 $assert(!in_array('CHANGELOG.md', $scan['files'], true), '(C3) CHANGELOG.md 不隨包出貨（政策）');
 
+// 🔴 must-not-ship：內部 release runbook。它記載受控正式商店的實刷實退步驟、
+// gitignored 的證據路徑，以及尚未完成的 gate——給我們自己看的作業文件，隨包散佈
+// 到每一個安裝站點沒有任何好處。以 exact path 斷言而非前綴比對：docs/ 底下的
+// 其他文件（headless.md）仍應出貨。檔案必須留在 repo，只是不出貨。
+$mustNotShip = ['docs/credit-refund-sandbox-gate.md'];
+$shipLeaks   = [];
+$missingDocs = [];
+foreach ($mustNotShip as $forbidden) {
+    if (in_array($forbidden, $scan['files'], true)) {
+        $shipLeaks[] = $forbidden;
+    }
+    if (!is_file($root . '/' . $forbidden)) {
+        $missingDocs[] = $forbidden;
+    }
+}
+$assert([] === $shipLeaks, '(C4) 內部 release runbook 不隨包出貨（' . (implode(', ', $shipLeaks) ?: '無洩漏') . '）');
+$assert([] === $missingDocs, '(C5) 該 runbook 仍保留在 repo（排除 ≠ 刪除）');
+$assert(
+    null === ys_cart_ecpay_release_exclusion_reason('docs/headless.md'),
+    '(C6) 排除以 exact path 為準——docs/ 底下的其他文件仍應出貨'
+);
+
 // ── D. 開啟當前版號的 ZIP ───────────────────────────────────────────────────
 
 $zipPath = $root . '/artifacts/' . $slug . '-' . $version . '.zip';

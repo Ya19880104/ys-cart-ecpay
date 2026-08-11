@@ -278,8 +278,10 @@ namespace {
             'ecpay_charged_amount' => 1000,
             'ecpay_environment' => 'live',
             'ecpay_merchant_id' => 'M1',
+            // v0.3.0：核心的**狀態**才是授權——只有 submitting 且未 finalized／
+            // 未 provider_done／非 record_only 的請求可以觸發金流動作。
             '_ys_refund_finalization' => null === $core
-                ? ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000]]
+                ? ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting']]
                 : $core,
         ];
         $wpdb->value = json_encode(array_merge($base, $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -337,8 +339,8 @@ namespace {
     //     核心 ledger 必須同時有 req-2（否則會先被「核心沒有這筆請求」擋掉，
     //     那是另一道 gate，證明不了全單凍結）。
     $w = $seed([], [
-        'req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
-        'req-2' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
+        'req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting'],
+        'req-2' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting'],
     ]);
     $w->before_write = static function (FakeWpdb $db, string $sql): void {
         if (!str_contains($sql, '_ys_ecpay_refunds')) {
@@ -436,9 +438,16 @@ namespace {
 
     // (j) 卡別 gate
     $cases = [
-        '分期' => ['stage' => '3'],
-        '紅利' => ['red_dan' => '100'],
-        '銀聯等非一般信用卡' => ['payment_type' => 'Credit_UnionPay'],
+        '分期'               => ['ecpay_stage' => '3'],
+        '紅利'               => ['ecpay_red_dan' => '100'],
+        '銀聯等非一般信用卡' => ['ecpay_payment_type' => 'Credit_UnionPay', 'payment_type' => 'Credit_UnionPay'],
+        // canonical fail-closed：無法解讀的證據不是「沒有證據」
+        'stage 非數字'       => ['ecpay_stage' => 'abc'],
+        'stage 負值'         => ['ecpay_stage' => '-1'],
+        'stage 小數'         => ['ecpay_stage' => '3.9'],
+        'red 非數字'         => ['ecpay_red_dan' => 'N/A'],
+        // 只證明非分期、沒有紅利證據 → 仍不可判定
+        '缺紅利證據'         => ['ecpay_red_dan' => null],
     ];
     $gate_ok = true;
     foreach ($cases as $why => $extra) {
@@ -513,8 +522,12 @@ namespace {
     // (p) 核心 finalization 綁定：四種不合法情形都必須擋下且不送金流
     $core_cases = [
         '核心沒有這筆請求' => [[], []],
-        '核心 gateway 不符' => [[], ['req-1' => ['gateway_id' => 'ys_ec_payuni_credit', 'amount' => 1000]]],
-        '核心金額不符'     => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 500]]],
+        '核心 gateway 不符' => [[], ['req-1' => ['gateway_id' => 'ys_ec_payuni_credit', 'amount' => 1000, 'status' => 'submitting']]],
+        '核心金額不符'     => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 500, 'status' => 'submitting']]],
+        '核心非 submitting' => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'pending']]],
+        '核心已 finalized'  => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => true]]],
+        '核心 provider_done' => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'provider_done' => true]]],
+        '核心 record_only'  => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'record_only' => true]]],
     ];
     $core_ok = true;
     foreach ($core_cases as $why => [$extra, $core]) {
@@ -529,34 +542,35 @@ namespace {
     $w = $seed([
         '_ys_ecpay_refunds' => ['done-1' => ['status' => 'done', 'amount' => 800]],
     ], [
-        'req-1'  => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
-        'done-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 800],
+        'req-1'  => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting'],
+        'done-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 800, 'status' => 'submitting'],
     ]);
     $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
     if (($r['success'] ?? false) || EcpayPaymentClient::do_action_count() > 0) {
         $core_ok = false;
         echo "        ↳ 超過剩餘可退額度 未被擋下\n";
     }
-    $assert($core_ok, '(p) 核心 finalization 綁定：無請求／gateway 不符／金額不符／超過剩餘額度 → 全部擋下');
+    $assert($core_ok, '(p) 核心 finalization 綁定：無請求／gateway／金額／非 submitting／finalized／provider_done／record_only／超過額度 → 全部擋下');
 
     // (q) terminal ownership：mark_attempt 不得憑空建立 entry、不得覆蓋 terminal
     $rc = new \ReflectionMethod(EcpayCreditGateway::class, 'mark_attempt');
+    $__fp = ['amount' => 1000, 'trade_no' => 'TN-1', 'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1', 'merchant_id' => 'M1', 'environment' => 'live'];
     $w = $seed();
-    $created = $rc->invoke(null, 7, 'ghost-req', ['status' => 'done'], 'done');
+    $created = $rc->invoke(null, 7, 'ghost-req', ['status' => 'done'], $__fp, 'done');
     $assert(
         false === $created && ! isset($ledger($w)['ghost-req']),
         '(q) mark_attempt 不得憑空建立不存在的 attempt entry'
     );
 
-    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => ['status' => 'failed', 'amount' => 1000]]]);
-    $overwritten = $rc->invoke(null, 7, 'req-1', ['status' => 'done'], 'done');
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => array_merge($__fp, ['status' => 'failed'])]]);
+    $overwritten = $rc->invoke(null, 7, 'req-1', ['status' => 'done'], $__fp, 'done');
     $assert(
         false === $overwritten && 'failed' === ($ledger($w)['req-1']['status'] ?? ''),
         '(q2) mark_attempt 不得覆蓋已核定的 terminal（failed → done 必須被拒）'
     );
 
-    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => ['status' => 'pending', 'executed' => 'E,N']]]);
-    $regressed = $rc->invoke(null, 7, 'req-1', ['executed' => 'E'], null);
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => array_merge($__fp, ['status' => 'pending', 'executed' => 'E,N'])]]);
+    $regressed = $rc->invoke(null, 7, 'req-1', ['executed' => 'E'], $__fp, null);
     $assert(
         false === $regressed && 'E,N' === ($ledger($w)['req-1']['executed'] ?? ''),
         '(q3) executed 不得倒退（E,N → E 必須被拒）'

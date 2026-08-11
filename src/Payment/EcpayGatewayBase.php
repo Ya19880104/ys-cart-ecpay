@@ -123,10 +123,24 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		YSOrder::update( $order_id, [
+		// v0.3.0：gateway identity 寫入失敗**不得**交付款表單。
+		// 付款通知回來時，核心以 gateway_id 決定由哪個 provider 處理、退款以它判定
+		// 歸屬；沒寫進去卻讓使用者付了款，這筆交易在系統裡不屬於任何 gateway——
+		// 通知無人認領、退款也找不到執行者。
+		if ( ! YSOrder::update( $order_id, [
 			'gateway_id'     => $method_id,
 			'payment_method' => $method_id,
-		] );
+		] ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: gateway identity 寫入失敗，拒絕簽發付款表單', [
+				'order_id' => $order_id,
+				'method'   => $method_id,
+			] );
+
+			return [
+				'success' => false,
+				'message' => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
+			];
+		}
 
 		return [
 			'success'      => true,

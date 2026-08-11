@@ -254,6 +254,28 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 					$decision = [ 'action' => 'core_gateway_mismatch', 'gateway' => (string) ( $core_entry['gateway_id'] ?? '' ) ];
 					return null;
 				}
+
+				// 🔴 v0.3.0：核心的**狀態**才是授權，光有 entry 不夠。
+				// 一筆已經 finalized、已經由 provider 完成、或根本是 record-only
+				// （人工記帳、未經金流）的請求，其 entry 一樣存在——只驗存在就等於
+				// 允許對這些請求再送一次 DoAction。
+				$core_status = (string) ( $core_entry['status'] ?? '' );
+				if ( 'submitting' !== $core_status ) {
+					$decision = [ 'action' => 'core_not_submitting', 'status' => $core_status ];
+					return null;
+				}
+				if ( ! empty( $core_entry['finalized'] ) ) {
+					$decision = [ 'action' => 'core_finalized' ];
+					return null;
+				}
+				if ( ! empty( $core_entry['provider_done'] ) ) {
+					$decision = [ 'action' => 'core_provider_done' ];
+					return null;
+				}
+				if ( ! empty( $core_entry['record_only'] ) ) {
+					$decision = [ 'action' => 'core_record_only' ];
+					return null;
+				}
 				if ( ! isset( $core_entry['amount'] ) || abs( (float) $core_entry['amount'] - (float) $amount_twd ) > 0.005 ) {
 					$decision = [ 'action' => 'core_amount_mismatch', 'core_amount' => $core_entry['amount'] ?? null ];
 					return null;
@@ -339,6 +361,22 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		if ( 'core_amount_mismatch' === $action ) {
 			return self::reject( '退款金額與核心紀錄不符，已拒絕操作；請人工核對後處理。' );
 		}
+		if ( 'core_not_submitting' === $action ) {
+			$status = is_array( $decision ) ? (string) ( $decision['status'] ?? '?' ) : '?';
+			return self::reject( sprintf(
+				'核心退款請求目前為「%s」而非 submitting，已拒絕操作——只有正在送出中的請求可以觸發金流動作。',
+				sanitize_text_field( $status )
+			) );
+		}
+		if ( 'core_finalized' === $action ) {
+			return self::reject( '核心退款請求已核定完成，不得再送出金流動作。' );
+		}
+		if ( 'core_provider_done' === $action ) {
+			return self::reject( '核心已標記此請求由 provider 完成，不得重複送出。' );
+		}
+		if ( 'core_record_only' === $action ) {
+			return self::reject( '此為人工記錄型退款（record-only，未經金流），不得送出 DoAction。' );
+		}
 		if ( 'exceeds_remaining' === $action ) {
 			$already = is_array( $decision ) ? (int) ( $decision['already'] ?? 0 ) : 0;
 			return self::reject( sprintf( '退款金額超過剩餘可退額度（已退 %d 元／請款 %d 元）。', $already, $charged_amount ) );
@@ -372,15 +410,21 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		$result   = [ 'success' => false, 'indeterminate' => false, 'data' => null, 'message' => '' ];
 
 		foreach ( $plan as $step ) {
-			$result     = $client->do_action_refund( $merchant_trade_no, $trade_no, (float) $amount_twd, $step );
-			$executed[] = $step;
+			// 🔴 v0.3.0：`executed` 只記**成功**的步驟。舊版在取得結果之前就把 step
+			// 推進陣列，於是 E 成功、N 失敗會被記成 `executed=E,N`——人工核定時看到
+			// 的是「兩步都做了」，實際上 N 從未生效。事實要分三種：已完成、嘗試過、
+			// 失敗於哪一步。
+			$result           = $client->do_action_refund( $merchant_trade_no, $trade_no, (float) $amount_twd, $step );
+			$attempted        = array_merge( $executed, [ $step ] );
 
 			if ( ! empty( $result['indeterminate'] ) ) {
 				// 傳輸不確定：綠界端可能已生效 → attempt 維持 pending，等人工核定。
+				// executed 不含本步（我們不知道它有沒有生效），另記 attempted。
 				self::note_attempt( $order_id, $request_id, [
-					'executed' => implode( ',', $executed ),
-					'note'     => '結果未明（' . (string) ( $result['message'] ?? '' ) . '）',
-				], '結果未明註記' );
+					'executed'       => implode( ',', $executed ),
+					'attempted_step' => $step,
+					'note'           => '結果未明（' . (string) ( $result['message'] ?? '' ) . '）',
+				], $fingerprint, '結果未明註記' );
 
 				return [
 					'success' => false,
@@ -395,23 +439,27 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				// 在綠界端已經改變狀態。把它標成 failed／rejected_terminal 等於告訴
 				// 核心「可以再送一次完整的 E→N」——第二次的 E 會作用在一筆已經被取消
 				// 關帳的交易上，結果無法預期。
-				$prior_steps = array_slice( $executed, 0, -1 );
+				$prior_steps = $executed; // 已成功的步驟（不含本步）
 
 				if ( $prior_steps ) {
 					self::note_attempt( $order_id, $request_id, [
-						'executed' => implode( ',', $executed ),
-						'note'     => sprintf(
+						'executed'       => implode( ',', $prior_steps ),
+						'attempted_step' => $step,
+						'failed_step'    => $step,
+						'rtn_code'       => (string) ( $result['data']['RtnCode'] ?? '' ),
+						'rtn_msg'        => (string) ( $result['message'] ?? '' ),
+						'note'           => sprintf(
 							'部分完成：%s 成功、%s 失敗（%s）',
 							implode( ',', $prior_steps ),
 							$step,
 							(string) ( $result['message'] ?? '' )
 						),
-					], '部分完成註記' );
+					], $fingerprint, '部分完成註記' );
 
 					YSLogger::error( 'ecpay', 'CRITICAL: 多步退款部分完成（前置步驟已改變綠界端狀態）', [
 						'order_id'    => $order_id,
 						'request_id'  => $request_id,
-						'executed'    => implode( ',', $executed ),
+						'executed'    => implode( ',', $prior_steps ),
 						'failed_step' => $step,
 					] );
 
@@ -431,11 +479,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 				// 第一步就被明確拒絕（RtnCode≠1，金流未動）→ 可安全重試。
 				$marked = self::mark_attempt( $order_id, $request_id, [
-					'status'   => 'failed',
-					'executed' => implode( ',', $executed ),
-					'rtn_code' => (string) ( $result['data']['RtnCode'] ?? '' ),
-					'rtn_msg'  => (string) ( $result['message'] ?? '' ),
-				], 'failed' );
+					'status'         => 'failed',
+					'executed'       => implode( ',', $executed ), // 仍是空字串：第一步就被拒
+					'attempted_step' => $step,
+					'failed_step'    => $step,
+					'rtn_code'       => (string) ( $result['data']['RtnCode'] ?? '' ),
+					'rtn_msg'        => (string) ( $result['message'] ?? '' ),
+				], $fingerprint, 'failed' );
 
 				if ( ! $marked ) {
 					// 終態沒落盤 → attempt 停留 pending＝全單凍結。此時我們無法保證
@@ -449,11 +499,14 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// 🔴 E→N 這類多步流程：本步成功後必須**先 durable 記錄**才可送下一步。
 			// 若不記錄就送 N，中途 crash 會留下「E 已執行但沒人知道」的狀態，人工
 			// 核定時無從判斷該補 N 還是重來。
+			// 本步成功 → 才計入 executed。
+			$executed = $attempted;
+
 			if ( $step !== $plan[ array_key_last( $plan ) ] ) {
 				$stepped = self::mark_attempt( $order_id, $request_id, [
 					'executed' => implode( ',', $executed ),
 					'note'     => '已完成動作 ' . $step . '，準備執行下一步',
-				], null );
+				], $fingerprint, null );
 
 				if ( ! $stepped ) {
 					return self::indeterminate_persist_failure( $order_id, $request_id, 'step:' . $step );
@@ -466,7 +519,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			'status'   => 'done',
 			'executed' => implode( ',', $executed ),
 			'trade_no' => $done_trade_no,
-		], 'done' );
+		], $fingerprint, 'done' );
 
 		if ( ! $marked ) {
 			// v0.3.0：先前這裡回 success 並附註記。那是錯的——金流已經動了，而我們
@@ -533,15 +586,25 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 *   1. entry 必須**已存在**（只有 reservation 能建立）
 	 *   2. entry 必須仍是 `pending`（terminal 不可變）
 	 *   3. 指紋必須**嚴格**相符（型別敏感，不做寬鬆轉換）
-	 *   4. 若提供 expected executed prefix，落盤的 executed 必須是它的前綴
-	 *      （防止把「已執行 E,N」倒退成「已執行 E」）
+	 *   4. `executed` 只能往前，不能倒退
 	 *
-	 * @param string|null $expect_terminal 這次要寫入的終態（'done'／'failed'／null＝非終態）
+	 * 🔴 第 3 點先前只寫在註解裡：方法既沒有收指紋參數，實作也完全沒有比對。
+	 * 沒有它，任何一次 step／terminal 寫入都可能落在**另一筆交易**的 attempt 上
+	 * （request_id 撞號、attempt 被搬移、訂單授權資訊被改寫）。
+	 *
+	 * @param array<string,mixed> $fingerprint     reservation 當時的交易指紋
+	 * @param string|null         $expect_terminal 這次要寫入的終態（'done'／'failed'／null＝非終態）
 	 */
-	private static function mark_attempt( int $order_id, string $request_id, array $patch, ?string $expect_terminal = null ): bool {
+	private static function mark_attempt(
+		int $order_id,
+		string $request_id,
+		array $patch,
+		array $fingerprint,
+		?string $expect_terminal = null
+	): bool {
 		$result = OrderPaymentDetail::mutate(
 			$order_id,
-			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $patch ): ?array {
+			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $patch, $fingerprint ): ?array {
 				$ledger  = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 				$current = is_array( $ledger[ $request_id ] ?? null ) ? $ledger[ $request_id ] : null;
 
@@ -552,6 +615,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				if ( 'pending' !== ( $current['status'] ?? '' ) ) {
 					$decision = [ 'action' => 'terminal', 'status' => (string) ( $current['status'] ?? '' ) ];
 					return null; // terminal 不可變
+				}
+
+				// 指紋必須仍相符——這一筆 attempt 必須確實是我們 reserve 的那一筆。
+				if ( ! self::fingerprint_matches( $current, $fingerprint ) ) {
+					$decision = [ 'action' => 'fingerprint_mismatch' ];
+					return null;
 				}
 
 				// executed 只能往前，不能倒退。
@@ -578,9 +647,19 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		}
 
 		// terminal 已存在且正好是我們想寫的終態＝先前已成功落盤，視為冪等成功。
+		//
+		// 🔴 但「名稱相同」不夠：一筆屬於**別的交易**的 attempt 也可能剛好是 done。
+		// 必須連指紋一起相符才算同一筆。
 		if ( 'terminal' === $action && null !== $expect_terminal
 			&& $expect_terminal === ( is_array( $decision ) ? (string) ( $decision['status'] ?? '' ) : '' ) ) {
-			return true;
+			$existing = OrderPaymentDetail::read( $order_id );
+			$entry    = is_array( $existing['_ys_ecpay_refunds'][ $request_id ] ?? null )
+				? $existing['_ys_ecpay_refunds'][ $request_id ]
+				: null;
+
+			if ( null !== $entry && self::fingerprint_matches( $entry, $fingerprint ) ) {
+				return true;
+			}
 		}
 
 		YSLogger::error( 'ecpay', 'attempt 狀態寫入被拒或失敗', array_merge(
@@ -596,8 +675,8 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	/** 非終態註記；寫不進去不改變結論（凍結由送出前的 pending 保證），僅記錄。 */
-	private static function note_attempt( int $order_id, string $request_id, array $patch, string $what ): void {
-		if ( self::mark_attempt( $order_id, $request_id, $patch, null ) ) {
+	private static function note_attempt( int $order_id, string $request_id, array $patch, array $fingerprint, string $what ): void {
+		if ( self::mark_attempt( $order_id, $request_id, $patch, $fingerprint, null ) ) {
 			return;
 		}
 
@@ -666,45 +745,116 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			$sources['query'] = $query_data;
 		}
 
-		/** 從所有來源蒐集某個欄位的全部值（含 0），保留來源標籤。 */
+		/**
+		 * 蒐集某個 evidence group 的全部值。
+		 *
+		 * 🔴 每一個值都必須是 **canonical 非負整數**。舊版直接 `(int)` 轉型：
+		 * `'abc'` 變 0、`'-1'` 變 -1、`'3.9'` 變 3——一個壞掉或帶負號的欄位會被
+		 * 讀成「沒有分期」而放行。無法解讀的證據不是「沒有證據」，是**不可判定**。
+		 *
+		 * @return array{values:array<int,array{origin:string,key:string,value:int}>, malformed:array<int,string>}
+		 */
 		$collect = static function ( array $keys ) use ( $sources ): array {
-			$found = [];
+			$values    = [];
+			$malformed = [];
+
 			foreach ( $sources as $origin => $source ) {
 				foreach ( $keys as $key ) {
-					if ( array_key_exists( $key, $source ) && '' !== (string) $source[ $key ] ) {
-						$found[] = [ 'origin' => $origin, 'key' => $key, 'value' => (string) $source[ $key ] ];
+					if ( ! array_key_exists( $key, $source ) ) {
+						continue;
 					}
+
+					$raw = $source[ $key ];
+					if ( '' === $raw || null === $raw ) {
+						continue; // 明確的空值＝這個來源沒有提供
+					}
+
+					if ( is_int( $raw ) ) {
+						$number = $raw;
+					} elseif ( is_string( $raw ) && 1 === preg_match( '/^(0|[1-9][0-9]*)$/', $raw ) ) {
+						$number = (int) $raw;
+					} else {
+						$malformed[] = sprintf( '%s.%s=%s', $origin, $key, is_scalar( $raw ) ? (string) $raw : gettype( $raw ) );
+						continue;
+					}
+
+					if ( $number < 0 ) {
+						$malformed[] = sprintf( '%s.%s=%d（負值）', $origin, $key, $number );
+						continue;
+					}
+
+					$values[] = [ 'origin' => $origin, 'key' => $key, 'value' => $number ];
 				}
 			}
-			return $found;
+
+			return [ 'values' => $values, 'malformed' => $malformed ];
 		};
 
-		// 分期：任何來源回報正的期數即為分期（positive evidence wins）。
-		$stages = $collect( [ 'ecpay_stage', 'stage', 'Stage', 'installment_count' ] );
-		foreach ( $stages as $stage ) {
-			if ( (int) $stage['value'] > 0 ) {
+		$stage_keys  = [ 'ecpay_stage', 'stage', 'Stage', 'installment_count' ];
+		$redeem_keys = [ 'ecpay_red_dan', 'red_dan', 'ecpay_red_de_amt', 'red_de_amt', 'ecpay_red_ok_amt', 'red_ok_amt' ];
+
+		$stage  = $collect( $stage_keys );
+		$redeem = $collect( $redeem_keys );
+
+		// 任何一個 group 有無法解讀的值 → 不可判定（不得當成「沒有分期／沒有紅利」）。
+		$malformed = array_merge( $stage['malformed'], $redeem['malformed'] );
+		if ( $malformed ) {
+			return [
+				'type'   => 'unknown',
+				'label'  => '卡別證據無法解讀的交易',
+				'reason' => '非 canonical 非負整數：' . implode( '、', array_map( 'sanitize_text_field', $malformed ) ),
+			];
+		}
+
+		// 分期：任何來源回報正的期數即成立（positive evidence wins）。
+		foreach ( $stage['values'] as $entry ) {
+			if ( $entry['value'] > 0 ) {
 				return [
 					'type'   => 'installment',
 					'label'  => '分期付款',
-					'reason' => sprintf( '%s=%s（來源：%s）', $stage['key'], $stage['value'], $stage['origin'] ),
+					'reason' => sprintf( '%s=%d（來源：%s）', $entry['key'], $entry['value'], $entry['origin'] ),
 				];
 			}
 		}
 
-		// 紅利折抵：同上，任一來源為正即成立。
-		$redeems = $collect( [ 'ecpay_red_dan', 'red_dan', 'ecpay_red_de_amt', 'red_de_amt', 'ecpay_red_ok_amt', 'red_ok_amt' ] );
-		foreach ( $redeems as $redeem ) {
-			if ( (float) $redeem['value'] > 0 ) {
+		// 紅利折抵：同上。
+		foreach ( $redeem['values'] as $entry ) {
+			if ( $entry['value'] > 0 ) {
 				return [
 					'type'   => 'redeem',
 					'label'  => '紅利折抵交易',
-					'reason' => sprintf( '%s=%s（來源：%s）', $redeem['key'], $redeem['value'], $redeem['origin'] ),
+					'reason' => sprintf( '%s=%d（來源：%s）', $entry['key'], $entry['value'], $entry['origin'] ),
 				];
 			}
 		}
 
-		// 付款方式：必須有值，且所有來源必須一致。
-		$types = $collect( [ 'ecpay_payment_type', 'payment_type', 'PaymentType' ] );
+		// 🔴 一般信用卡需要**兩個**證明：非分期、且無紅利。舊版只要 `stage=0` 就放行，
+		// 完全沒有紅利的證據也算過——那是「沒看到」而不是「證明沒有」。
+		if ( ! $stage['values'] ) {
+			return [
+				'type'   => 'unknown',
+				'label'  => '無法證明是否為分期的交易',
+				'reason' => '訂單付款紀錄與 QueryTradeInfo 皆未提供 stage 欄位（v0.3.0 之前建立）',
+			];
+		}
+		if ( ! $redeem['values'] ) {
+			return [
+				'type'   => 'unknown',
+				'label'  => '無法證明是否有紅利折抵的交易',
+				'reason' => '訂單付款紀錄與 QueryTradeInfo 皆未提供 red_* 欄位（v0.3.0 之前建立）',
+			];
+		}
+
+		// 付款方式：必須有值，且所有來源一致。
+		$types = [];
+		foreach ( $sources as $origin => $source ) {
+			foreach ( [ 'ecpay_payment_type', 'payment_type', 'PaymentType' ] as $key ) {
+				if ( array_key_exists( $key, $source ) && '' !== (string) $source[ $key ] ) {
+					$types[] = (string) $source[ $key ];
+				}
+			}
+		}
+
 		if ( ! $types ) {
 			return [
 				'type'   => 'unknown',
@@ -713,7 +863,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			];
 		}
 
-		$distinct = array_values( array_unique( array_map( static fn( array $t ): string => $t['value'], $types ) ) );
+		$distinct = array_values( array_unique( $types ) );
 		if ( count( $distinct ) > 1 ) {
 			return [
 				'type'   => 'conflict',
@@ -728,29 +878,6 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'label'  => '非一般信用卡交易（' . sanitize_text_field( $distinct[0] ) . '）',
 				'reason' => 'PaymentType=' . sanitize_text_field( $distinct[0] ),
 			];
-		}
-
-		// 一般信用卡：另外要求**確實看過**分期／紅利欄位。完全沒有這些欄位代表
-		// 這筆交易建立於 v0.3.0 之前（付款通知還沒持久化它們），我們無法證明它不是
-		// 分期——「沒有標記」不等於「不是分期」。
-		if ( ! $stages && ! $redeems ) {
-			$has_zero_marker = false;
-			foreach ( $sources as $source ) {
-				foreach ( [ 'ecpay_stage', 'stage', 'ecpay_red_dan', 'red_dan' ] as $marker ) {
-					if ( array_key_exists( $marker, $source ) ) {
-						$has_zero_marker = true;
-						break 2;
-					}
-				}
-			}
-
-			if ( ! $has_zero_marker ) {
-				return [
-					'type'   => 'unknown',
-					'label'  => '無法證明是否為分期／紅利的交易',
-					'reason' => '訂單付款紀錄與 QueryTradeInfo 皆未提供 stage／red_* 欄位（v0.3.0 之前建立）',
-				];
-			}
 		}
 
 		return [ 'type' => 'plain_credit', 'label' => '一般信用卡', 'reason' => '' ];

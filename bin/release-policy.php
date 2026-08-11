@@ -73,6 +73,13 @@ if (!function_exists('ys_cart_ecpay_release_slug')) {
             return 'excluded directory: docs/superpowers';
         }
 
+        // 內部 release runbook：受控正式商店的實刷實退步驟、gitignored 的證據路徑、
+        // 尚未完成的 gate 清單。這是給我們自己看的作業文件，不是交付內容——它會隨包
+        // 散佈到每一個安裝站點的檔案系統上。檔案保留在 repo，只是不出貨。
+        if ('docs/credit-refund-sandbox-gate.md' === $relative) {
+            return 'internal release runbook (must not ship)';
+        }
+
         if (str_ends_with($relative, '.log')) {
             return 'log file';
         }
