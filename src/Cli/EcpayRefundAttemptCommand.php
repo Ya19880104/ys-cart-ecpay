@@ -208,108 +208,71 @@ final class EcpayRefundAttemptCommand {
 			return $results;
 		}
 
-		// v0.3.0：讀取改走核心共用 store（穿透模型快取、欄位不可解讀時回 null）。
-		$detail = OrderPaymentDetail::read( $order_id );
-		if ( null === $detail ) {
-			return $results;
-		}
+		$target = ( 'paid' === $mark ) ? 'done' : 'failed';
 
-		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-		$entry   = $history[ $request_id ] ?? null;
-		if ( ! is_array( $entry ) ) {
-			return $results; // 無此 attempt（非本外掛的退款）→ 無需同步、無需回報
-		}
-
-		// R12-F4／R13-F4：attempt fingerprint 核對——**fail-closed**（mismatch 與「缺值
-		// 無法核對」都不得放行到冪等 success；防 request_id 撞號／錯單同步）。
-		// 人工出口＝ecpay CLI resolve（人工核對後手動核定），不會死結。
-		// (1) gateway 歸屬：core entry 的 gateway_id 必須是本外掛。
-		$core_gateway = (string) ( $core_entry['gateway_id'] ?? '' );
-		if ( self::GATEWAY_ID !== $core_gateway ) {
-			$results[] = [
-				'provider'   => 'ecpay',
-				'gateway_id' => self::GATEWAY_ID,
-				'success'    => false,
-				'message'    => sprintf(
-					'core entry 的 gateway（%s）非本外掛——request_id 撞號或 legacy entry 缺 gateway_id，請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
-					'' !== $core_gateway ? $core_gateway : '缺'
-				),
-			];
-			return $results;
-		}
-		// (2) 金額：兩邊都必須有值且一致（±0.005）；任一邊缺＝無法核對＝不放行。
-		$core_amount = isset( $core_entry['amount'] ) ? (float) $core_entry['amount'] : null;
-		$our_amount  = isset( $entry['amount'] ) ? (float) $entry['amount'] : null;
-		if ( null === $core_amount || null === $our_amount ) {
-			$results[] = [
-				'provider'   => 'ecpay',
-				'gateway_id' => self::GATEWAY_ID,
-				'success'    => false,
-				'message'    => 'attempt 金額無法核對（core 或 ecpay entry 缺 amount）——請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
-			];
-			return $results;
-		}
-		if ( abs( $core_amount - $our_amount ) > 0.005 ) {
-			$results[] = [
-				'provider'   => 'ecpay',
-				'gateway_id' => self::GATEWAY_ID,
-				'success'    => false,
-				'message'    => sprintf( 'attempt 金額不符（core %s vs ecpay %s）——疑錯單，請人工核對', $core_amount, $our_amount ),
-			];
-			return $results;
-		}
-		// (3) R14-F4：原交易 fingerprint——attempt 保存的 trade_no/merchant_trade_no/gwsr
-		// 必須與**訂單當前**的授權資訊一致（防 attempt 被搬移／訂單資料被改寫後錯誤
-		// 同步）；mismatch 不得走到下方冪等 success。兩邊都有值才比（legacy attempt
-		// 缺 fingerprint 欄＝R14 之前建立，跳過本項——amount＋gateway 仍有核對）。
-		$order_trade_no = (string) ( $detail['trade_no'] ?? '' );
-		$order_mer_no   = (string) ( $detail['mer_trade_no'] ?? '' );
-		$order_gwsr     = (string) ( $detail['gwsr'] ?? $detail['ecpay_gwsr'] ?? '' );
-		$fp_checks      = [
-			'trade_no'          => [ (string) ( $entry['trade_no'] ?? '' ), $order_trade_no ],
-			'merchant_trade_no' => [ (string) ( $entry['merchant_trade_no'] ?? '' ), $order_mer_no ],
-			'gwsr'              => [ (string) ( $entry['gwsr'] ?? '' ), $order_gwsr ],
-		];
-		foreach ( $fp_checks as $field => [ $attempt_value, $order_value ] ) {
-			if ( '' !== $attempt_value && '' !== $order_value && $attempt_value !== $order_value ) {
-				$results[] = [
-					'provider'   => 'ecpay',
-					'gateway_id' => self::GATEWAY_ID,
-					'success'    => false,
-					'message'    => sprintf(
-						'attempt 交易 fingerprint 不符（%s：attempt=%s vs order=%s）——疑錯單，請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定',
-						$field,
-						$attempt_value,
-						$order_value
-					),
-				];
-				return $results;
-			}
-		}
-
-		$current = (string) ( $entry['status'] ?? '' );
-		$target  = ( 'paid' === $mark ) ? 'done' : 'failed';
-
-		// R11-F4：已達**相同**終態＝先前同步已成功→回冪等 success（否則核心重試會
-		// 因零回報＋requires_sync 被誤報「同步失敗」）；**不同**終態＝資料衝突，回失敗。
+		// 🔴 v0.3.0：所有驗證與寫入都在**同一個 CAS closure** 內完成。
 		//
-		// v0.3.0：這段判定已整個移進下方的 CAS mutator。先前在這裡先用一份舊快照
-		// 判一次、稍後再寫入，等於兩個 source of truth——快照與落盤之間別人剛核定的
-		// 結果會被這裡的舊值蓋過去。`$current` 保留供上方 fingerprint 比對使用。
-		unset( $current );
+		// 舊版是「先用一份快照跑完 gateway／金額／fingerprint 三道核對，再於稍後
+		// 寫入」。那三道核對讀的是舊值：期間若有人改動 attempt 或訂單的授權資訊，
+		// 我們仍會以通過核對的姿態寫下終態——核對因此只是形式。
+		// 現在 CAS 落敗重讀後，整段核對會用最新值重跑一次。
+		$core_gateway = (string) ( $core_entry['gateway_id'] ?? '' );
+		$core_amount  = isset( $core_entry['amount'] ) ? (float) $core_entry['amount'] : null;
 
-		// v0.3.0：狀態仲裁移進 mutator，CAS 落敗重讀後會重跑一次——不會用先前讀到的
-		// pending 去覆寫期間別人剛寫入的終態。
 		$sync = OrderPaymentDetail::mutate(
 			$order_id,
-			static function ( array $fresh, int $attempt, &$decision ) use ( $request_id, $target ): ?array {
+			static function ( array $fresh, int $attempt, &$decision ) use ( $request_id, $target, $core_gateway, $core_amount ): ?array {
 				$ledger  = is_array( $fresh['_ys_ecpay_refunds'] ?? null ) ? $fresh['_ys_ecpay_refunds'] : [];
 				$current = is_array( $ledger[ $request_id ] ?? null ) ? $ledger[ $request_id ] : null;
 
 				if ( null === $current ) {
 					$decision = [ 'action' => 'missing' ];
+					return null; // 非本外掛的退款 → 無需同步、無需回報
+				}
+
+				// (1) gateway 歸屬：core entry 必須明確屬於本外掛。
+				if ( self::GATEWAY_ID !== $core_gateway ) {
+					$decision = [ 'action' => 'gateway_mismatch', 'gateway' => $core_gateway ];
 					return null;
 				}
+
+				// (2) 金額：兩邊都必須有值且一致（±0.005）。任一邊缺＝無法核對＝不放行。
+				$our_amount = isset( $current['amount'] ) ? (float) $current['amount'] : null;
+				if ( null === $core_amount || null === $our_amount ) {
+					$decision = [ 'action' => 'amount_unverifiable' ];
+					return null;
+				}
+				if ( abs( $core_amount - $our_amount ) > 0.005 ) {
+					$decision = [ 'action' => 'amount_mismatch', 'core' => $core_amount, 'ours' => $our_amount ];
+					return null;
+				}
+
+				// (3) 原交易 fingerprint：attempt 保存的識別碼必須與**當下**訂單的授權
+				// 資訊一致。legacy attempt（v0.3.0 之前建立）缺這些欄位——那不是「跳過
+				// 檢查」的理由，而是「無法證明是同一筆」，一律不自動同步。
+				$order_fp = [
+					'trade_no'          => (string) ( $fresh['trade_no'] ?? '' ),
+					'merchant_trade_no' => (string) ( $fresh['mer_trade_no'] ?? '' ),
+					'gwsr'              => (string) ( $fresh['gwsr'] ?? $fresh['ecpay_gwsr'] ?? '' ),
+				];
+				foreach ( $order_fp as $field => $order_value ) {
+					$attempt_value = (string) ( $current[ $field ] ?? '' );
+					if ( '' === $attempt_value || '' === $order_value ) {
+						$decision = [ 'action' => 'fingerprint_unverifiable', 'field' => $field ];
+						return null;
+					}
+					if ( $attempt_value !== $order_value ) {
+						$decision = [
+							'action'  => 'fingerprint_mismatch',
+							'field'   => $field,
+							'attempt' => $attempt_value,
+							'order'   => $order_value,
+						];
+						return null;
+					}
+				}
+
+				// (4) 狀態仲裁
 				$status = (string) ( $current['status'] ?? '' );
 				if ( 'pending' !== $status ) {
 					$decision = [ 'action' => $status === $target ? 'already' : 'conflict', 'status' => $status ];
@@ -330,6 +293,38 @@ final class EcpayRefundAttemptCommand {
 
 		$sync_decision = $sync->get_decision();
 		$sync_action   = is_array( $sync_decision ) ? (string) ( $sync_decision['action'] ?? '' ) : '';
+		$manual        = '——請人工核對後以 wp ys-ecpay refund-attempts resolve 手動核定';
+
+		if ( 'missing' === $sync_action ) {
+			return $results; // 無此 attempt → 不回報
+		}
+
+		$refusals = [
+			'gateway_mismatch'         => sprintf(
+				'core entry 的 gateway（%s）非本外掛——request_id 撞號或 legacy entry 缺 gateway_id%s',
+				'' !== $core_gateway ? $core_gateway : '缺',
+				$manual
+			),
+			'amount_unverifiable'      => 'attempt 金額無法核對（core 或 ecpay entry 缺 amount）' . $manual,
+			'amount_mismatch'          => 'attempt 金額不符——疑錯單' . $manual,
+			'fingerprint_unverifiable' => 'attempt 交易 fingerprint 無法核對（legacy attempt 或訂單缺識別碼）' . $manual,
+			'fingerprint_mismatch'     => 'attempt 交易 fingerprint 不符——疑錯單' . $manual,
+			'conflict'                 => sprintf(
+				'attempt 已為 %s，與核心核定（%s）衝突——請人工核對兩邊紀錄',
+				is_array( $sync_decision ) ? (string) ( $sync_decision['status'] ?? '?' ) : '?',
+				$target
+			),
+		];
+
+		if ( isset( $refusals[ $sync_action ] ) ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => $refusals[ $sync_action ],
+			];
+			return $results;
+		}
 
 		if ( 'already' === $sync_action ) {
 			$results[] = [
@@ -340,15 +335,7 @@ final class EcpayRefundAttemptCommand {
 			];
 			return $results;
 		}
-		if ( 'conflict' === $sync_action ) {
-			$results[] = [
-				'provider'   => 'ecpay',
-				'gateway_id' => self::GATEWAY_ID,
-				'success'    => false,
-				'message'    => 'attempt 已為 ' . ( is_array( $sync_decision ) ? (string) ( $sync_decision['status'] ?? '?' ) : '?' ) . "，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
-			];
-			return $results;
-		}
+
 
 		if ( ! $sync->is_persisted() || 'synced' !== $sync_action ) {
 			YSLogger::error( 'ecpay', 'CRITICAL: 核心核定同步失敗（CAS 落敗，本外掛 attempt 仍 pending＝全單凍結）', [
@@ -373,14 +360,14 @@ final class EcpayRefundAttemptCommand {
 		YSLogger::warning( 'ecpay', '已依核心核定同步退款 attempt 狀態（解除本外掛全單凍結）', [
 			'order_id'   => $order_id,
 			'request_id' => $request_id,
-			'status'     => $entry['status'],
+			'status'     => $target,
 		] );
 
 		$results[] = [
 			'provider'   => 'ecpay',
 			'gateway_id' => self::GATEWAY_ID,
 			'success'    => true,
-			'message'    => '已同步為 ' . (string) $entry['status'],
+			'message'    => '已同步為 ' . $target,
 		];
 
 		return $results;

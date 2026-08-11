@@ -64,15 +64,42 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		$merchant_trade_no = $this->make_merchant_trade_no( $order_id );
 		$method_id         = $this->get_id();
 
+		// v0.3.0：先算出實際要送出的金額（非 canonical TWD 正整數會直接拋例外），
+		// 並在**送出付款表單之前**連同環境與商店身分一起持久化。
+		try {
+			$form_data = ( new EcpayPaymentClient() )->build_aio_form( $order, $merchant_trade_no, $this->choose_payment() );
+		} catch ( \InvalidArgumentException $e ) {
+			YSLogger::error( 'ecpay', '建單金額不合法，拒絕簽發付款表單', [
+				'order_id' => $order_id,
+				'message'  => $e->getMessage(),
+			] );
+
+			return [
+				'success' => false,
+				'message' => $e->getMessage(),
+			];
+		}
+
+		$charged_amount = (int) ( $form_data['charged_amount'] ?? 0 );
+		$credentials    = Settings::payment_credentials();
+		$environment    = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
+		$merchant_id    = (string) ( $credentials['merchant_id'] ?? '' );
+
 		// payment_detail 走核心共用 CAS（v0.3.0：YSPaymentDetailStore），其餘為獨立
 		// 純量欄位，不參與 JSON 整包覆蓋，維持一般 update。
 		$persisted = OrderPaymentDetail::mutate(
 			$order_id,
-			static function ( array $detail ) use ( $merchant_trade_no, $method_id ): array {
+			static function ( array $detail ) use ( $merchant_trade_no, $method_id, $charged_amount, $environment, $merchant_id ): array {
 				$detail['mer_trade_no']            = $merchant_trade_no;
 				$detail['ecpay_merchant_trade_no'] = $merchant_trade_no;
 				$detail['payment_provider']        = 'ecpay';
 				$detail['payment_method']          = $method_id;
+				// 實際送出的金額——退款端據此判定全額／部分，不再回頭讀 $order->total。
+				$detail['ecpay_charged_amount'] = $charged_amount;
+				// 環境與商店身分：設定被切換（stage↔live、換商店代號）之後，若不綁定
+				// 這兩個值，退款會拿著**另一個環境／另一家商店**的憑證去操作這筆交易。
+				$detail['ecpay_environment'] = $environment;
+				$detail['ecpay_merchant_id'] = $merchant_id;
 				return $detail;
 			}
 		);
@@ -100,8 +127,6 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			'gateway_id'     => $method_id,
 			'payment_method' => $method_id,
 		] );
-
-		$form_data = ( new EcpayPaymentClient() )->build_aio_form( $order, $merchant_trade_no, $this->choose_payment() );
 
 		return [
 			'success'      => true,

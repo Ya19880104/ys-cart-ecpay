@@ -8,7 +8,9 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
+use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayLogisticsController {
@@ -155,16 +157,40 @@ final class EcpayLogisticsController {
 			$order_update['shipping_status'] = $this->map_status( $status );
 		}
 
-		YSOrder::update( (int) $order->id, $order_update );
+		// v0.3.0：純量欄位（tracking_number／shipping_status）同樣不得靜默失敗。
+		// 消費者是靠 tracking_number 查件的；寫不進去卻回 1|OK，這次狀態變更就永久
+		// 遺失，而訂單頁上什麼都不會顯示。
+		if ( ! YSOrder::update( (int) $order->id, $order_update ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback 的訂單欄位寫入失敗', [
+				'order_id' => (int) $order->id,
+				'status'   => $status,
+				'tracking' => $tracking,
+			] );
 
-		$this->sync_label( (int) $order->id, (string) ( $params['AllPayLogisticsID'] ?? '' ), $tracking, $status );
+			return false;
+		}
+
+		if ( ! $this->sync_label( (int) $order->id, (string) ( $params['AllPayLogisticsID'] ?? '' ), $tracking, $status ) ) {
+			return false;
+		}
 
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
-			YSShippingPipelineService::advance_from_carrier_status(
+			// pipeline 推進失敗代表出貨狀態機沒有前進——後續的到貨、取件、退貨判定
+			// 全都建立在它上面，這裡回 true 等於讓整條狀態機停在舊狀態且無人知情。
+			$advanced = YSShippingPipelineService::advance_from_carrier_status(
 				(int) $order->id,
 				$status,
 				'webhook_ecpay'
 			);
+
+			if ( false === $advanced ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: 物流 pipeline 推進失敗', [
+					'order_id' => (int) $order->id,
+					'status'   => $status,
+				] );
+
+				return false;
+			}
 		}
 
 		return true;
@@ -180,14 +206,21 @@ final class EcpayLogisticsController {
 		return 'in_transit';
 	}
 
-	private function sync_label( int $order_id, string $provider_trade_no, string $tracking, string $status ): void {
+	/**
+	 * 同步 tracking_number 到 shipping_labels 表。
+	 *
+	 * v0.3.0：回傳成敗。`$wpdb->update()` 回 `false` 代表 SQL 失敗（回 `0` 只是
+	 * 「值沒變」，不是錯誤）——把 SQL 失敗吞掉再 ACK，出貨單上的追蹤碼就與訂單
+	 * 不一致，而且沒有任何機制會回來補。
+	 */
+	private function sync_label( int $order_id, string $provider_trade_no, string $tracking, string $status ): bool {
 		if ( '' === $provider_trade_no ) {
-			return;
+			return true; // 沒有 provider 單號可對應，非錯誤
 		}
 
 		global $wpdb;
 		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
-		$wpdb->update(
+		$updated = $wpdb->update(
 			$table,
 			[
 				'tracking_number' => $tracking,
@@ -199,6 +232,17 @@ final class EcpayLogisticsController {
 				'provider_trade_no' => $provider_trade_no,
 			]
 		);
+
+		if ( false === $updated ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: shipping_labels 追蹤碼同步失敗', [
+				'order_id'          => $order_id,
+				'provider_trade_no' => $provider_trade_no,
+			] );
+
+			return false;
+		}
+
+		return true;
 	}
 
 	private function respond_text( string $body, int $status = 200 ): void {

@@ -262,15 +262,27 @@ namespace {
     };
 
     /** 一張「一般信用卡、已關帳」的乾淨訂單。 */
-    $seed = static function (array $extra = []): FakeWpdb {
+    // 一張「v0.3.0 建單」的乾淨訂單：帶環境／商店身分、實際請款金額、卡別證據，
+    // 以及核心 `_ys_refund_finalization` 內對應的退款請求。
+    $seed = static function (array $extra = [], array $core = null): FakeWpdb {
         global $wpdb;
         $wpdb = new FakeWpdb();
-        $wpdb->value = json_encode(array_merge([
+        $base = [
             'trade_no' => 'TN-1',
             'mer_trade_no' => 'YS7Tabc',
             'gwsr' => 'GW-1',
             'payment_type' => 'Credit_CreditCard',
-        ], $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            'ecpay_payment_type' => 'Credit_CreditCard',
+            'ecpay_stage' => '0',
+            'ecpay_red_dan' => '0',
+            'ecpay_charged_amount' => 1000,
+            'ecpay_environment' => 'live',
+            'ecpay_merchant_id' => 'M1',
+            '_ys_refund_finalization' => null === $core
+                ? ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000]]
+                : $core,
+        ];
+        $wpdb->value = json_encode(array_merge($base, $extra), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         YSOrder::$total = 1000.0;
         YSOrder::$refunded = 0.0;
@@ -322,7 +334,12 @@ namespace {
     );
 
     // (c) 併發不同 request_id：同樣被全單凍結擋下
-    $w = $seed();
+    //     核心 ledger 必須同時有 req-2（否則會先被「核心沒有這筆請求」擋掉，
+    //     那是另一道 gate，證明不了全單凍結）。
+    $w = $seed([], [
+        'req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
+        'req-2' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
+    ]);
     $w->before_write = static function (FakeWpdb $db, string $sql): void {
         if (!str_contains($sql, '_ys_ecpay_refunds')) {
             return;
@@ -344,6 +361,7 @@ namespace {
     $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
         'status' => 'done', 'amount' => 1000, 'trade_no' => 'TN-1',
         'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
+        'merchant_id' => 'M1', 'environment' => 'live',
     ]]]);
     $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
     $assert(
@@ -443,6 +461,140 @@ namespace {
         echo "        ↳ 無法證明付款方式 未被擋下\n";
     }
     $assert($gate_ok, '(j) 分期／紅利／非一般信用卡／無法證明 → 一律拒絕，不送 DoAction');
+
+    // ── #2B 新增的 gate ──────────────────────────────────────────────────
+
+    // (m) E→N：E 成功、N 明確失敗 → **不得**標成可安全重試
+    //     E（取消關帳）已經改變綠界端狀態，重送完整 E→N 的第二個 E 會作用在一筆
+    //     已被取消關帳的交易上，結果無法預期。
+    $w = $seed();
+    EcpayPaymentClient::$close = ['state' => 'to_close', 'message' => ''];
+    EcpayPaymentClient::$do_action_results = [
+        ['success' => true,  'indeterminate' => false, 'data' => ['TradeNo' => 'TN-1'], 'message' => ''],
+        ['success' => false, 'indeterminate' => false, 'data' => ['RtnCode' => '10200047'], 'message' => 'N 被拒絕'],
+    ];
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $l = $ledger($w);
+    $assert(
+        'indeterminate' === ($r['outcome'] ?? '')
+        && 'pending' === ($l['req-1']['status'] ?? '')
+        && str_contains((string) ($r['message'] ?? ''), '部分完成'),
+        '(m) E 成功、N 明確失敗 → indeterminate 且 attempt 維持 pending（不得開放重送完整 E→N）'
+    );
+
+    // (n) 環境／商店身分與建單時不同 → 拒絕，且不送任何 client 呼叫
+    $w = $seed(['ecpay_merchant_id' => 'OTHER-MERCHANT']);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true) && 0 === count(EcpayPaymentClient::$calls),
+        '(n) 商店代號與建單時不同 → 拒絕跨商店退款，且完全沒有 client 呼叫'
+    );
+
+    $w = $seed();
+    Settings::$test_mode = false;
+    $wpdb->value = str_replace('"ecpay_environment":"live"', '"ecpay_environment":"stage"', (string) $wpdb->value);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true) && 0 === count(EcpayPaymentClient::$calls),
+        '(n2) 環境與建單時不同（stage 建單、live 退款）→ 拒絕跨環境退款'
+    );
+
+    // (o) 未記錄實際請款金額（v0.3.0 之前建立）→ 拒絕
+    $w = $seed();
+    $detail = json_decode((string) $wpdb->value, true);
+    unset($detail['ecpay_charged_amount']);
+    $wpdb->value = json_encode($detail, JSON_UNESCAPED_SLASHES);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true) && 0 === EcpayPaymentClient::do_action_count(),
+        '(o) 未記錄實際請款金額 → 拒絕（無法判定全額／部分）'
+    );
+
+    // (p) 核心 finalization 綁定：四種不合法情形都必須擋下且不送金流
+    $core_cases = [
+        '核心沒有這筆請求' => [[], []],
+        '核心 gateway 不符' => [[], ['req-1' => ['gateway_id' => 'ys_ec_payuni_credit', 'amount' => 1000]]],
+        '核心金額不符'     => [[], ['req-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 500]]],
+    ];
+    $core_ok = true;
+    foreach ($core_cases as $why => [$extra, $core]) {
+        $w = $seed($extra, $core);
+        $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+        if (($r['success'] ?? false) || EcpayPaymentClient::do_action_count() > 0) {
+            $core_ok = false;
+            echo "        ↳ {$why} 未被擋下\n";
+        }
+    }
+    // 超過剩餘可退額度
+    $w = $seed([
+        '_ys_ecpay_refunds' => ['done-1' => ['status' => 'done', 'amount' => 800]],
+    ], [
+        'req-1'  => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000],
+        'done-1' => ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 800],
+    ]);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    if (($r['success'] ?? false) || EcpayPaymentClient::do_action_count() > 0) {
+        $core_ok = false;
+        echo "        ↳ 超過剩餘可退額度 未被擋下\n";
+    }
+    $assert($core_ok, '(p) 核心 finalization 綁定：無請求／gateway 不符／金額不符／超過剩餘額度 → 全部擋下');
+
+    // (q) terminal ownership：mark_attempt 不得憑空建立 entry、不得覆蓋 terminal
+    $rc = new \ReflectionMethod(EcpayCreditGateway::class, 'mark_attempt');
+    $w = $seed();
+    $created = $rc->invoke(null, 7, 'ghost-req', ['status' => 'done'], 'done');
+    $assert(
+        false === $created && ! isset($ledger($w)['ghost-req']),
+        '(q) mark_attempt 不得憑空建立不存在的 attempt entry'
+    );
+
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => ['status' => 'failed', 'amount' => 1000]]]);
+    $overwritten = $rc->invoke(null, 7, 'req-1', ['status' => 'done'], 'done');
+    $assert(
+        false === $overwritten && 'failed' === ($ledger($w)['req-1']['status'] ?? ''),
+        '(q2) mark_attempt 不得覆蓋已核定的 terminal（failed → done 必須被拒）'
+    );
+
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => ['status' => 'pending', 'executed' => 'E,N']]]);
+    $regressed = $rc->invoke(null, 7, 'req-1', ['executed' => 'E'], null);
+    $assert(
+        false === $regressed && 'E,N' === ($ledger($w)['req-1']['executed'] ?? ''),
+        '(q3) executed 不得倒退（E,N → E 必須被拒）'
+    );
+
+    // (r) 嚴格指紋：型別不同即不符（"1000" ≠ 1000）
+    $fp = new \ReflectionMethod(EcpayCreditGateway::class, 'fingerprint_matches');
+    $expected = ['amount' => 1000, 'trade_no' => 'TN-1'];
+    $assert(
+        true === $fp->invoke(null, ['amount' => 1000, 'trade_no' => 'TN-1'], $expected)
+        && false === $fp->invoke(null, ['amount' => '1000', 'trade_no' => 'TN-1'], $expected)
+        && false === $fp->invoke(null, ['amount' => 1000.0, 'trade_no' => 'TN-1'], $expected)
+        && false === $fp->invoke(null, ['amount' => 1000, 'trade_no' => null], $expected),
+        '(r) 指紋比對型別敏感："1000"／1000.0／null 都不得被判成相符'
+    );
+
+    // (s) 卡別證據：持久化的 0 不得遮掉 query 回報的正值
+    $w = $seed(['ecpay_stage' => '0']);
+    EcpayPaymentClient::$query = ['success' => true, 'data' => ['gwsr' => 'GW-1', 'stage' => '3']];
+    $detail = json_decode((string) $wpdb->value, true);
+    unset($detail['gwsr']); // 逼出 QueryTradeInfo 補查路徑
+    $wpdb->value = json_encode($detail, JSON_UNESCAPED_SLASHES);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    EcpayPaymentClient::$query = ['success' => true, 'data' => []];
+    $assert(
+        false === ($r['success'] ?? true)
+        && 0 === EcpayPaymentClient::do_action_count()
+        && str_contains((string) ($r['message'] ?? ''), '分期'),
+        '(s) 持久化的 stage=0 不得遮掉 QueryTradeInfo 回報的 stage=3（positive evidence wins）'
+    );
+
+    // (t) 卡別證據衝突（兩個來源給不同的 PaymentType）→ 拒絕
+    $w = $seed(['ecpay_payment_type' => 'Credit_CreditCard', 'payment_type' => 'Credit_UnionPay']);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true) && 0 === EcpayPaymentClient::do_action_count(),
+        '(t) PaymentType 各來源不一致 → 拒絕（無法證明是一般信用卡）'
+    );
 
     // (k) 契約：仲裁必須在 CAS closure 內，且不得殘留舊的「先檢查後寫入」
     $src = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Payment/EcpayCreditGateway.php'));

@@ -16,13 +16,32 @@ final class EcpayPaymentClient {
 	}
 
 	/**
+	 * 建立 AIO 付款表單。
+	 *
+	 * v0.3.0：金額改為 **canonical TWD 正整數**，非整數一律拒絕。
+	 * 舊寫法 `max( 1, (int) round( $order->total ) )` 會把 1000.5 送成 1001——
+	 * 消費者實際被扣的是 1001，我們的訂單卻記著 1000.5；退款端以 `total` 判定
+	 * 「是否全額」與可退餘額，於是永遠無法精確退回那一筆。`max(1, …)` 更會把
+	 * 0 元訂單悄悄變成 1 元交易。
+	 *
 	 * @param object $order
-	 * @return array{action_url:string,fields:array<string,string>}
+	 * @return array{action_url:string,fields:array<string,string>,charged_amount:int}
+	 * @throws \InvalidArgumentException 金額非 canonical TWD 正整數
 	 */
 	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment ): array {
 		$credentials = Settings::payment_credentials();
-		$amount      = max( 1, (int) round( (float) ( $order->total ?? 0 ) ) );
-		$item_name   = $this->clean_item_name( $order );
+
+		$total = $order->total ?? null;
+		if ( is_string( $total ) && '' !== $total && is_numeric( $total ) ) {
+			$total = 0.0 + $total; // DB 取回可能是字串
+		}
+		if ( ! self::is_canonical_twd( $total ) ) {
+			throw new \InvalidArgumentException(
+				sprintf( '訂單金額必須為正整數新台幣（收到 %s），已拒絕建立付款表單。', var_export( $order->total ?? null, true ) )
+			);
+		}
+		$amount    = (int) $total;
+		$item_name = $this->clean_item_name( $order );
 
 		$fields = [
 			'MerchantID'        => $credentials['merchant_id'],
@@ -51,8 +70,11 @@ final class EcpayPaymentClient {
 		);
 
 		return [
-			'action_url' => Settings::payment_endpoint(),
-			'fields'     => $fields,
+			'action_url'     => Settings::payment_endpoint(),
+			'fields'         => $fields,
+			// 呼叫端必須把這個值持久化：它是**實際送出的金額**，退款端據此判定
+			// 全額／部分，不得再回頭讀 $order->total（可能已被其他流程改動）。
+			'charged_amount' => $amount,
 		];
 	}
 

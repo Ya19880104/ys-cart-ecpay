@@ -97,10 +97,12 @@ namespace YangSheep\Ecommerce\Models {
     {
         public static function table(): string { return 'wp_ys_ec_orders'; }
         public static function forget(int $id): void {}
+        public static float $total = 1000.0;
+
         public static function find(int $id): ?object
         {
             global $wpdb;
-            return (object) ['id' => $id, 'total' => 1000.0, 'payment_detail' => $wpdb->value, 'tracking_number' => ''];
+            return (object) ['id' => $id, 'total' => self::$total, 'payment_detail' => $wpdb->value, 'tracking_number' => ''];
         }
         public static function update(int $id, array $data): bool { return true; }
     }
@@ -141,10 +143,26 @@ namespace YangSheep\YSCartEcpay\Payment {
     {
         public static int $built = 0;
 
+        public static function is_canonical_twd($amount): bool
+        {
+            if (is_int($amount)) {
+                return $amount > 0;
+            }
+            if (!is_float($amount) || !is_finite($amount) || $amount <= 0) {
+                return false;
+            }
+            return abs($amount - round($amount)) < 1e-9;
+        }
+
         public function build_aio_form(object $order, string $mtn, string $choose): array
         {
+            // 與 production 同契約：非 canonical TWD 正整數在**計數之前**就拋例外，
+            // 否則這個替身會比真實實作寬鬆，測到的就不是真的行為。
+            if (!self::is_canonical_twd($order->total ?? null)) {
+                throw new \InvalidArgumentException('訂單金額必須為正整數新台幣。');
+            }
             ++self::$built;
-            return ['action_url' => 'https://example.test/pay'];
+            return ['action_url' => 'https://example.test/pay', 'charged_amount' => (int) $order->total];
         }
     }
 }
@@ -187,15 +205,31 @@ namespace {
     };
 
     // (a) 建單：payment_detail 寫入失敗 → 不得簽發付款表單
+    //
+    // v0.3.0 起 build_aio_form() 會在 CAS 之前被呼叫（要先算出 canonical 金額才能
+    // 連同環境／商店身分一起持久化），因此「有沒有建表單」不再是可用的觀測點——
+    // 改為斷言**回傳值不含表單**：呼叫端拿不到 form_data／redirect_url 就無法把
+    // 使用者送去付款。
     global $wpdb;
     $wpdb = new FailingWpdb();
     EcpayPaymentClient::$built = 0;
     $result = (new EcpayTestGateway())->process_payment(7);
     $assert(
         false === ($result['success'] ?? true)
-        && 0 === EcpayPaymentClient::$built
-        && ! isset($result['form_data']),
-        '(a) 建單 payment_detail 寫入失敗 → 回 success=false，且完全沒有建立付款表單'
+        && ! isset($result['form_data'])
+        && ! isset($result['redirect_url']),
+        '(a) 建單 payment_detail 寫入失敗 → 回 success=false，且回傳值不含付款表單／導轉網址'
+    );
+
+    // (a3) 金額非 canonical TWD 正整數 → 連表單都不建立
+    $wpdb = new FailingWpdb();
+    EcpayPaymentClient::$built = 0;
+    \YangSheep\Ecommerce\Models\YSOrder::$total = 1000.5;
+    $bad = (new EcpayTestGateway())->process_payment(7);
+    \YangSheep\Ecommerce\Models\YSOrder::$total = 1000.0;
+    $assert(
+        false === ($bad['success'] ?? true) && 0 === EcpayPaymentClient::$built,
+        '(a3) 訂單金額為小數 → 拒絕建單，且完全沒有呼叫 build_aio_form'
     );
 
     $assert(
