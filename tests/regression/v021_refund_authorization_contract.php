@@ -483,7 +483,9 @@ namespace {
 
     $writer_src = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Support/ScalarColumnWriter.php' ) );
     $assert(
-        str_contains( $writer_src, "public const MISSING" )
+        str_contains( $writer_src, "public const VERIFIED" )
+        && ! str_contains( $writer_src, "public const UPDATED" )
+        && str_contains( $writer_src, "public const MISSING" )
         && str_contains( $writer_src, "public const CONFLICT" )
         && str_contains( $writer_src, "public const DB_ERROR" )
         && str_contains( $writer_src, 'YSOrder::find( $order_id )' )

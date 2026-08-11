@@ -14,8 +14,8 @@
  * 呼叫端拿到 `true` 之後就 ACK 給供方，於是「TradeNo 沒寫進去」「tracking_number
  * 沒寫進去」這類事實被永久吞掉——而那些欄位正是退款、對帳、查件的唯一依據。
  *
- * 這個類別把結果分成五種可分辨的狀態，並在 affected=0 時**回頭讀一次**：只有
- * 現況與我們要寫的值逐字元相同，才算成功的 no-op。
+ * 這個類別把結果分成可分辨的狀態，並**一律回頭讀一次**：只有現況與我們要寫的
+ * 值逐字元相同才算成功。
  *
  * @package YangSheep\YSCartEcpay\Support
  */
@@ -28,10 +28,19 @@ use YangSheep\Ecommerce\Models\YSOrder;
 
 final class ScalarColumnWriter {
 
-    /** 值已寫入（affected = 1）。 */
-    public const UPDATED = 'updated';
+    /**
+     * 值已確認落在 DB 裡（readback 逐字元相符）。
+     *
+     * 🔴 #2F：這裡**不能**再分「UPDATED（affected=1）」與「NO_OP（affected=0
+     * 但值相同）」。`YSOrder::update()` 回的是 bool——`true` 同時代表 affected=1
+     * 與 affected=0，兩者分不出來。給它們兩個不同的名字等於宣稱我們知道一件
+     * 我們不知道的事，而讀 log 的人會據此推論。
+     *
+     * 我們**能**證明的只有一件事：readback 顯示 DB 裡就是我們要的值。
+     */
+    public const VERIFIED = 'verified';
 
-    /** 值本來就相同（affected = 0，且 readback 逐字元相符）。 */
+    /** 沒有要寫的欄位（呼叫端傳了空陣列）。 */
     public const NO_OP = 'no_op';
 
     /** 訂單不存在（readback 讀不到）。 */
@@ -87,16 +96,16 @@ final class ScalarColumnWriter {
             }
         }
 
-        return [ 'state' => true === $updated ? self::UPDATED : self::NO_OP, 'columns' => $actual ];
+        return [ 'state' => self::VERIFIED, 'columns' => $actual ];
     }
 
     /**
-     * 值確實就是我們要的（UPDATED 或 NO_OP）。
+     * 值確實就是我們要的（VERIFIED 或「沒有欄位要寫」）。
      *
      * @param array{state:string, columns:array<string,mixed>} $result
      */
     public static function is_persisted( array $result ): bool {
-        return in_array( $result['state'] ?? '', [ self::UPDATED, self::NO_OP ], true );
+        return in_array( $result['state'] ?? '', [ self::VERIFIED, self::NO_OP ], true );
     }
 
     /**
