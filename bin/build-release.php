@@ -45,12 +45,25 @@ if (!$scan['files']) {
 }
 
 // entry 名稱在寫入前就先過安全性檢查，壞名稱不該先進包再靠測試抓。
-foreach (ys_cart_ecpay_release_expected_entries($scan) as $entry) {
+$expectedEntries = ys_cart_ecpay_release_expected_entries($scan);
+foreach ($expectedEntries as $entry) {
     $problem = ys_cart_ecpay_release_entry_problem($entry);
     if (null !== $problem) {
         fwrite(STDERR, "Refusing to build: unsafe archive entry '{$entry}' ({$problem}).\n");
         exit(1);
     }
+}
+
+// 逐一檢查擋不住 case-fold 碰撞——兩個名字各自都合法，解壓到不分大小寫的檔案系統
+// 才會互相覆蓋。必須在**刪除既有 ZIP 之前**判定，否則一次失敗的建置會順手毀掉
+// 上一份可用的產物。
+$collisions = ys_cart_ecpay_release_collision_problems($expectedEntries);
+if ($collisions) {
+    fwrite(STDERR, "Refusing to build: archive entries collide on a case-insensitive filesystem:\n");
+    foreach ($collisions as $collision) {
+        fwrite(STDERR, "  {$collision}\n");
+    }
+    exit(1);
 }
 
 if (is_file($zipPath)) {

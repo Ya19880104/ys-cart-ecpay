@@ -98,6 +98,62 @@ $assert(
     '(A4) builder 與本測試共用同一份 policy（不得各自抄一份排除規則）'
 );
 
+// (A5)~(A7) list-level 碰撞：逐一檢查 entry 名稱擋不住這一類——兩個名字各自都完全
+// 合法，在 case-sensitive 的建置機上也能並存，解壓到 NTFS／APFS 才互相覆蓋。
+$collisionFixtures = [
+    'file case variant' => [
+        'ys-cart-ecpay/src/Plugin.php',
+        'ys-cart-ecpay/src/plugin.php',
+    ],
+    'directory case variant' => [
+        'ys-cart-ecpay/src/',
+        'ys-cart-ecpay/SRC/',
+    ],
+    'file vs directory of the same name' => [
+        'ys-cart-ecpay/src/Plugin.php',
+        'ys-cart-ecpay/src/Plugin.php/',
+    ],
+    'exact duplicate' => [
+        'ys-cart-ecpay/src/Plugin.php',
+        'ys-cart-ecpay/src/Plugin.php',
+    ],
+    'nested path segment case variant' => [
+        'ys-cart-ecpay/src/Support/Settings.php',
+        'ys-cart-ecpay/src/support/Settings.php',
+    ],
+    'separator variant' => [
+        'ys-cart-ecpay/src/Plugin.php',
+        'ys-cart-ecpay\\src\\Plugin.php',
+    ],
+];
+$collision_ok = true;
+foreach ($collisionFixtures as $why => $fixture) {
+    if ([] === ys_cart_ecpay_release_collision_problems($fixture)) {
+        $collision_ok = false;
+        printf("        ↳ 未偵測到碰撞：%s（%s）\n", $why, implode(', ', $fixture));
+    }
+}
+$assert($collision_ok, '(A5) 碰撞偵測涵蓋 file/dir case variant、file↔dir 同名、完全重複、路徑中段大小寫、分隔符變體');
+
+$assert(
+    [] === ys_cart_ecpay_release_collision_problems([
+        'ys-cart-ecpay/src/',
+        'ys-cart-ecpay/src/Plugin.php',
+        'ys-cart-ecpay/src/Support/',
+        'ys-cart-ecpay/src/Support/Settings.php',
+        'ys-cart-ecpay/README.md',
+    ]),
+    '(A6) 正常的巢狀目錄＋檔案清單不被誤判為碰撞'
+);
+
+$dupProblem = ys_cart_ecpay_release_collision_problems(['ys-cart-ecpay/a.php', 'ys-cart-ecpay/a.php']);
+$caseProblem = ys_cart_ecpay_release_collision_problems(['ys-cart-ecpay/a.php', 'ys-cart-ecpay/A.php']);
+$assert(
+    1 === count($dupProblem) && str_contains($dupProblem[0], 'duplicate entry')
+    && 1 === count($caseProblem) && str_contains($caseProblem[0], 'case-insensitive collision'),
+    '(A7) 完全重複與 case-fold 碰撞分別回報，訊息可辨識'
+);
+
 // ── B. 當前 source 版號 ─────────────────────────────────────────────────────
 
 $pluginFile = $root . '/' . $slug . '.php';
@@ -204,6 +260,23 @@ foreach (array_count_values($names) as $name => $occurrences) {
 $assert([] === $duplicates, '(E2) 無重複 entry（' . (implode(', ', $duplicates) ?: '無') . '）');
 
 $assert([] === $symlinkEntries, '(E3) 無 symlink entry（' . (implode(', ', $symlinkEntries) ?: '無') . '）');
+
+$zipCollisions = ys_cart_ecpay_release_collision_problems($names);
+$assert([] === $zipCollisions, '(E4) 實際 ZIP 無 case-fold／重複碰撞（' . (implode('; ', $zipCollisions) ?: '無') . '）');
+
+$sourceCollisions = ys_cart_ecpay_release_collision_problems(ys_cart_ecpay_release_expected_entries($scan));
+$assert([] === $sourceCollisions, '(E5) eligible 來源集合本身無碰撞（' . (implode('; ', $sourceCollisions) ?: '無') . '）');
+
+// 順序契約：碰撞判定必須早於 unlink，否則一次失敗的建置會順手毀掉上一份可用產物。
+$builderSrc  = str_replace("\r\n", "\n", (string) file_get_contents($root . '/bin/build-release.php'));
+$posGate     = strpos($builderSrc, 'ys_cart_ecpay_release_collision_problems');
+$posEntry    = strpos($builderSrc, 'ys_cart_ecpay_release_entry_problem');
+$posUnlink   = strpos($builderSrc, 'unlink($zipPath)');
+$assert(
+    false !== $posGate && false !== $posEntry && false !== $posUnlink
+    && $posGate < $posUnlink && $posEntry < $posUnlink,
+    '(E6) builder 的 entry 檢查與碰撞檢查都在 unlink 既有 ZIP 之前'
+);
 
 // ── F. 精確集合：檔案 ＋ 目錄，逐項相等（含順序無關但含重複計數）────────────
 

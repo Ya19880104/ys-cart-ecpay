@@ -208,4 +208,60 @@ if (!function_exists('ys_cart_ecpay_release_slug')) {
 
         return null;
     }
+
+    /**
+     * 碰撞比對用的正規化鍵。
+     *
+     * - 反斜線一律轉成斜線（entry gate 會擋掉反斜線，但本函式必須能單獨對任意清單使用）
+     * - 去掉尾斜線：目錄 `src/Plugin.php/` 與檔案 `src/Plugin.php` 在解壓時是同一個名字
+     * - case-fold：NTFS／APFS 預設不分大小寫
+     *
+     * 已知界線：不做 Unicode 正規化（NFC/NFD）。目前工作目錄全為 ASCII 路徑；
+     * 若日後出現非 ASCII 檔名，這裡要再補 normalizer。
+     */
+    function ys_cart_ecpay_release_collision_key(string $entry): string
+    {
+        $key = rtrim(str_replace('\\', '/', $entry), '/');
+
+        return function_exists('mb_strtolower') ? mb_strtolower($key, 'UTF-8') : strtolower($key);
+    }
+
+    /**
+     * list-level 碰撞檢查：完全重複，以及**不分大小寫**才會撞到的名字。
+     *
+     * 逐一檢查每個 entry 的名稱合法性擋不住這一類：`src/Plugin.php` 與 `src/plugin.php`
+     * 兩個名字各自都完全合法，在 case-sensitive 的建置機上也能同時存在；但解壓到
+     * Windows／macOS 預設檔案系統時會互相覆蓋——安裝出來的外掛少一個檔，而且是**哪一個
+     * 留下來取決於解壓順序**。目錄與檔案的 case variant（`src/` vs `SRC/`）同樣算碰撞。
+     *
+     * @param string[] $entries
+     * @return string[] 人類可讀的問題描述；空陣列＝無碰撞
+     */
+    function ys_cart_ecpay_release_collision_problems(array $entries): array
+    {
+        $groups = [];
+        foreach ($entries as $entry) {
+            $groups[ys_cart_ecpay_release_collision_key((string) $entry)][] = (string) $entry;
+        }
+
+        $problems = [];
+        foreach ($groups as $key => $members) {
+            if (count($members) < 2) {
+                continue;
+            }
+
+            $distinct = array_values(array_unique($members));
+            if (1 === count($distinct)) {
+                $problems[] = sprintf('duplicate entry ×%d: %s', count($members), $distinct[0]);
+                continue;
+            }
+
+            sort($distinct);
+            $problems[] = sprintf('case-insensitive collision on "%s": %s', $key, implode(' ⟷ ', $distinct));
+        }
+
+        sort($problems);
+
+        return $problems;
+    }
 }
