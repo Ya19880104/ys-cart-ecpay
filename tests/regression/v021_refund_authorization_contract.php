@@ -351,6 +351,16 @@ namespace {
         '(a1) 完整且正確的 core entry → 通過'
     );
 
+    // 超界字串不得飽和成 PHP_INT_MAX
+    $assert(
+        null === Auth::canonical_int( '999999999999999999999999' )
+        && null === Auth::canonical_int( '1000abc' )
+        && null === Auth::canonical_int( true )
+        && 1000 === Auth::canonical_int( 1000 )
+        && 1000 === Auth::canonical_int( '1000' ),
+        '(a1b) 🔴 canonical_int：超界字串回 null（(int) 轉型會飽和成 PHP_INT_MAX）'
+    );
+
     foreach ( [ 'finalized', 'provider_done', 'record_only' ] as $flag ) {
         $missing = $core_entry();
         unset( $missing[ $flag ] );
@@ -364,16 +374,23 @@ namespace {
     $assert(
         'core_flag_unreadable' === ( Auth::problem( $core_entry( [ 'record_only' => 'no' ] ), 1000 )['action'] ?? '' )
         && 'core_finalized' === ( Auth::problem( $core_entry( [ 'finalized' => true ] ), 1000 )['action'] ?? '' )
-        && null === Auth::problem( $core_entry( [ 'finalized' => '0' ] ), 1000 ),
-        '(a3) 旗標型別敏感：無法解讀 → 拒絕；true → 擋；字串零 → 明確的 false'
+        // 🔴 #2F：**只**接受 exact bool。Core 產出的契約是 false／true；`'0'`
+        // 不是它寫出來的形狀，接受它等於接受未知來源的值。
+        && 'core_flag_unreadable' === ( Auth::problem( $core_entry( [ 'finalized' => '0' ] ), 1000 )['action'] ?? '' )
+        && 'core_flag_unreadable' === ( Auth::problem( $core_entry( [ 'finalized' => 0 ] ), 1000 )['action'] ?? '' )
+        && 'core_flag_unreadable' === ( Auth::problem( $core_entry( [ 'finalized' => 1 ] ), 1000 )['action'] ?? '' ),
+        '(a3) 🔴 旗標只接受 exact bool：0、字串零、1 一律 fail-closed'
     );
 
     $assert(
         'core_amount_unreadable' === ( Auth::problem( $core_entry( [ 'amount' => '1000abc' ] ), 1000 )['action'] ?? '' )
         && 'core_amount_unreadable' === ( Auth::problem( $core_entry( [ 'amount' => true ] ), 1000 )['action'] ?? '' )
-        && null === Auth::problem( $core_entry( [ 'amount' => 1000.0 ] ), 1000 )
+        // 🔴 #2F：只接受 Core 產出的 canonical 正整數；float／string 都不是。
+        && 'core_amount_unreadable' === ( Auth::problem( $core_entry( [ 'amount' => 1000.0 ] ), 1000 )['action'] ?? '' )
+        && 'core_amount_unreadable' === ( Auth::problem( $core_entry( [ 'amount' => '1000' ] ), 1000 )['action'] ?? '' )
+        && 'core_amount_unreadable' === ( Auth::problem( $core_entry( [ 'amount' => 0 ] ), 0 )['action'] ?? '' )
         && 'core_amount_mismatch' === ( Auth::problem( $core_entry( [ 'amount' => 999 ] ), 1000 )['action'] ?? '' ),
-        '(a4) 金額必須是 canonical 整數且逐值相符'
+        '(a4) 🔴 金額只接受 canonical 正整數（float／string／0 全部拒絕）'
     );
 
     $assert(
@@ -488,6 +505,7 @@ namespace {
         'executed'          => 'E',
         'response_trade_no' => 'ECPAY-OLD',
         'amount'            => 1000,
+        'charged_amount'    => 1000,
         'trade_no'          => 'TN-1',
         'merchant_trade_no' => 'YS7Tabc',
         'gwsr'              => 'GW-1',
@@ -528,6 +546,115 @@ namespace {
         && ! str_contains( $resolve_body, 'OrderPaymentDetail::mutate' )
         && str_contains( $resolve_body, 'wp ys-cart refund-finalization resolve' ),
         '(f2) CLI resolve 只讀不寫（核心 CLI 是唯一 writer）'
+    );
+
+    // ══ #2F：identity drift → DoAction = 0 ═══════════════════════════════
+    //
+    // 交易證據在 process_refund 開頭讀一次；CAS 重試時舊版完全沒有再看它們。
+    // 期間 detail 被改寫（webhook 寫入另一筆交易、資料修復、換商店設定）之後，
+    // 我們仍會以 A 的身分呼叫 DoAction。
+    $drift_cases = [
+        'trade_no'             => [ 'trade_no' => 'TN-OTHER' ],
+        'mer_trade_no'         => [ 'mer_trade_no' => 'YS7Tzzz' ],
+        'ecpay_merchant_id'    => [ 'ecpay_merchant_id' => 'M2' ],
+        'ecpay_environment'    => [ 'ecpay_environment' => 'stage' ],
+        'gwsr'                 => [ 'gwsr' => 'GW-OTHER' ],
+        'ecpay_charged_amount' => [ 'ecpay_charged_amount' => 2000 ],
+    ];
+
+    $all_blocked = true;
+    foreach ( $drift_cases as $label => $mutation ) {
+        $seed();
+        $wpdb->before_write = static function ( FakeWpdb $db, string $sql ) use ( $mutation ): void {
+            // 在 reservation 落盤前把身分改掉（模擬併發改寫）。
+            $db->before_write = null;
+            $detail = json_decode( (string) $db->value, true ) ?: [];
+            foreach ( $mutation as $k => $v ) {
+                $detail[ $k ] = $v;
+            }
+            $db->value = json_encode( $detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        };
+
+        $r = $refund();
+        if ( ! empty( $r['success'] ) || EcpayPaymentClient::do_action_count() > 0 ) {
+            $all_blocked = false;
+            echo "        ↳ {$label} drift 未被擋下\n";
+        }
+    }
+    $assert( $all_blocked, '(g1) 🔴 六種 identity drift 全部 DoAction=0' );
+
+    // 不相關欄位的變動只會讓 CAS 落敗重試，不得被誤判成 drift
+    $seed();
+    $wpdb->before_write = static function ( FakeWpdb $db, string $sql ): void {
+        $db->before_write = null;
+        $detail = json_decode( (string) $db->value, true ) ?: [];
+        $detail['_ys_shopline_refunds'] = [ 'other' => [ 'status' => 'pending' ] ];
+        $db->value = json_encode( $detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+    };
+    $r = $refund();
+    $assert(
+        ! empty( $r['success'] ) && 1 === EcpayPaymentClient::do_action_count(),
+        '(g2) 不相關欄位變動 → CAS 重試後仍然成功（不得被誤判成 drift）'
+    );
+
+    // ══ #2F：QueryTrade 缺 TradeNo ═══════════════════════════════════════
+    $seed();
+    EcpayPaymentClient::$query = [
+        'success'      => true,
+        'mac_verified' => true,
+        'data'         => [ 'MerchantTradeNo' => 'YS7Tabc' ], // 缺 TradeNo
+    ];
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(h1) 🔴 QueryTrade 缺 TradeNo → 拒絕（先前只在有值時比對）'
+    );
+
+    // ══ #2F：每步 operation append-only ══════════════════════════════════
+    $seed();
+    EcpayPaymentClient::$close = [ 'state' => 'to_close', 'message' => '' ];
+    EcpayPaymentClient::$do_action_results = [
+        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'ECPAY-E' ], 'message' => '' ],
+        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'ECPAY-N' ], 'message' => '' ],
+    ];
+    $r     = $refund();
+    $entry = $ledger();
+    $ops   = is_array( $entry['operations'] ?? null ) ? $entry['operations'] : [];
+
+    $assert(
+        ! empty( $r['success'] )
+        && 2 === count( $ops )
+        && 'E' === ( $ops[0]['step'] ?? '' )
+        && 'N' === ( $ops[1]['step'] ?? '' )
+        && ( $ops[0]['token'] ?? '' ) !== ( $ops[1]['token'] ?? '' ),
+        '(i1) 🔴 E→N 每一步都 append（舊版只留最後一步的 token）'
+    );
+
+    // ══ #2F：post-send 失敗一律 append orphan fact ═══════════════════════
+    $cli_src = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Cli/EcpayRefundAttemptCommand.php' ) );
+    $gw_src  = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Payment/EcpayCreditGateway.php' ) );
+
+    $assert(
+        str_contains( $gw_src, "self::record_orphan_facts( \$order_id, \$request_id, array_merge( \$patch," ),
+        '(j1) note_attempt 寫入失敗時把完整 patch 存成 orphan fact（不只 log）'
+    );
+
+    // ══ #2F：core sync 接受 Core 真正的狀態 ══════════════════════════════
+    $assert(
+        str_contains( $cli_src, "'provider_done'" )
+        && str_contains( $cli_src, "'aborted_provider_rejected'" )
+        && str_contains( $cli_src, "'paid' === \$mark" ),
+        '(k1) 🔴 core sync 接受 provider_done／aborted_provider_rejected（否則人工核定必然被拒）'
+    );
+
+    // ══ #2F：CLI 三來源聯集 + corrupt JSON 明確報錯 ══════════════════════
+    $assert(
+        str_contains( $cli_src, '$request_ids = array_values( array_unique( array_merge(' )
+        && str_contains( $cli_src, '$orphan_ids' )
+        && str_contains( $cli_src, '$core_ledger_ids' )
+        && str_contains( $cli_src, 'payment_detail 無法解析為 JSON' )
+        && str_contains( $cli_src, "\$operations = is_array( \$entry['operations'] ?? null )" ),
+        '(k2) CLI 以 provider／core／orphan 聯集輸出、corrupt JSON 明確報錯、每步歷史可見'
     );
 
     echo "\nrefund authorization contract: {$pass} PASS / {$fail} FAIL\n";

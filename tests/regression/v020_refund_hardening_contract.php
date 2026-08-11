@@ -336,8 +336,8 @@ namespace {
     $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => '0', 'provider_done' => false, 'record_only' => false]);
     $r = $refund();
     $assert(
-        !empty($r['success']) && 1 === EcpayPaymentClient::do_action_count(),
-        '(a1) finalized="0"（字串零）是明確的 false → 正常放行'
+        empty($r['success']) && 0 === EcpayPaymentClient::do_action_count(),
+        '(a1) 🔴 #2F：finalized="0" 不是 exact bool → fail-closed（先前放行）'
     );
 
     $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000, 'status' => 'submitting', 'finalized' => true, 'provider_done' => false, 'record_only' => false]);
@@ -363,11 +363,18 @@ namespace {
         '(a4) 🔴 amount="1000abc" → 拒絕（舊版 (float) 轉型會變成 1000.0 而通過核對）'
     );
 
+    // 🔴 #2F 的事實澄清：core ledger 存在 payment_detail 的 **JSON** 裡，而 PHP
+    // 的 json_encode 會把整數值 float（1000.0）寫成 `1000`，decode 回來是 int。
+    // 「float 金額」在這條路徑上**不可能發生**；真正的 float 只會出現在記憶體內
+    // 的呼叫（v021 (a4) 直接對 validator 驗證那一種）。
     $seed([], ['gateway_id' => 'ys_ec_ecpay_credit', 'amount' => 1000.0, 'status' => 'submitting', 'finalized' => false, 'provider_done' => false, 'record_only' => false]);
+    $stored_amount = (json_decode((string) $wpdb->value, true) ?: [])['_ys_refund_finalization']['req-1']['amount'] ?? null;
     $r = $refund();
     $assert(
-        !empty($r['success']) && 1 === EcpayPaymentClient::do_action_count(),
-        '(a5) amount=1000.0（JSON 解碼常見的整數值 float）→ 接受'
+        is_int($stored_amount)
+        && !empty($r['success'])
+        && 1 === EcpayPaymentClient::do_action_count(),
+        '(a5) 整數值 float 經 JSON 存取後就是 int（因此放行）——float 分支見 v021 (a4)'
     );
 
     // ══ F2／F6：指紋不可變、回應 ID 獨立 ══════════════════════════════════

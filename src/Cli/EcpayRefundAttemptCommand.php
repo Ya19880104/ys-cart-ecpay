@@ -44,9 +44,37 @@ final class EcpayRefundAttemptCommand {
 			\WP_CLI::error( "訂單 {$order_id} 不存在。" );
 		}
 
-		$detail  = json_decode( (string) ( $order->payment_detail ?? '{}' ), true ) ?: [];
+		$raw = (string) ( $order->payment_detail ?? '{}' );
+		$detail = '' === $raw ? [] : json_decode( $raw, true );
+
+		// 🔴 #2F：JSON 損壞不得被當成「沒有紀錄」。人工核定時最需要看到資料的
+		// 場合，正是資料出問題的時候。
+		if ( ! is_array( $detail ) ) {
+			\WP_CLI::error( sprintf(
+				'訂單 %d 的 payment_detail 無法解析為 JSON（%s）——請先人工檢查該欄位。',
+				$order_id,
+				json_last_error_msg()
+			) );
+		}
+
 		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-		if ( empty( $history ) ) {
+		$core_ledger_ids = is_array( $detail['_ys_refund_finalization'] ?? null )
+			? array_keys( $detail['_ys_refund_finalization'] )
+			: [];
+		$orphan_ids = is_array( $detail['_ys_ecpay_orphan_facts'] ?? null )
+			? array_keys( $detail['_ys_ecpay_orphan_facts'] )
+			: [];
+
+		// 🔴 以三個來源的**聯集**列出：只迭代 provider history 會讓 core-only
+		// （我們從未 reserve 成功）與 orphan-only（失去授權後才寫下的事實）
+		// 的請求完全看不見——而那兩種正是最需要人工處理的。
+		$request_ids = array_values( array_unique( array_merge(
+			array_map( 'strval', array_keys( $history ) ),
+			array_map( 'strval', $core_ledger_ids ),
+			array_map( 'strval', $orphan_ids )
+		) ) );
+
+		if ( empty( $request_ids ) ) {
 			\WP_CLI::log( '（無退款 attempt 紀錄）' );
 			return;
 		}
@@ -64,8 +92,13 @@ final class EcpayRefundAttemptCommand {
 			? $detail['_ys_ecpay_orphan_facts']
 			: [];
 
-		foreach ( $history as $request_id => $entry ) {
-			$core = is_array( $core_ledger[ (string) $request_id ] ?? null ) ? $core_ledger[ (string) $request_id ] : [];
+		foreach ( $request_ids as $request_id ) {
+			$entry = is_array( $history[ $request_id ] ?? null ) ? $history[ $request_id ] : [];
+			$core  = is_array( $core_ledger[ (string) $request_id ] ?? null ) ? $core_ledger[ (string) $request_id ] : [];
+
+			if ( [] === $entry ) {
+				\WP_CLI::log( sprintf( '── attempt %s  ⚠ 本外掛沒有 provider 紀錄（core-only／orphan-only）', (string) $request_id ) );
+			}
 
 			\WP_CLI::log( sprintf( '── attempt %s', (string) $request_id ) );
 			\WP_CLI::log( sprintf(
@@ -111,6 +144,23 @@ final class EcpayRefundAttemptCommand {
 
 			if ( ! empty( $entry['note'] ) ) {
 				\WP_CLI::log( sprintf( '   註記      %s', (string) $entry['note'] ) );
+			}
+
+			// E→N 這類多步流程：每一步的 operation 都要看得到，不能只留最後一步。
+			$operations = is_array( $entry['operations'] ?? null ) ? $entry['operations'] : [];
+			foreach ( $operations as $index => $op ) {
+				if ( ! is_array( $op ) ) {
+					continue;
+				}
+				\WP_CLI::log( sprintf(
+					'   步驟 #%d   step=%s  token=%s  sent_at=%s  result=%s  RtnCode=%s',
+					(int) $index + 1,
+					(string) ( $op['step'] ?? '-' ),
+					(string) ( $op['token'] ?? '-' ),
+					(string) ( $op['sent_at'] ?? '-' ),
+					(string) ( $op['result'] ?? '-' ),
+					(string) ( $op['rtn_code'] ?? '-' )
+				) );
 			}
 
 			// 失去授權時保存下來的 provider 事實：多步流程／crash 後的唯一線索。
@@ -314,11 +364,26 @@ final class EcpayRefundAttemptCommand {
 
 				// (1b) core 的終態必須與這次要寫的方向一致。core 說 aborted、我們卻
 				// 要把 provider ledger 標成 done，兩邊會永久互相矛盾。
+				// 🔴 #2F：接受 Core **實際**會寫出來的狀態。
+				//
+				// Core 在呼叫我們之前就已經把 paid 的 entry 標成 `provider_done`、
+				// 把 aborted 的標成 `aborted_provider_rejected`。舊版只認
+				// paid/aborted/submitting，於是每一次人工核定的同步都必然被拒——
+				// provider ledger 永遠留在 pending，凍結永遠解不開。
 				$core_status = (string) ( $core_current['status'] ?? '' );
-				$consistent  = ( 'paid' === $mark && in_array( $core_status, [ 'paid', 'submitting' ], true ) )
-					|| ( 'aborted' === $mark && in_array( $core_status, [ 'aborted', 'failed', 'submitting' ], true ) );
-				if ( ! $consistent ) {
+				$accepted    = 'paid' === $mark
+					? [ 'paid', 'submitting', 'provider_done' ]
+					: [ 'aborted', 'failed', 'submitting', 'aborted_provider_rejected' ];
+
+				if ( ! in_array( $core_status, $accepted, true ) ) {
 					$decision = [ 'action' => 'core_status_inconsistent', 'status' => $core_status ];
+					return null;
+				}
+
+				// paid 方向：core 也可能已經把 provider_done 旗標設起來——那是
+				// 「核定已完成」的正常形狀，不是矛盾。
+				if ( 'paid' === $mark && true === ( $core_current['record_only'] ?? null ) ) {
+					$decision = [ 'action' => 'core_record_only' ];
 					return null;
 				}
 

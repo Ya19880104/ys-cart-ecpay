@@ -247,6 +247,8 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// v0.3.0：綁定建單身分——同一筆 request_id 若在設定切換後重放，指紋就對不上。
 			'merchant_id'       => $charge_merchant,
 			'environment'       => $charge_env,
+			// #2F：請款金額也是身分的一部分（退款上界的依據）。
+			'charged_amount'    => $charged_amount,
 		];
 
 		// ── 步驟 6：原子式 reservation ──────────────────────────────────────
@@ -275,6 +277,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				$schema = CoreRefundAuthorization::problem_in( $detail, $request_id, $amount_twd );
 				if ( null !== $schema ) {
 					$decision = $schema;
+					return null;
+				}
+
+				// 🔴 交易身分以**這一次 CAS 讀到的** detail 重建並比對。
+				$drift = self::identity_drift( $detail, $fingerprint );
+				if ( null !== $drift ) {
+					$decision = [ 'action' => 'identity_drift', 'field' => $drift ];
 					return null;
 				}
 
@@ -368,6 +377,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				sanitize_text_field( $status )
 			) );
 		}
+		if ( 'identity_drift' === $action ) {
+			$field = is_array( $decision ) ? (string) ( $decision['field'] ?? '' ) : '';
+			return self::reject( sprintf(
+				'訂單的綠界交易身分在退款準備期間被改動（%s），已中止；未送出任何金流動作，請人工核對後重試。',
+				sanitize_text_field( $field )
+			) );
+		}
 		if ( 'core_flag_unreadable' === $action ) {
 			$flag = is_array( $decision ) ? (string) ( $decision['flag'] ?? '?' ) : '?';
 			return self::reject( sprintf(
@@ -430,11 +446,32 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// 寫不進去就**不送**：沒有 durable 的送出前紀錄，等於沒有事後可查證的
 			// 依據，而退款是不可逆的。
 			$op_token = self::operation_token( $request_id, $step, count( $executed ) );
-			$armed    = self::mark_attempt( $order_id, $request_id, [
+			$sent_at  = current_time( 'mysql' );
+
+			// 🔴 #2F：每一步都 append 到 `operations`，而不是覆寫單一 token。
+			//
+			// E→N 這類多步流程覆寫之後，人工核定時只看得到最後一步——「E 到底送
+			// 出去了沒」變成無法回答的問題，而那正是決定要不要補 N 的依據。
+			$armed = self::mark_attempt( $order_id, $request_id, [
 				'operation_token' => $op_token,
 				'pending_step'    => $step,
-				'sent_at'         => current_time( 'mysql' ),
-			], $fingerprint, null );
+				'sent_at'         => $sent_at,
+			], $fingerprint, null, static function ( array $entry ) use ( $op_token, $step, $sent_at ): array {
+				$ops = is_array( $entry['operations'] ?? null ) && array_is_list( $entry['operations'] )
+					? $entry['operations']
+					: [];
+
+				$ops[] = [
+					'step'    => $step,
+					'token'   => $op_token,
+					'sent_at' => $sent_at,
+					'result'  => 'sent',
+				];
+
+				$entry['operations'] = $ops;
+
+				return $entry;
+			} );
 
 			if ( ! $armed ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: 送出前紀錄寫入失敗，已中止（未送出本步）', [
@@ -616,6 +653,65 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	/**
+	 * 這一筆 attempt 的交易身分是否仍與 detail 的**當下值**一致？（v0.3.0，#2F）
+	 *
+	 * 🔴 交易證據（trade_no、mer_trade_no、gwsr、商店、環境、請款金額）是在
+	 * `process_refund()` 開頭讀一次的。CAS 重試時只重驗核心 ledger，這些**完全
+	 * 沒有再看**——期間 detail 被改寫（webhook 寫入另一筆交易、資料修復、
+	 * 換商店設定）之後，我們仍會以 A 的身分呼叫 DoAction。
+	 *
+	 * 這個檢查放進每一個 CAS closure：任何 identity drift 一律 abort，DoAction
+	 * 呼叫次數為 0。不相關欄位的變動（其他 provider 的 ledger）不受影響——那些
+	 * 只會讓 CAS 落敗重試，重試時這裡仍然通過。
+	 *
+	 * @param array<string,mixed> $detail      當下的 payment_detail
+	 * @param array<string,mixed> $fingerprint reservation 當時的交易指紋
+	 * @return string|null null＝一致；否則是漂移的欄位說明
+	 */
+	private static function identity_drift( array $detail, array $fingerprint ): ?string {
+		$checks = [
+			'trade_no'          => (string) ( $detail['trade_no'] ?? '' ),
+			'merchant_trade_no' => (string) ( $detail['mer_trade_no'] ?? '' ),
+			'merchant_id'       => (string) ( $detail['ecpay_merchant_id'] ?? '' ),
+			'environment'       => (string) ( $detail['ecpay_environment'] ?? '' ),
+		];
+
+		foreach ( $checks as $key => $current ) {
+			$expected = (string) ( $fingerprint[ $key ] ?? '' );
+
+			// 期望值為空代表 reservation 當時就沒有它——那是另一道 gate 的職責。
+			if ( '' === $expected ) {
+				continue;
+			}
+
+			if ( '' === $current || ! hash_equals( $expected, $current ) ) {
+				return sprintf( '%s（指紋 %s／當下 %s）', $key, $expected, '' === $current ? '缺' : $current );
+			}
+		}
+
+		// gwsr：detail 有值時必須相符。快取寫入失敗導致缺值不算漂移——指紋裡的
+		// 值來自 QueryTradeInfo，本來就不依賴快取。
+		$gwsr_now      = (string) ( $detail['gwsr'] ?? $detail['ecpay_gwsr'] ?? '' );
+		$gwsr_expected = (string) ( $fingerprint['gwsr'] ?? '' );
+		if ( '' !== $gwsr_expected && '' !== $gwsr_now && ! hash_equals( $gwsr_expected, $gwsr_now ) ) {
+			return sprintf( 'gwsr（指紋 %s／當下 %s）', $gwsr_expected, $gwsr_now );
+		}
+
+		// 請款金額：退款金額的上界依據，改變了就不能沿用原本的判定。
+		$charged_now = CoreRefundAuthorization::canonical_int( $detail['ecpay_charged_amount'] ?? null );
+		$charged_exp = CoreRefundAuthorization::canonical_int( $fingerprint['charged_amount'] ?? null );
+		if ( null !== $charged_exp && $charged_now !== $charged_exp ) {
+			return sprintf(
+				'charged_amount（指紋 %d／當下 %s）',
+				$charged_exp,
+				null === $charged_now ? '無法解讀' : (string) $charged_now
+			);
+		}
+
+		return null;
+	}
+
+	/**
 	 * 這份 QueryTradeInfo 回應可以拿來當退款依據嗎？（v0.3.0）
 	 *
 	 * 四道全部要過：
@@ -649,8 +745,15 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			return sprintf( 'MerchantTradeNo 不符（回應 %s）', sanitize_text_field( $resp_mtn ) );
 		}
 
+		// 🔴 #2F：TradeNo 必須**存在**且相符。
+		//
+		// 舊版只在「有值時」比對：MAC 正確、MerchantTradeNo 正確、但 TradeNo 缺
+		// 失的回應仍可授權退款——而 TradeNo 正是我們要送去 DoAction 的識別碼。
 		$resp_tn = isset( $data['TradeNo'] ) && is_string( $data['TradeNo'] ) ? trim( $data['TradeNo'] ) : '';
-		if ( '' !== $resp_tn && '' !== $trade_no && ! hash_equals( $trade_no, $resp_tn ) ) {
+		if ( '' === $resp_tn ) {
+			return '回應未帶 TradeNo（無法證明是同一筆交易）';
+		}
+		if ( '' === $trade_no || ! hash_equals( $trade_no, $resp_tn ) ) {
 			return sprintf( 'TradeNo 不符（回應 %s）', sanitize_text_field( $resp_tn ) );
 		}
 
@@ -737,11 +840,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		string $request_id,
 		array $patch,
 		array $fingerprint,
-		?string $expect_terminal = null
+		?string $expect_terminal = null,
+		?callable $append = null
 	): bool {
 		$result = OrderPaymentDetail::mutate(
 			$order_id,
-			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $patch, $fingerprint ): ?array {
+			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $patch, $fingerprint, $append ): ?array {
 				// 🔴 指紋欄位不可變。少了這道檢查，終態寫入時的
 				// `'trade_no' => $done_trade_no` 會把指紋裡的 trade_no 換成綠界回應
 				// 的值——之後任何一次 fingerprint_matches 都是在跟被改過的值比對。
@@ -765,6 +869,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 						'action'  => 'core_authority_lost',
 						'problem' => $core_problem,
 					];
+					return null;
+				}
+
+				// 交易身分同樣以這一次讀到的值重建並比對（見 identity_drift）。
+				$drift = self::identity_drift( $detail, $fingerprint );
+				if ( null !== $drift ) {
+					$decision = [ 'action' => 'identity_drift', 'field' => $drift ];
 					return null;
 				}
 
@@ -794,7 +905,18 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 					return null;
 				}
 
-				$ledger[ $request_id ]       = array_merge( $current, $patch );
+				$next = array_merge( $current, $patch );
+
+				// append-only 的部分（每步 operation 歷史）由 callback 在**最新**的
+				// entry 上追加——直接放進 patch 會在 CAS 重試時重複追加。
+				if ( null !== $append ) {
+					$appended = $append( $next );
+					if ( is_array( $appended ) ) {
+						$next = $appended;
+					}
+				}
+
+				$ledger[ $request_id ]       = $next;
 				$detail['_ys_ecpay_refunds'] = $ledger;
 				$decision                    = [ 'action' => 'marked' ];
 
@@ -915,6 +1037,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			'order_id'   => $order_id,
 			'request_id' => $request_id,
 		] );
+
+		// 🔴 #2F：金流已經動過了，這些是 provider 端**唯一**的事實。
+		//
+		// 舊版只記 log 就算了：ledger 寫不進去（或授權在期間改變）時，operation
+		// token、步驟、RtnCode／RtnMsg 全部只存在於 log 檔——人工核定看不到。
+		self::record_orphan_facts( $order_id, $request_id, array_merge( $patch, [ 'phase' => $what ] ) );
 	}
 
 	/**
@@ -937,6 +1065,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 */
 	private const FINGERPRINT_KEYS = [
 		'amount',
+		'charged_amount',
 		'trade_no',
 		'merchant_trade_no',
 		'gwsr',
@@ -1028,7 +1157,8 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// 轉換後比較，於是 `"1000"` 與 `1000`、`"0"` 與 `false`、甚至 `null`
 			// 與 `""` 都會被判成「相符」——指紋的用途正是要抓出「這不是同一筆」，
 			// 用會抹平差異的比較方式等於沒有指紋。
-			if ( 'amount' === $key ) {
+			// 金額類欄位是整數：`'1000'` 與 `1000` 不算相符。
+			if ( in_array( $key, [ 'amount', 'charged_amount' ], true ) ) {
 				if ( ! is_int( $actual ) || $actual !== $expected ) {
 					return false;
 				}

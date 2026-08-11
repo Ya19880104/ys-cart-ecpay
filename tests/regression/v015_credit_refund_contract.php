@@ -367,7 +367,7 @@ namespace {
 
     // (d) 冪等重放
     $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
-        'status' => 'done', 'amount' => 1000, 'trade_no' => 'TN-1',
+        'status' => 'done', 'amount' => 1000, 'charged_amount' => 1000, 'trade_no' => 'TN-1',
         'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
         'merchant_id' => 'M1', 'environment' => 'live',
     ]]]);

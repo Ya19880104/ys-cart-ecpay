@@ -73,10 +73,15 @@ final class CoreRefundAuthorization {
 
             $raw = $core_entry[ $flag ];
 
-            if ( true === $raw || 1 === $raw || '1' === $raw ) {
+            // 🔴 #2F：**只**接受 exact bool。
+            //
+            // Core 產出的契約是 `false`／`true`，不是 `0`／`'0'`。接受後者等於接受
+            // 一份不知道從哪來的值——被其他外掛改過的 entry、部分寫入的 entry、
+            // 從 CSV 匯入的 entry 都會通過。退款是不可逆的；「看起來像 false」不夠。
+            if ( true === $raw ) {
                 return [ 'action' => 'core_' . $flag ];
             }
-            if ( false === $raw || 0 === $raw || '0' === $raw ) {
+            if ( false === $raw ) {
                 continue;
             }
 
@@ -88,7 +93,10 @@ final class CoreRefundAuthorization {
             ];
         }
 
-        $core_amount = self::canonical_int( $core_entry['amount'] ?? null );
+        // 🔴 #2F：金額只接受 Core 產出的 canonical **正整數**。
+        // string／float 都不是 Core 寫出來的形狀；接受它們等於接受未知來源。
+        $raw_amount  = $core_entry['amount'] ?? null;
+        $core_amount = is_int( $raw_amount ) && $raw_amount > 0 ? $raw_amount : null;
         if ( null === $core_amount ) {
             return [
                 'action'      => 'core_amount_unreadable',
@@ -124,12 +132,19 @@ final class CoreRefundAuthorization {
         if ( is_int( $value ) ) {
             return $value;
         }
+        // 🔴 字串必須落在 PHP 整數範圍內。超界字串被 `(int)` 轉型會**飽和**成
+        // PHP_INT_MAX——一個荒謬的金額會變成一個看起來合理的巨大整數。
         if ( is_string( $value ) && 1 === preg_match( '/^(0|-?[1-9][0-9]*)$/', $value ) ) {
+            if ( (string) (int) $value !== $value ) {
+                return null; // 轉型後對不回去＝超界
+            }
+
             return (int) $value;
         }
+
         // JSON 解碼常見的整數值 float（1000.0）。
         if ( is_float( $value ) && is_finite( $value ) && floor( $value ) === $value
-            && abs( $value ) <= (float) PHP_INT_MAX ) {
+            && abs( $value ) < (float) PHP_INT_MAX ) {
             return (int) $value;
         }
 
