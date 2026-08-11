@@ -261,6 +261,27 @@ $assert([] === $duplicates, '(E2) 無重複 entry（' . (implode(', ', $duplicat
 
 $assert([] === $symlinkEntries, '(E3) 無 symlink entry（' . (implode(', ', $symlinkEntries) ?: '無') . '）');
 
+// 每個 entry 的 mtime 必須是固定值，artifact 的 SHA-256 才會是**內容**的函數。
+// 沒有這一條，同一份 source 連續打兩次就會得到不同的 hash（目錄 entry 取「現在」、
+// 檔案 entry 取 checkout 時間），「回報 hash 以證明這個包來自那個 commit」就不成立。
+$stampProblems = [];
+$expectedStamp = getdate(YS_CART_ECPAY_RELEASE_MTIME);
+for ($i = 0; $i < $zipEntryCount; $i++) {
+    $stat = $zip->statIndex($i);
+    if (!is_array($stat) || !isset($stat['mtime'])) {
+        $stampProblems[] = $names[$i] . ' — unreadable mtime';
+        continue;
+    }
+    if ((int) $stat['mtime'] !== YS_CART_ECPAY_RELEASE_MTIME) {
+        $stampProblems[] = $names[$i] . ' — ' . gmdate('c', (int) $stat['mtime']);
+    }
+}
+$assert(
+    [] === $stampProblems,
+    '(E7) 所有 entry 的 mtime 都已正規化為固定值（' . count($stampProblems) . ' 個偏離：'
+        . (implode('; ', array_slice($stampProblems, 0, 3)) ?: '無') . '）'
+);
+
 $zipCollisions = ys_cart_ecpay_release_collision_problems($names);
 $assert([] === $zipCollisions, '(E4) 實際 ZIP 無 case-fold／重複碰撞（' . (implode('; ', $zipCollisions) ?: '無') . '）');
 

@@ -14,6 +14,17 @@
 
 declare(strict_types=1);
 
+/**
+ * 發佈包內所有 entry 的固定 mtime（2026-01-01 00:00:00 UTC）。
+ *
+ * 用固定值而非建置時間，是為了讓 artifact 的 SHA-256 成為**內容**的函數。
+ * 沒有它，同一份 source 連續打兩次的 hash 就不同（目錄 entry 取「現在」、檔案
+ * entry 取 checkout 時間），於是「回報 hash 以證明這個包來自那份 commit」不成立。
+ */
+if (!defined('YS_CART_ECPAY_RELEASE_MTIME')) {
+    define('YS_CART_ECPAY_RELEASE_MTIME', 1767225600);
+}
+
 if (!function_exists('ys_cart_ecpay_release_slug')) {
 
     /** 發佈包的根目錄名（同時是外掛 slug）。 */

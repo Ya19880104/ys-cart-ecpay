@@ -88,6 +88,27 @@ foreach ($scan['files'] as $relative) {
     }
 }
 
+// 所有 entry 的 mtime 正規化成固定值，讓「同一份 source → 同一個 SHA-256」成立。
+//
+// 沒有這一步，artifact 的 hash 是**建置時間**的函數而不是內容的函數：
+//   - 目錄 entry 沒有對應的來源檔，addEmptyDir() 直接蓋上「現在」；同一棵樹連續
+//     打兩次，30 個目錄 entry 的時間戳就不同，hash 也就不同。
+//   - 檔案 entry 取檔案 mtime，而重新 clone 會把所有 mtime 換成 checkout 時間。
+// 於是「回報 hash 以證明這個包來自那份 source」整件事就不成立——兩次建置對不上，
+// 而對不上的原因與內容無關。v004 的逐位比對是內容契約，hash 則要能識別 source。
+if (!method_exists($zip, 'setMtimeIndex')) {
+    $zip->close();
+    fwrite(STDERR, "ZipArchive::setMtimeIndex() is unavailable (needs libzip 1.9+); refusing to build a non-reproducible artifact.\n");
+    exit(1);
+}
+for ($i = 0; $i < $zip->numFiles; $i++) {
+    if (!$zip->setMtimeIndex($i, YS_CART_ECPAY_RELEASE_MTIME)) {
+        $zip->close();
+        fwrite(STDERR, "Unable to normalise mtime for entry #{$i}.\n");
+        exit(1);
+    }
+}
+
 $zip->close();
 
 echo $zipPath . PHP_EOL;
