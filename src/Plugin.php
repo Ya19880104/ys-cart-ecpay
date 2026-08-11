@@ -262,9 +262,12 @@ final class Plugin {
 	 * @param string $cart_scope  已消毒的購物車 scope
 	 */
 	private function is_shipping_allowed_for_cart( string $shipping_id, string $cart_scope ): bool {
+		// 核心述詞不存在時一律拒絕。初版回 true 以「相容舊核心」，但那等於整道守門在
+		// 舊核心上不存在——而發版順序（先發核心再發本外掛）是流程約定，不能取代 runtime
+		// gate：任何降版、部分部署或安裝順序錯誤都會讓守門靜默消失。
 		if ( ! class_exists( YSShippingRegistry::class )
 			|| ! method_exists( YSShippingRegistry::class, 'is_method_allowed_for_cart' ) ) {
-			return true;
+			return false;
 		}
 
 		$items = self::read_cart_items( $cart_scope );
@@ -292,15 +295,23 @@ final class Plugin {
 	 */
 	private static function read_cart_items( string $cart_scope ): ?array {
 		$handler = '\\YangSheep\\Ecommerce\\Handlers\\YSCartHandler';
-		if ( ! class_exists( $handler ) ) {
-			return null; // 核心存在但 cart handler 缺失＝安裝損壞，非空車。
+
+		// 必須有 error-aware 的 typed API。舊核心的 get_items_raw() 在 load_from_db()
+		// 內就把「SQL 錯誤」「items 壞 JSON」「查無 row」全部抹平成 []，而空車在核心
+		// 語意等於「無商品設限」——用它做守門，讀取失敗必然 fail-open，且 provider
+		// 在外層無論怎麼包都救不回來。API 不存在即拒絕。
+		if ( ! class_exists( $handler ) || ! method_exists( $handler, 'try_get_items_raw' ) ) {
+			return null;
 		}
 
 		if ( ! is_user_logged_in() ) {
+			// 只檢查**本 scope** 的 cookie。先前額外接受 default cookie，於是非 default
+			// scope 在該 scope 尚無購物車時仍會進入讀取路徑，觸發 cart_identity() →
+			// get_or_create_session() 產生新 session cookie（純讀請求不該有此副作用），
+			// 且讀到的會是另一個 scope 的車。
 			$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
-			if ( empty( $_COOKIE[ $cookie ] ) && empty( $_COOKIE['ys_ec_session'] ) ) {
-				// 訪客尚無 session cookie＝購物車必然不存在，這是「確定為空」而非
-				// 讀取失敗；直接短路以避免 get_or_create_session() 的 setcookie() 副作用。
+			if ( empty( $_COOKIE[ $cookie ] ) ) {
+				// 該 scope 尚無 session＝購物車必然不存在，屬「確定為空」而非讀取失敗。
 				return [];
 			}
 		}
@@ -310,7 +321,7 @@ final class Plugin {
 		};
 		add_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
 		try {
-			$items = $handler::get_instance()->get_items_raw();
+			$items = $handler::get_instance()->try_get_items_raw();
 			return is_array( $items ) ? $items : null;
 		} catch ( \Throwable $e ) {
 			return null;

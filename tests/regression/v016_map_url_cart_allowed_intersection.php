@@ -45,7 +45,8 @@ namespace YangSheep\Ecommerce\Models {
 
 namespace YangSheep\Ecommerce\Handlers {
     final class YSCartHandler {
-        public static array $items = [];
+        /** null＝核心回報讀取失敗（SQL 錯誤／items 壞 JSON）。 */
+        public static ?array $items = [];
         public static int $calls = 0;
         public static ?string $scope_seen = null;
         public static ?\Throwable $throw = null;
@@ -54,7 +55,11 @@ namespace YangSheep\Ecommerce\Handlers {
             return new self();
         }
 
-        public function get_items_raw(): array {
+        /**
+         * 核心 v2.56.4 的 error-aware API：[]＝確定為空；null＝讀取失敗。
+         * 舊的 get_items_raw() 刻意不提供，provider 不得再使用它做守門。
+         */
+        public function try_get_items_raw(): ?array {
             ++self::$calls;
             self::$scope_seen = \apply_filters('ys_ec_cart_key_scope', 'default');
             if (null !== self::$throw) {
@@ -188,7 +193,32 @@ namespace {
         && 1 === YSCartHandler::$calls
         && 'shop2' === YSCartHandler::$scope_seen
         && $before === $after,
-        '(d) 純讀 get_items_raw、scope 綁定為 shop2、filter 於 finally 移除'
+        '(d) 純讀 try_get_items_raw、scope 綁定為 shop2、filter 於 finally 移除'
+    );
+
+    // (d2) 非 default scope 只認**該 scope** 的 cookie
+    //      先前額外接受 default cookie，於是該 scope 尚無購物車時仍會進入讀取路徑，
+    //      觸發 get_or_create_session() 建立新 session（純讀請求不該有此副作用），
+    //      而且讀到的會是另一個 scope 的車。
+    $_COOKIE = ['ys_ec_session' => 'abc']; // 只有 default 的 cookie
+    YSCartHandler::$calls = 0;
+    YSCartHandler::$items = [['product_id' => 501]];
+    $items = $read_cart_items->invoke(null, 'shop2');
+    $assert(
+        [] === $items && 0 === YSCartHandler::$calls,
+        '(d2) 非 default scope 僅憑 default cookie → 視為該 scope 空車，完全不讀取'
+    );
+
+    // (d3) 核心回報讀取失敗（SQL 錯誤／壞 JSON → null）→ 守門 fail-closed
+    $_COOKIE = ['ys_ec_session' => 'abc'];
+    $seed([501 => '["ys_ec_ecpay_ship_hilife"]']);
+    YSCartHandler::$items = null;
+    $items_null = $read_cart_items->invoke(null, 'default');
+    $ok_on_null = $allowed_for_cart->invoke($plugin, 'ys_ec_ecpay_ship_hilife', 'default');
+    YSCartHandler::$items = [];
+    $assert(
+        null === $items_null && false === $ok_on_null,
+        '(d3) 核心 try_get_items_raw 回 null（SQL 錯誤／壞 JSON）→ 守門 fail-closed'
     );
 
     // 端到端：購物車限 hilife 時，unimart 應被 provider 守門擋下
@@ -241,6 +271,25 @@ namespace {
         && ! str_contains($src, '0 === $order_id &&')
         && str_contains($src, 'shipping_method_not_allowed'),
         '(h) 非零 order_id 先被拒收、守門無條件執行且在 build_map_form_data 之前、無 order_id 分流殘留'
+    );
+
+    // (i) 契約：核心述詞或 typed 讀取 API 缺席時必須 fail-closed。
+    //     初版以 `return true` 相容舊核心——那等於守門在舊核心上完全不存在；發版順序是
+    //     流程約定，不能取代 runtime gate（降版／部分部署／安裝順序錯誤都會讓它靜默消失）。
+    // 窗口以 byte 計，而中文註解每字 3 bytes——窗口過小會截在註解裡，讓實際呼叫落在窗外。
+    $guard_fn = substr($src, (int) strpos($src, 'private function is_shipping_allowed_for_cart'), 1800);
+    $read_fn  = substr($src, (int) strpos($src, 'private static function read_cart_items'), 3500);
+    $assert(
+        // 述詞缺席分支必須回 false（不得 return true）
+        1 === preg_match('/is_method_allowed_for_cart\'\s*\)\s*\)\s*\{\s*return\s+false\s*;/', $guard_fn)
+        // typed 讀取 API 缺席分支必須回 null
+        && 1 === preg_match('/try_get_items_raw\'\s*\)\s*\)\s*\{\s*return\s+null\s*;/', $read_fn)
+        // 實際呼叫一律走 typed API；不得殘留舊 API 的呼叫形式
+        //（負向斷言需排除 try_ 前綴，否則 'get_items_raw()' 會被 'try_get_items_raw()' 命中；
+        //  且只比對「呼叫」而非註解提及，避免說明文字影響契約）
+        && 1 === preg_match('/->\s*try_get_items_raw\(\s*\)/', $read_fn)
+        && 0 === preg_match('/->\s*(?<!try_)get_items_raw\(\s*\)/', $read_fn),
+        '(i) 核心述詞缺席 → return false；typed 讀取 API 缺席 → return null；不得再使用舊 get_items_raw()'
     );
 
     echo "\nmap-url cart allowed intersection: {$pass} PASS / {$fail} FAIL\n";

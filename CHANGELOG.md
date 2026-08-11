@@ -6,7 +6,11 @@
 
 - 超商電子地圖（`/stores/ecpay/map-url`）補上購物車商品「允許的物流方式」交集驗證。先前僅檢查 provider 與該物流方式的**全域**啟用狀態，因此購物車商品只允許萊爾富時，前端仍可取得**已簽章**的 7-11 電子地圖表單；使用者選完門市、callback 也會寫入門市 session 與 `ys_ec_selected_store`，直到送單才被核心擋下。現以核心 `YSShippingRegistry::is_method_allowed_for_cart()` 這一份共用守門驗證（fail-closed，回 `shipping_method_not_allowed`）。
 - 此端點不再接受 `order_id`。該參數直接取自請求且未驗證訂單存在、擁有者或品項，任何非零值都能整段跳過上述物流限制；現直接拒收（`order_id_not_supported`）。核心 `assets/js/ys-ec-store-selector.js` 與 `sdk/ys-cart-ecpay-headless.js` 兩個呼叫端皆未使用此參數。
-- 購物車讀取失敗不再被當成空購物車。核心把空車視為「不限物流」，因此先前把 handler 缺失／非陣列／例外一律轉成空陣列，會讓讀取失敗反而簽發地圖表單；現以 `null` 表示讀取失敗並 fail-closed，空陣列僅代表確定為空。購物車讀取為純讀（`get_items_raw()` + `ys_ec_cart_key_scope` 綁定），訪客無 session cookie 時直接短路以避免 `setcookie()` 副作用。
+- 購物車讀取失敗不再被當成空購物車。核心把空車視為「不限物流」，因此先前把 handler 缺失／非陣列／例外一律轉成空陣列，會讓讀取失敗反而簽發地圖表單；現以 `null` 表示讀取失敗並 fail-closed，空陣列僅代表確定為空。
+- 讀取改用核心 v2.56.4 的 `YSCartHandler::try_get_items_raw()`。舊的 `get_items_raw()` 在 `load_from_db()` 內就把「SQL 錯誤」「items 壞 JSON」「查無 row」全部抹平成 `[]`，provider 在外層無論怎麼包都救不回來；typed API 不存在時直接拒絕，不退回舊 API。
+- 核心述詞缺席時改為 fail-closed。先前回 `true` 以「相容舊核心」，等於整道守門在舊核心上完全不存在；發版順序是流程約定，不能取代 runtime gate——降版、部分部署或安裝順序錯誤都會讓守門靜默消失。
+- 訪客購物車的 scope 判斷只認**該 scope** 的 cookie。先前額外接受 default cookie，於是非 default scope 在該 scope 尚無購物車時仍會進入讀取路徑，觸發 `get_or_create_session()` 產生新 session cookie（純讀請求不該有此副作用），且讀到的是另一個 scope 的車。
+- 發佈包契約改為鎖定 plugin header 的當前版號，並要求 ZIP **內容**與當前 source 對得上：主檔 `Version` header、`YS_CART_ECPAY_VERSION` 常數，以及 `src/Plugin.php` 的 bytes 必須逐位相同。先前以 `glob + rsort` 取現存最新 ZIP，版號推進後會驗到陳舊的包並回報 PASS；只鎖檔名也不夠，任何同名 ZIP（例如從別條分支打的同版號）都能矇混通過。
 
 ## [0.2.10] - 2026-07-28
 
