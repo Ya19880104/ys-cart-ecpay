@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Utils\YSLogger;
+use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 
 /**
  * 退款 attempt 人工核定 CLI（v0.3.0，CODEX 終審 F4）
@@ -80,54 +81,62 @@ final class EcpayRefundAttemptCommand {
 			\WP_CLI::error( '--request 不得為空。' );
 		}
 
-		// 真 CAS（CODEX 終審 R6-F6）：直接讀 orders 表 payment_detail 原始字串
-		//（繞開任何模型層快取），改寫後以「WHERE id AND payment_detail=舊 raw」
-		// 條件寫入——affected rows==1 才算成功；0＝期間被其他程序（gateway 回寫、
-		// 後台操作、另一 CLI）改寫，中止並要求重查。先前的 read-modify-write
-		//（YSOrder::update 無條件覆寫）存在 lost-update 窗口，並非 CAS。
-		global $wpdb;
-		$table   = YSOrder::table();
-		$old_raw = $wpdb->get_var( $wpdb->prepare(
-			"SELECT payment_detail FROM {$table} WHERE id = %d",
-			$order_id
-		) );
-		if ( null === $old_raw ) {
-			\WP_CLI::error( "訂單 {$order_id} 不存在。" );
-		}
+		// v0.3.0：改用核心共用 CAS（YSPaymentDetailStore）。仲裁（attempt 是否存在、
+		// 是否仍為 pending）**全部在 mutator 內**，因此 CAS 落敗重讀後會拿最新的
+		// ledger 重跑一次判定——不會用第一次讀到的舊狀態去覆寫別人剛核定的結果。
+		$trade_no_override = 'done' === $mark ? sanitize_text_field( (string) ( $assoc['trade-no'] ?? '' ) ) : '';
 
-		$detail  = json_decode( (string) $old_raw, true ) ?: [];
-		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
-		$entry   = $history[ $request_id ] ?? null;
+		$result = OrderPaymentDetail::mutate(
+			$order_id,
+			static function ( array $detail, int $attempt, &$decision ) use ( $request_id, $mark, $trade_no_override ): ?array {
+				$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
+				$entry   = is_array( $history[ $request_id ] ?? null ) ? $history[ $request_id ] : null;
 
-		if ( ! is_array( $entry ) ) {
+				if ( null === $entry ) {
+					$decision = [ 'action' => 'missing' ];
+					return null;
+				}
+				if ( 'pending' !== ( $entry['status'] ?? '' ) ) {
+					$decision = [ 'action' => 'not_pending', 'status' => (string) ( $entry['status'] ?? '?' ) ];
+					return null;
+				}
+
+				$entry['status']      = $mark;
+				$entry['resolved_by'] = 'wp-cli';
+				$entry['resolved_at'] = current_time( 'mysql' );
+				if ( '' !== $trade_no_override ) {
+					$entry['trade_no'] = $trade_no_override;
+				}
+
+				$history[ $request_id ]      = $entry;
+				$detail['_ys_ecpay_refunds'] = $history;
+				$decision                    = [ 'action' => 'resolved' ];
+
+				return $detail;
+			}
+		);
+
+		$decision = $result->get_decision();
+		$action   = is_array( $decision ) ? (string) ( $decision['action'] ?? '' ) : '';
+
+		if ( 'missing' === $action ) {
 			\WP_CLI::error( "attempt {$request_id} 不存在。" );
 		}
-		if ( 'pending' !== ( $entry['status'] ?? '' ) ) {
+		if ( 'not_pending' === $action ) {
 			\WP_CLI::error( sprintf(
 				'attempt %s 目前狀態為 %s（非 pending）——可能已被其他程序核定，請重新 list 確認後再操作。',
 				$request_id,
-				(string) ( $entry['status'] ?? '?' )
+				is_array( $decision ) ? (string) ( $decision['status'] ?? '?' ) : '?'
 			) );
 		}
-
-		$entry['status']      = $mark;
-		$entry['resolved_by'] = 'wp-cli';
-		$entry['resolved_at'] = current_time( 'mysql' );
-		if ( 'done' === $mark && '' !== (string) ( $assoc['trade-no'] ?? '' ) ) {
-			$entry['trade_no'] = sanitize_text_field( (string) $assoc['trade-no'] );
+		if ( $result->is_missing_order() ) {
+			\WP_CLI::error( "訂單 {$order_id} 不存在。" );
 		}
-
-		$history[ $request_id ]      = $entry;
-		$detail['_ys_ecpay_refunds'] = $history;
-
-		$updated = $wpdb->query( $wpdb->prepare(
-			"UPDATE {$table} SET payment_detail = %s WHERE id = %d AND payment_detail = %s",
-			wp_json_encode( $detail ),
-			$order_id,
-			(string) $old_raw
-		) );
-		if ( 1 !== (int) $updated ) {
-			\WP_CLI::error( 'CAS 失敗：payment_detail 於核定期間已被其他程序改寫，未寫入任何變更；請重新 list 確認最新狀態後再操作。' );
+		if ( ! $result->is_persisted() ) {
+			\WP_CLI::error( sprintf(
+				'核定未寫入（%s）：payment_detail 於核定期間被反覆改寫或欄位無法解讀；請重新 list 確認最新狀態後再操作。',
+				$result->get_outcome()
+			) );
 		}
 
 		\WP_CLI::success( sprintf(
@@ -199,17 +208,12 @@ final class EcpayRefundAttemptCommand {
 			return $results;
 		}
 
-		global $wpdb;
-		$table   = YSOrder::table();
-		$old_raw = $wpdb->get_var( $wpdb->prepare(
-			"SELECT payment_detail FROM {$table} WHERE id = %d",
-			$order_id
-		) );
-		if ( null === $old_raw ) {
+		// v0.3.0：讀取改走核心共用 store（穿透模型快取、欄位不可解讀時回 null）。
+		$detail = OrderPaymentDetail::read( $order_id );
+		if ( null === $detail ) {
 			return $results;
 		}
 
-		$detail  = json_decode( (string) $old_raw, true ) ?: [];
 		$history = is_array( $detail['_ys_ecpay_refunds'] ?? null ) ? $detail['_ys_ecpay_refunds'] : [];
 		$entry   = $history[ $request_id ] ?? null;
 		if ( ! is_array( $entry ) ) {
@@ -286,41 +290,67 @@ final class EcpayRefundAttemptCommand {
 		$current = (string) ( $entry['status'] ?? '' );
 		$target  = ( 'paid' === $mark ) ? 'done' : 'failed';
 
-		// R11-F4：已達**相同**終態＝先前同步已成功——回冪等 success（否則核心重試會
+		// R11-F4：已達**相同**終態＝先前同步已成功→回冪等 success（否則核心重試會
 		// 因零回報＋requires_sync 被誤報「同步失敗」）；**不同**終態＝資料衝突，回失敗。
-		if ( 'pending' !== $current ) {
-			$results[] = ( $current === $target )
-				? [
-					'provider'   => 'ecpay',
-					'gateway_id' => self::GATEWAY_ID,
-					'success'    => true,
-					'message'    => '已同步為 ' . $current . '（冪等）',
-				]
-				: [
-					'provider'   => 'ecpay',
-					'gateway_id' => self::GATEWAY_ID,
-					'success'    => false,
-					'message'    => "attempt 已為 {$current}，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
-				];
+		//
+		// v0.3.0：這段判定已整個移進下方的 CAS mutator。先前在這裡先用一份舊快照
+		// 判一次、稍後再寫入，等於兩個 source of truth——快照與落盤之間別人剛核定的
+		// 結果會被這裡的舊值蓋過去。`$current` 保留供上方 fingerprint 比對使用。
+		unset( $current );
+
+		// v0.3.0：狀態仲裁移進 mutator，CAS 落敗重讀後會重跑一次——不會用先前讀到的
+		// pending 去覆寫期間別人剛寫入的終態。
+		$sync = OrderPaymentDetail::mutate(
+			$order_id,
+			static function ( array $fresh, int $attempt, &$decision ) use ( $request_id, $target ): ?array {
+				$ledger  = is_array( $fresh['_ys_ecpay_refunds'] ?? null ) ? $fresh['_ys_ecpay_refunds'] : [];
+				$current = is_array( $ledger[ $request_id ] ?? null ) ? $ledger[ $request_id ] : null;
+
+				if ( null === $current ) {
+					$decision = [ 'action' => 'missing' ];
+					return null;
+				}
+				$status = (string) ( $current['status'] ?? '' );
+				if ( 'pending' !== $status ) {
+					$decision = [ 'action' => $status === $target ? 'already' : 'conflict', 'status' => $status ];
+					return null;
+				}
+
+				$current['status']      = $target;
+				$current['resolved_by'] = 'core-finalization-sync';
+				$current['resolved_at'] = current_time( 'mysql' );
+
+				$ledger[ $request_id ]      = $current;
+				$fresh['_ys_ecpay_refunds'] = $ledger;
+				$decision                   = [ 'action' => 'synced' ];
+
+				return $fresh;
+			}
+		);
+
+		$sync_decision = $sync->get_decision();
+		$sync_action   = is_array( $sync_decision ) ? (string) ( $sync_decision['action'] ?? '' ) : '';
+
+		if ( 'already' === $sync_action ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => true,
+				'message'    => '已同步為 ' . $target . '（冪等）',
+			];
+			return $results;
+		}
+		if ( 'conflict' === $sync_action ) {
+			$results[] = [
+				'provider'   => 'ecpay',
+				'gateway_id' => self::GATEWAY_ID,
+				'success'    => false,
+				'message'    => 'attempt 已為 ' . ( is_array( $sync_decision ) ? (string) ( $sync_decision['status'] ?? '?' ) : '?' ) . "，與核心核定（{$target}）衝突——請人工核對兩邊紀錄",
+			];
 			return $results;
 		}
 
-		$entry['status']      = ( 'paid' === $mark ) ? 'done' : 'failed';
-		$entry['resolved_by'] = 'core-finalization-sync';
-		$entry['resolved_at'] = current_time( 'mysql' );
-
-		$history[ $request_id ]      = $entry;
-		$detail['_ys_ecpay_refunds'] = $history;
-
-		// 真 CAS（同 resolve）：payment_detail 於期間被改寫則不寫入，避免覆蓋他人變更。
-		$updated = $wpdb->query( $wpdb->prepare(
-			"UPDATE {$table} SET payment_detail = %s WHERE id = %d AND payment_detail = %s",
-			wp_json_encode( $detail ),
-			$order_id,
-			(string) $old_raw
-		) );
-
-		if ( 1 !== (int) $updated ) {
+		if ( ! $sync->is_persisted() || 'synced' !== $sync_action ) {
 			YSLogger::error( 'ecpay', 'CRITICAL: 核心核定同步失敗（CAS 落敗，本外掛 attempt 仍 pending＝全單凍結）', [
 				'order_id'   => $order_id,
 				'request_id' => $request_id,

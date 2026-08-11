@@ -286,15 +286,18 @@ final class EcpayPaymentClient {
 				'message' => '缺少綠界交易識別碼（MerchantTradeNo / TradeNo），無法退刷。',
 			];
 		}
-		$total_amount = (int) round( $amount );
-		if ( $total_amount <= 0 ) {
+		// v0.3.0：canonical TWD 整數契約。先前 `(int) round( $amount )` 會把 100.4 靜默
+		// 變成 100、100.5 變成 101——送出去的金額與呼叫端要求的**不是同一個數字**，而
+		// 這是一筆不可逆的金流動作。任何非整數一律在送出前拒絕，不四捨五入。
+		if ( ! self::is_canonical_twd( $amount ) ) {
 			return [
 				'success' => false,
 				'indeterminate' => false,
 				'data'    => null,
-				'message' => '退刷金額必須為正數。',
+				'message' => sprintf( '退刷金額必須為正整數新台幣（收到 %s），已拒絕送出。', var_export( $amount, true ) ),
 			];
 		}
+		$total_amount = (int) $amount;
 
 		$fields = [
 			'MerchantID'      => $credentials['merchant_id'],
@@ -375,6 +378,32 @@ final class EcpayPaymentClient {
 			'data'    => $data,
 			'message' => '',
 		];
+	}
+
+	/**
+	 * 金額是否為 canonical TWD 正整數（v0.3.0）
+	 *
+	 * 綠界信用卡的 TotalAmount 只接受整數新台幣。float 在此是「呼叫端表達整數的載體」，
+	 * 不是可四捨五入的近似值——100.4 與 100.5 是呼叫端算錯了，不是我們該替它決定要送
+	 * 100 還是 101。`0.1 + 0.2` 這類二進位浮點誤差同樣落在拒絕範圍內（1e-9 容差）。
+	 *
+	 * @param float|int $amount
+	 */
+	public static function is_canonical_twd( $amount ): bool {
+		if ( is_int( $amount ) ) {
+			return $amount > 0;
+		}
+		if ( ! is_float( $amount ) || ! is_finite( $amount ) ) {
+			return false;
+		}
+		if ( $amount <= 0 ) {
+			return false;
+		}
+		if ( $amount > (float) PHP_INT_MAX ) {
+			return false;
+		}
+
+		return abs( $amount - round( $amount ) ) < 1e-9;
 	}
 
 	private function clean_item_name( object $order ): string {

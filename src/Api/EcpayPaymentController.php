@@ -9,6 +9,7 @@ use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
+use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
@@ -93,24 +94,50 @@ final class EcpayPaymentController {
 			// CheckMacValue 驗證）——退款的關帳狀態查詢（CreditDetail/QueryTrade）依賴它。
 			$gwsr = sanitize_text_field( (string) ( $params['gwsr'] ?? '' ) );
 			if ( '' !== $gwsr ) {
-				// v0.2.12：改走 CAS。此處與退款 ledger（`_ys_ecpay_refunds`）是同一個
-				// payment_detail 欄位的兩個併發 writer；先前的 read-modify-write 會在
+				// 走核心共用 CAS。此處與退款 ledger（`_ys_ecpay_refunds`）是同一個
+				// payment_detail 欄位的兩個併發 writer；read-modify-write 會在
 				// webhook 與退款重疊時整包覆蓋對方的寫入。
-				OrderPaymentDetail::mutate(
+				$gwsr_written = OrderPaymentDetail::mutate(
 					(int) $order->id,
 					static function ( array $detail ) use ( $gwsr ): array {
 						$detail['gwsr'] = $gwsr;
 						return $detail;
 					}
 				);
+
+				// v0.3.0：寫不進去就**不得** ACK。gwsr 是關帳狀態查詢（CreditDetail/
+				// QueryTrade）的唯一輸入，缺了它整條退款路徑都無法判定該送 E／N／R。
+				// 回 1|OK 會讓綠界停止重送，這個欄位就永久遺失了；回非 1|OK 才能讓
+				// 綠界依其重送機制再送一次。
+				if ( ! $gwsr_written->is_persisted() ) {
+					YSLogger::error( 'ecpay', 'CRITICAL: 付款通知的 gwsr 寫入失敗，拒絕 ACK 以觸發綠界重送', array_merge(
+						[ 'order_id' => (int) $order->id ],
+						$gwsr_written->to_log_context()
+					) );
+					$this->respond_text( '0|Persist Failed', 500 );
+					return;
+				}
 			}
 
 			YSOrder::update( (int) $order->id, [
 				'gateway_trade_no' => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
 			] );
-			YSPaymentLifecycleService::mark_paid( (int) $order->id, $detail, 'webhook_ecpay_notify' );
+			$transition = YSPaymentLifecycleService::mark_paid( (int) $order->id, $detail, 'webhook_ecpay_notify' );
 		} else {
-			YSPaymentLifecycleService::mark_failed( (int) $order->id, $detail, 'webhook_ecpay_notify' );
+			$transition = YSPaymentLifecycleService::mark_failed( (int) $order->id, $detail, 'webhook_ecpay_notify' );
+		}
+
+		// v0.3.0：生命週期推進失敗（含 payment_detail CAS 失敗）同樣不得 ACK——
+		// 訂單狀態沒有落盤卻告訴綠界「收到了」，這筆付款就再也不會被通知。
+		if ( is_array( $transition ) && empty( $transition['success'] ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 付款通知的狀態推進失敗，拒絕 ACK 以觸發綠界重送', [
+				'order_id' => (int) $order->id,
+				'message'  => (string) ( $transition['message'] ?? '' ),
+				'from'     => (string) ( $transition['from'] ?? '' ),
+				'to'       => (string) ( $transition['to'] ?? '' ),
+			] );
+			$this->respond_text( '0|Persist Failed', 500 );
+			return;
 		}
 
 		$this->respond_text( '1|OK' );

@@ -24,6 +24,8 @@
 | G-5 | **綠界端重複 DoAction 行為** | 正式小額 | 對已成功動作重送相同請求 | 記錄第二次 RtnCode——決定 pending 凍結策略是否可放寬 |
 | G-6 | **不確定結果凍結演練** | 本地 mock（結構） | 模擬 timeout／非 2xx／無 RtnCode | attempt 維持 pending、拒絕重送（契約測試已覆蓋）；正式環境不演練中斷 |
 | G-7 | **與 core 退款鏈整合** | dev 站＋正式小額 | core 後台退款面板對綠界信用卡訂單執行 | `refunded_amount`／紀錄／歷程正確；`supports_gateway_refund` 生效 |
+| G-8 | **每日關帳時段** | 綠界技術窗口書面確認 | 取得官方對「每日關帳作業時段內 DoAction 行為」的書面說明（實際窗口時間、期間送出的回應碼、是否應改為拒絕） | 取得**確切**窗口與行為後，才在程式內加入時段守門。🔴 在此之前**不得臆造時間**——目前程式碼沒有任何時段判斷，關帳期間的失敗會走既有的 `rejected_terminal`／`indeterminate` 分流 |
+| G-9 | **卡別方案 gate 對照** | 綠界技術窗口＋正式（唯讀） | 確認分期（`stage`）、紅利折抵（`red_dan`／`red_de_amt`）、銀聯與其他 `PaymentType` 的實際欄位值與退款規則 | 目前實作只有能證明 `PaymentType=Credit_CreditCard` 且無分期／紅利標記才自動退刷，其餘一律導向人工。**取得官方規則後**才可放寬 |
 
 證據落地：`tests/fixtures/refund/`（本地、gitignored），檔名 `{gate}-{action}.json`，附時間與訂單號（**不含正式憑證**）。
 

@@ -16,7 +16,15 @@
 - 發佈包新增 **list-level 碰撞守門**（exact 與 case-fold）。逐一檢查 entry 名稱擋不住這一類：`src/Plugin.php` 與 `src/plugin.php` 各自都完全合法，在 case-sensitive 的建置機上也能並存，但解壓到 NTFS／APFS 會互相覆蓋——安裝出來的外掛少一個檔，而且哪一個留下來取決於解壓順序。比對鍵做 forward-slash 與尾斜線正規化，因此目錄與檔案的同名／大小寫變體也算碰撞。builder 在**刪除既有 ZIP 之前**判定（否則一次失敗的建置會順手毀掉上一份可用產物），v004 對 synthetic fixtures 與實際 ZIP 兩邊都跑。
 - 發佈包的排除政策抽成 `bin/release-policy.php`，builder 與 v004 契約測試共用同一份（純函式、無副作用、位於被排除的 `bin/`）。先前兩邊各帶一份抄本，漂移時測試無從發現。同時把 entry 名稱的安全性檢查納入政策並在**寫入前**執行：traversal（`ys-cart-ecpay/../escape/`）、absolute／drive-letter 路徑、反斜線、空 segment、非單一根目錄、archive 根目錄下的裸檔案一律拒絕；工作目錄若含 symlink 直接停止打包（`addFile()` 會跟隨 symlink 把目標內容偷渡進包裡）。
 - 發佈包契約再收緊為**精確集合＋全量 bytes**：依 `bin/build-release.php` 的排除政策從工作目錄推導 eligible 檔案集合，ZIP 的檔案 entry 必須與之完全相等，且每一個檔案都逐位相同。先前只斷言「幾個必含 entry ＋ 一份 `src/Plugin.php`」，於是手工打的 0.2.11 包漏掉整個 `skills/` 目錄、又收進政策上排除的 `CHANGELOG.md`，測試仍全綠；其餘所有檔案（gateway、`CheckMacValue`、SDK、vendor hub client）也可以是任意舊版本而不被發現。現另明確斷言 README／docs／SDK／skills 四個交付面與 CHANGELOG 的排除政策。目錄 entry 也納入精確集合、以排序後的完整清單比對（`array_diff` 不看重複次數，先前排除目錄 entry 又讓尾斜線的 traversal entry 整批溜過），並逐一驗證 entry 唯一、路徑安全、無 unix symlink 屬性。
-- `payment_detail` 的所有寫入改走 compare-and-swap（新增 `Support\OrderPaymentDetail`）。此欄位是單一 JSON，先前五處全走 read-modify-write 後整包覆蓋；付款通知回寫 `gwsr` 與退款 ledger `_ys_ecpay_refunds` 是同一欄位的併發 writer，重疊時後寫者會靜默蓋掉先寫者——而被蓋掉的正是「不重複退款」的唯一依據。其中信用卡閘道的 `gwsr` 回寫更是直接寫回方法開頭的舊快照，屬必然覆蓋而非競態。新寫入器分流三種 MySQL／wpdb 天性：`query()` 回 `false`（SQL 錯誤）與回 `0`（CAS 落敗）語意不同、同值 UPDATE 天生 `affected=0` 不算落敗、欄位為 SQL NULL 時 WHERE 需用 `IS NULL`。
+- **原子式退款 reservation**。先前「檢查有沒有進行中的退款」讀的是方法開頭的舊快照，實際寫入 pending 卻在很久之後——兩個併發請求各自拿著自己的快照都判定「沒有 pending」，於是**都**走到 `DoAction` ＝ 退兩次款；`EcpayCreditGateway.php` 第 96／116 行查的是舊 history、第 221 行的 CAS retry 只會再插入 pending 而不重新仲裁。現在仲裁與寫入在**同一個 CAS closure** 內完成：CAS 落敗時 mutator 會拿當下最新的 ledger 重跑整段判定，因此只有一個併發請求能 reserve 成功。任何 `DoAction` 都必須在 reservation 落盤之後。
+- 冪等重放與重試都要求**交易指紋相符**（金額／`TradeNo`／`MerchantTradeNo`／`gwsr`）。指紋不符代表 `refund_request_id` 撞號（不同交易共用同一個鍵），先前會直接回報成功。舊紀錄沒有指紋欄位時一律視為不符——「無法證明是同一筆」在退款這件事上必須等同於「不是」。
+- 多步流程（要關帳＋全額＝`E` 後接 `N`）每一步成功後**先 durable 記錄才送下一步**。先前 `E` 成功後直接送 `N`，中途 crash 會留下「`E` 已執行但沒人知道」的狀態，人工核定無從判斷該補 `N` 還是重來。
+- 終態（`done`／`failed`）寫入失敗一律回 `indeterminate`。先前 `done` 寫失敗仍回 `success` 並附註記——金流已經動了、紀錄卻沒落盤，對呼叫端宣告成功會讓核心把訂單結案，之後沒有任何機制會回來核對。
+- 測試模式（stage）直接拒絕退刷。綠界官方明載 stage 無實際授權、`DoAction` 不可用；先前只有註解說明，實際上仍會把請求送到 stage endpoint 並把回應當真。
+- 退刷金額改為 **canonical TWD 整數契約**。先前 `(int) round( $amount )` 會把 100.4 靜默變成 100、100.5 變成 101——送出去的金額與呼叫端要求的不是同一個數字，而這是一筆不可逆的金流動作。任何非整數在送出前拒絕，不四捨五入。
+- 分期、紅利折抵、銀聯與**無法證明付款方式**的交易一律導向人工退款。這些方案的官方退款規則與一般信用卡不同（例如分期僅能全額），我們沒有權威來源，猜錯就是把錢退錯。只有能證明 `PaymentType=Credit_CreditCard` 且無分期／紅利標記才自動退刷；證據取自訂單付款紀錄與 `QueryTradeInfo` 回應。⚠️ 舊訂單若兩處都沒有標記，會被判為「無法證明」而導向人工——這是刻意的 fail-closed。
+- 每日關帳時段**未**加入時段守門：本機沒有官方窗口時間的權威證據，不臆造。已列為 release gate G-8（見 `docs/credit-refund-sandbox-gate.md`）。
+- `payment_detail` 的所有寫入改走 compare-and-swap（v0.3.0 起委派核心 `YSPaymentDetailStore`；`Support\OrderPaymentDetail` 僅保留為薄殼）。此欄位是單一 JSON，先前五處全走 read-modify-write 後整包覆蓋；付款通知回寫 `gwsr` 與退款 ledger `_ys_ecpay_refunds` 是同一欄位的併發 writer，重疊時後寫者會靜默蓋掉先寫者——而被蓋掉的正是「不重複退款」的唯一依據。其中信用卡閘道的 `gwsr` 回寫更是直接寫回方法開頭的舊快照，屬必然覆蓋而非競態。新寫入器分流三種 MySQL／wpdb 天性：`query()` 回 `false`（SQL 錯誤）與回 `0`（CAS 落敗）語意不同、同值 UPDATE 天生 `affected=0` 不算落敗、欄位為 SQL NULL 時 WHERE 需用 `IS NULL`。
 
 ### Added
 

@@ -41,8 +41,11 @@ final class EcpayLogisticsController {
 		}
 
 		$order = $this->find_order( $params );
-		if ( $order ) {
-			$this->update_order_shipping( $order, $params );
+		if ( $order && ! $this->update_order_shipping( $order, $params ) ) {
+			// v0.3.0：物流狀態沒落盤就**不得** ACK。回 1|OK 會讓綠界停止重送，
+			// 這筆狀態變更（出貨、到店、退貨）就永久遺失了。
+			$this->respond_text( '0|Persist Failed', 500 );
+			return;
 		}
 
 		$this->respond_text( '1|OK' );
@@ -106,25 +109,45 @@ final class EcpayLogisticsController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function update_order_shipping( object $order, array $params ): void {
+	private function update_order_shipping( object $order, array $params ): bool {
 		$tracking = (string) ( $params['CVSPaymentNo'] ?? $params['BookingNote'] ?? $params['AllPayLogisticsID'] ?? '' );
 		$status   = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
 
-		$payment_detail = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
-		if ( ! is_array( $payment_detail ) ) {
-			$payment_detail = [];
-		}
-		$payment_detail['shipping'] = array_merge( (array) ( $payment_detail['shipping'] ?? [] ), [
+		$shipping_patch = [
 			'provider'             => 'ecpay',
 			'allpay_logistics_id'  => (string) ( $params['AllPayLogisticsID'] ?? '' ),
 			'logistics_status'     => $status,
 			'logistics_status_msg' => (string) ( $params['LogisticsStatusName'] ?? $params['RtnMsg'] ?? '' ),
 			'tracking_number'      => $tracking,
 			'updated_at'           => current_time( 'mysql' ),
-		] );
+		];
+
+		// v0.3.0：payment_detail 走核心共用 CAS。物流 callback 與付款通知、退款 ledger
+		// 是同一個欄位的併發 writer——舊寫法在這裡整包覆蓋，會把剛落盤的退款憑據抹掉。
+		$persisted = OrderPaymentDetail::mutate(
+			(int) $order->id,
+			static function ( array $detail ) use ( $shipping_patch ): array {
+				$detail['shipping'] = array_merge(
+					is_array( $detail['shipping'] ?? null ) ? $detail['shipping'] : [],
+					$shipping_patch
+				);
+				return $detail;
+			}
+		);
+
+		if ( ! $persisted->is_persisted() ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback 的 payment_detail 寫入失敗', array_merge(
+				[
+					'order_id' => (int) $order->id,
+					'status'   => $status,
+				],
+				$persisted->to_log_context()
+			) );
+
+			return false;
+		}
 
 		$order_update = [
-			'payment_detail'  => wp_json_encode( $payment_detail ),
 			'tracking_number' => $tracking ?: (string) ( $order->tracking_number ?? '' ),
 		];
 
@@ -143,6 +166,8 @@ final class EcpayLogisticsController {
 				'webhook_ecpay'
 			);
 		}
+
+		return true;
 	}
 
 	private function map_status( string $status ): string {

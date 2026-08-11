@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Gateways\YSGatewayInterface;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
@@ -63,9 +64,9 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		$merchant_trade_no = $this->make_merchant_trade_no( $order_id );
 		$method_id         = $this->get_id();
 
-		// v0.2.12：payment_detail 走 CAS（見 OrderPaymentDetail），其餘為獨立純量欄位，
-		// 不參與 JSON 整包覆蓋，維持一般 update。
-		OrderPaymentDetail::mutate(
+		// payment_detail 走核心共用 CAS（v0.3.0：YSPaymentDetailStore），其餘為獨立
+		// 純量欄位，不參與 JSON 整包覆蓋，維持一般 update。
+		$persisted = OrderPaymentDetail::mutate(
 			$order_id,
 			static function ( array $detail ) use ( $merchant_trade_no, $method_id ): array {
 				$detail['mer_trade_no']            = $merchant_trade_no;
@@ -75,6 +76,25 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 				return $detail;
 			}
 		);
+
+		// v0.3.0：寫入失敗**必須**中止建單。`mer_trade_no` 是這筆交易與綠界之間唯一
+		// 的對應鍵——付款通知靠它找回訂單、退款靠它送 DoAction。舊版忽略回傳值仍然
+		// 把付款表單交給使用者，於是消費者付了款，而我們沒有任何欄位可以認回這筆錢。
+		if ( ! $persisted->is_persisted() ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 建單 payment_detail 寫入失敗，拒絕簽發付款表單', array_merge(
+				[
+					'order_id'          => $order_id,
+					'merchant_trade_no' => $merchant_trade_no,
+					'method'            => $method_id,
+				],
+				$persisted->to_log_context()
+			) );
+
+			return [
+				'success' => false,
+				'message' => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
+			];
+		}
 
 		YSOrder::update( $order_id, [
 			'gateway_id'     => $method_id,
