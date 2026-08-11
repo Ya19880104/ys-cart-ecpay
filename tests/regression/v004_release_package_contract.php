@@ -369,16 +369,23 @@ $assert(
 // ── H. 每一個 eligible 檔案逐位相同 ─────────────────────────────────────────
 
 $mismatched = [];
+$eol_only   = true;
 foreach ($scan['files'] as $relative) {
     $entry  = $slug . '/' . $relative;
     $zipped = $zip->getFromName($entry);
     if (false === $zipped) {
         $mismatched[] = [$relative, '(unreadable in zip)', ''];
+        $eol_only     = false;
         continue;
     }
     $local = (string) file_get_contents($root . '/' . $relative);
     if ($zipped !== $local) {
         $mismatched[] = [$relative, hash('sha256', $zipped), hash('sha256', $local)];
+
+        // 這個檔案的差異是否**僅**來自行尾？（說明見下方）
+        if (str_replace("\r\n", "\n", $zipped) !== str_replace("\r\n", "\n", $local)) {
+            $eol_only = false;
+        }
     }
 }
 $zip->close();
@@ -388,6 +395,20 @@ if ($mismatched) {
     foreach ($mismatched as [$relative, $zipHash, $localHash]) {
         fwrite(STDERR, "  {$relative}\n    zip    : {$zipHash}\n    source : {$localHash}\n");
     }
+
+    // 🔴 最常見的原因不是「忘了重打包」，而是**行尾**：Windows 上 autocrlf=true 的
+    // 工作樹是 CRLF，而可出貨的 artifact 一律從 autocrlf=false 的乾淨 clone 建置
+    // （LF）。兩者逐位比對必然不同，但那不是缺陷——是兩個不同的樹。
+    // 分辨這兩種情況，訊息才不會把人導向錯誤的方向。
+    if ($eol_only) {
+        $abort(
+            "  差異**僅在行尾**（CRLF vs LF）。這個 artifact 是從 autocrlf=false 的乾淨 clone\n"
+            . "  建置的（可出貨的那一份）；本工作樹是 CRLF checkout。\n"
+            . "  在本地驗證 → 重打包：php bin/build-release.php\n"
+            . "  驗證可出貨的那一份 → 在乾淨 clone 內執行本測試。"
+        );
+    }
+
     $abort("  The artifact was not built from this branch's current bytes.");
 }
 $assert(true, sprintf('(H1) %d 個 eligible 檔案與工作目錄逐位相同', count($scan['files'])));
