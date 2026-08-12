@@ -61,8 +61,22 @@ if (!function_exists('ys_cart_ecpay_release_slug')) {
             return 'empty path';
         }
 
-        $excludedDirs = ['.git', '.github', '.idea', '.vscode', 'artifacts', 'bin', 'node_modules', 'tests', 'tmp'];
-        $excludedFiles = ['.gitignore', '.env', '.env.example', 'composer.json', 'composer.lock', 'CHANGELOG.md', 'phpunit.xml'];
+        // 🔴 v0.3.0（#2G）：AI 代理與編輯器的工作目錄一律排除。
+        //
+        // `.codex`／`.claude`／`.agents` 裡放的是工作交接、審查筆記、內部流程與
+        // 尚未完成的 gate 清單——那是給我們自己看的，卻會隨包散佈到每一個安裝
+        // 站點的檔案系統上（而且多半在 web root 底下）。`.DS_Store` 則會洩漏
+        // 目錄結構，且對安裝毫無用處。
+        $excludedDirs = [
+            '.git', '.github', '.idea', '.vscode',
+            '.codex', '.claude', '.agents',
+            'artifacts', 'bin', 'node_modules', 'tests', 'tmp',
+        ];
+        $excludedFiles = [
+            '.gitignore', '.env', '.env.example',
+            'composer.json', 'composer.lock', 'CHANGELOG.md', 'phpunit.xml',
+            '.DS_Store',
+        ];
 
         $hit = array_intersect(explode('/', $relative), $excludedDirs);
         if ($hit) {

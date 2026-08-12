@@ -57,7 +57,66 @@ final class Plugin {
 		return self::$instance;
 	}
 
+	/**
+	 * 這個外掛要求的最低核心版本（v0.3.0，#2G）
+	 *
+	 * 🔴 2.57.0 不是「建議」，是**結構性依賴**：
+	 *
+	 *   - `YSPaymentDetailStore` 是 payment_detail 的唯一併發安全寫入器。舊核心
+	 *     沒有它，`OrderPaymentDetail` 會一律回 core_unavailable，退款與建單全部
+	 *     失敗——但那是在使用者已經按下付款之後才失敗。
+	 *   - `YSPaymentDispatch` 的 ambient guard 讓 provider 的每一次寫入自動受
+	 *     dispatch 保護。舊核心不會套用它，於是逾時被接管的舊呼叫仍能把自己的
+	 *     取號資訊寫進新的一次嘗試。
+	 *
+	 * 版本不符時**不註冊任何 gateway 或物流方式**：一個註冊了卻無法安全落盤的
+	 * provider，比一個明顯缺席的 provider 危險得多——前者會收到錢。
+	 */
+	public const REQUIRES_CORE = '2.57.0';
+
+	/**
+	 * 核心版本是否滿足需求。
+	 *
+	 * 讀不到版本常數＝核心根本沒載入，或舊到還沒有這個常數——兩者都不滿足。
+	 */
+	public static function core_version_ok(): bool {
+		if ( ! defined( 'YS_ECOMMERCE_VERSION' ) ) {
+			return false;
+		}
+
+		return version_compare( (string) constant( 'YS_ECOMMERCE_VERSION' ), self::REQUIRES_CORE, '>=' );
+	}
+
+	/** 目前偵測到的核心版本（缺席時回空字串）。 */
+	public static function core_version(): string {
+		return defined( 'YS_ECOMMERCE_VERSION' ) ? (string) constant( 'YS_ECOMMERCE_VERSION' ) : '';
+	}
+
+	/** 版本不符時的後台通知。 */
+	public function render_core_version_notice(): void {
+		$found = self::core_version();
+
+		printf(
+			'<div class="notice notice-error"><p><strong>%s</strong> %s</p></div>',
+			esc_html__( 'YS CART - ECPay 未啟用：', 'ys-cart-ecpay' ),
+			esc_html( sprintf(
+				/* translators: 1: required core version, 2: detected core version */
+				__( '需要 YS CART %1$s 或更新版本（目前偵測到 %2$s）。在核心升級之前，綠界金流與物流方式不會被註冊。', 'ys-cart-ecpay' ),
+				self::REQUIRES_CORE,
+				'' !== $found ? $found : __( '未安裝／未啟用', 'ys-cart-ecpay' )
+			) )
+		);
+	}
+
 	public function init(): void {
+		// 🔴 版本不符 → 只掛後台通知，其餘一律不註冊（含 gateway、物流、REST 路由、
+		// CLI 與核心同步 hook）。一個註冊了卻無法安全落盤的 provider 會收到錢。
+		if ( ! self::core_version_ok() ) {
+			add_action( 'admin_notices', [ $this, 'render_core_version_notice' ] );
+
+			return;
+		}
+
 		EcpaySettings::register();
 		\YangSheep\YSCartEcpay\Cli\EcpayRefundAttemptCommand::register();
 		// R8-F3：核心 finalization 人工核定 → 同步核定本外掛退款 attempt（解除雙 ledger

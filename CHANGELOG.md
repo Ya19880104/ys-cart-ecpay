@@ -4,6 +4,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- 宣告核心版本硬性需求 `YS CART >= 2.57.0`（`Plugin::REQUIRES_CORE`）。本外掛沒有自己的 `payment_detail` 寫入器，全部走核心的 `YSPaymentDetailStore`，並依賴 `YSPaymentDispatch` 的 ambient guard 讓每一次 provider 寫入都是 owner-conditioned；兩者在 2.57.0 之前都不存在。版本不符時 `init()` 只掛 `admin_notices`，**不註冊任何 gateway、物流方式、REST 路由或 CLI**——一個註冊了卻無法安全落盤的 provider 會收到錢，比明顯缺席危險得多。
+- 每一步金流動作都追加一筆**不可變**的 result event（先前只有送出前的 `sent`）。內容涵蓋人工核定需要的全部事實：`token`、`step`、`attempted`／`executed`、傳輸分類（`ok`／`rejected`／`indeterminate`）、`RtnCode`／`RtnMsg`、回應交易編號、指紋摘要與時間戳。舊版這些只存在於 log 檔，而核定的人看的是訂單。追加是冪等的（同一個 token＋階段不重複），既有事件一律不修改。
+
+### Changed
+
+- `done` 的冪等重放改為要求**完整證據**：`plan` 逐字元等於本次計畫、`executed === plan`、`operations` 對計畫裡的每一步都有一筆（且帶得出 token 與送出時間）、`response_trade_no` 是非空字串。任一項不成立即回 `indeterminate` 而非成功。冪等重放會讓核心結案（標記已退款、寫進帳、不再回頭核對），因此「status 是 done」這個字串遠遠不足以支撐那個結論——一筆只執行了 `E`（漏了 `N`）的 entry 先前會被當成完成。
+- 冪等重放回報的交易編號**禁止 fallback**。舊版在 `response_trade_no` 為空時退回指紋內的 `trade_no`，把「綠界確認的退款交易編號」與「我們送出去的原始交易編號」混成一個值——呼叫端拿到一個看起來像退款憑據的東西，對帳時無從發現。
+- 交易身分改為**typed-present**：`trade_no`、`mer_trade_no`、`ecpay_merchant_id`、`ecpay_environment`、`gwsr` 每一個都必須是非空字串，`charged_amount` 必須是正整數，而且**指紋端與當下值兩邊都要**。舊版用 `(string)` 轉型（`null`／`0`／`false` 都會變成看得下去的值），且對 `gwsr` 有一條「當下缺值不算漂移」的例外——期間有人刪掉 gwsr，比對就自動跳過而 DoAction 照送。
+- `gwsr` 落盤從 best-effort 快取升為**必要條件**：寫不進去即中止退款（此時尚未動任何錢），而不是留到後續每一步 arm 時才失敗。
+- QueryTradeInfo 的授權身分改為 **raw bytes 逐位元比較**。MAC 驗證可以依綠界的正規化規則——那是驗簽的需要；但「這份回應講的是不是我送出去的那一筆」不能靠正規化拉近。舊版對 `MerchantTradeNo`／`TradeNo` 先 `trim()`，於是 `" YS123"` 與 `"YS123"` 相等；綠界的交易編號不含空白，出現空白只代表回應不是我們以為的那一筆，或中間有東西改過它。
+- 請款金額改用 `CoreRefundAuthorization::canonical_int()` 解析，**禁止 string-cast alias**。`(int)` 會把 `'1000abc'` 變成 1000、`'1e3'` 變成 1、超界字串飽和成 `PHP_INT_MAX`；它是退款上界的依據，也是指紋的一部分。
+- 核心核定同步只接受 Core **實際**寫得出來的那一個 terminal tuple：paid → `status = provider_done` 且 `provider_done === true`；aborted → `status = aborted_provider_rejected` 且 `finalized === true`（且 `provider_done` 不得為 true）。#2F 接受了一整排狀態，其中 `submitting` 代表核定還沒完成——那時候同步等於在核心下結論之前就解除凍結。
+- orphan 寫入改回 typed outcome（`written`／`core_unavailable`／`failed`）。資料庫全失敗時，log 輸出與 orphan 紀錄**同一份**完整事實（不攤平、不截斷），兩邊撈出來的形狀才對得起來。
+- `wp ys-cart-ecpay refund-attempt list` 印出每一筆 operation 與 orphan 事實的**全部**欄位（未知欄位一併附上），不再挑欄位顯示。這些紀錄存在的唯一理由就是 ledger 寫不進去，這時候再砍一半等於把僅存的線索丟掉。
+- 發佈包排除 `.codex`／`.claude`／`.agents`／`.DS_Store`。這些是交接筆記、審查紀錄與未完成的 gate 清單，會隨包散佈到每一個安裝站點的檔案系統（多半在 web root 底下）。v004 補上正反例。
+- 正式 package gate 改為比對 **committed Git blob**，不只比工作樹。工作樹逐位相同只證明「這個包是從我現在看到的檔案打出來的」；我們回報給審查者的 hash 必須對應到一個可以被別人重現的 commit。
+
 ### Fixed
 
 - 超商電子地圖（`/stores/ecpay/map-url`）補上購物車商品「允許的物流方式」交集驗證。先前僅檢查 provider 與該物流方式的**全域**啟用狀態，因此購物車商品只允許萊爾富時，前端仍可取得**已簽章**的 7-11 電子地圖表單；使用者選完門市、callback 也會寫入門市 session 與 `ys_ec_selected_store`，直到送單才被核心擋下。現以核心 `YSShippingRegistry::is_method_allowed_for_cart()` 這一份共用守門驗證（fail-closed，回 `shipping_method_not_allowed`）。

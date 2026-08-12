@@ -258,6 +258,7 @@ namespace {
     $core = dirname(__DIR__, 3) . '/ys-cart/src/Services/Payment/';
     require_once $core . 'YSPaymentDetailResult.php';
     require_once $core . 'YSPaymentDetailStore.php';
+    require_once $core . 'YSPaymentDispatch.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
     require_once dirname(__DIR__, 2) . '/src/Support/ScalarColumnWriter.php';
@@ -501,9 +502,14 @@ namespace {
         '(e1) 終態冪等要求逐欄 readback（含 executed／response_trade_no）'
     );
 
-    // 行為：既有 done 的 executed 與本次不同 → 不得當成冪等
+    // 行為：🔴 #2G — 既有 done 的 executed 與本次計畫不同 → **不得**當成冪等
+    //
+    // 這一筆只執行了 `E`（取消關帳），本次的計畫是 `R`。指紋相符只證明「講的是
+    // 同一筆交易」，不證明「該做的都做完了」。#2F 在這裡回成功，於是核心會把一筆
+    // 只做了一半的退款結案。
     $seed( [ '_ys_ecpay_refunds' => [ 'req-1' => [
         'status'            => 'done',
+        'plan'              => 'E,N',
         'executed'          => 'E',
         'response_trade_no' => 'ECPAY-OLD',
         'amount'            => 1000,
@@ -517,8 +523,37 @@ namespace {
     ] ] ] );
     $r = $refund();
     $assert(
-        ! empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
-        '(e2) 既有 done + 指紋相符 → 冪等重放（不送金流）'
+        empty( $r['success'] )
+        && 'indeterminate' === ( $r['outcome'] ?? '' )
+        && 0 === EcpayPaymentClient::do_action_count(),
+        '(e2) 🔴 既有 done 但 executed ≠ plan → 不得冪等成功，且不送金流'
+    );
+
+    // 行為：完整的 done（plan／executed／operations／response_trade_no 齊備）
+    // → 才是真正的冪等重放，而且回報的是**綠界確認的**交易編號。
+    $seed( [ '_ys_ecpay_refunds' => [ 'req-1' => [
+        'status'            => 'done',
+        'plan'              => 'R',
+        'executed'          => 'R',
+        'operations'        => [
+            [ 'step' => 'R', 'token' => 'op-1', 'sent_at' => '2026-08-12 00:00:00', 'result' => 'sent' ],
+        ],
+        'response_trade_no' => 'ECPAY-OK',
+        'amount'            => 1000,
+        'charged_amount'    => 1000,
+        'trade_no'          => 'TN-1',
+        'merchant_trade_no' => 'YS7Tabc',
+        'gwsr'              => 'GW-1',
+        'merchant_id'       => 'M1',
+        'environment'       => 'live',
+        'signature'         => 'x',
+    ] ] ] );
+    $r = $refund();
+    $assert(
+        ! empty( $r['success'] )
+        && 'ECPAY-OK' === ( $r['transaction_id'] ?? '' )
+        && 0 === EcpayPaymentClient::do_action_count(),
+        '(e3) 完整的 done → 冪等重放，回報 response_trade_no（禁止 fallback 成 trade_no）'
     );
 
     // ══ B12：CLI forensic 欄位 ═══════════════════════════════════════════
@@ -623,13 +658,85 @@ namespace {
     $entry = $ledger();
     $ops   = is_array( $entry['operations'] ?? null ) ? $entry['operations'] : [];
 
+    // 🔴 #2G：每一步都有**兩筆**事件——送出前的 `sent`，以及送出後不可變的
+    // `result`。#2F 只有前者，於是「綠界回了什麼」只存在於 log 檔裡，而人工核定
+    // 看的是訂單。
+    $by_result = static function ( array $ops, string $kind ): array {
+        return array_values( array_filter( $ops, static function ( $op ) use ( $kind ): bool {
+            return is_array( $op ) && $kind === ( $op['result'] ?? '' );
+        } ) );
+    };
+    $sent    = $by_result( $ops, 'sent' );
+    $results = $by_result( $ops, 'result' );
+
     $assert(
         ! empty( $r['success'] )
-        && 2 === count( $ops )
-        && 'E' === ( $ops[0]['step'] ?? '' )
-        && 'N' === ( $ops[1]['step'] ?? '' )
-        && ( $ops[0]['token'] ?? '' ) !== ( $ops[1]['token'] ?? '' ),
-        '(i1) 🔴 E→N 每一步都 append（舊版只留最後一步的 token）'
+        && 4 === count( $ops )
+        && 2 === count( $sent )
+        && 2 === count( $results )
+        && 'E' === ( $sent[0]['step'] ?? '' )
+        && 'N' === ( $sent[1]['step'] ?? '' )
+        && ( $sent[0]['token'] ?? '' ) !== ( $sent[1]['token'] ?? '' ),
+        '(i1) 🔴 E→N 每一步都 append sent＋result（舊版只留最後一步的 token）'
+    );
+
+    // (i2) result event 必須帶得出人工核定需要的全部事實。
+    $missing_fields = [];
+    foreach ( $results as $index => $event ) {
+        foreach ( [ 'step', 'token', 'transport', 'attempted', 'executed', 'rtn_code', 'rtn_msg', 'response_trade_no', 'sent_at', 'digest', 'recorded_at' ] as $field ) {
+            if ( ! array_key_exists( $field, $event ) ) {
+                $missing_fields[] = $index . ':' . $field;
+            }
+        }
+    }
+    $assert(
+        [] === $missing_fields
+        && 'ok' === ( $results[0]['transport'] ?? '' )
+        && 'ok' === ( $results[1]['transport'] ?? '' )
+        && 'ECPAY-E' === ( $results[0]['response_trade_no'] ?? '' )
+        && 'ECPAY-N' === ( $results[1]['response_trade_no'] ?? '' )
+        // executed 是**這一步之前**已完成的步驟；attempted 含這一步。
+        && '' === ( $results[0]['executed'] ?? 'x' )
+        && 'E' === ( $results[0]['attempted'] ?? '' )
+        && 'E' === ( $results[1]['executed'] ?? '' )
+        && 'E,N' === ( $results[1]['attempted'] ?? '' )
+        // 兩筆事件屬於同一個交易身分 → digest 相同
+        && ( $results[0]['digest'] ?? 'a' ) === ( $results[1]['digest'] ?? 'b' ),
+        '(i2) 🔴 result event 保存 token／step／attempted／executed／transport／RtnCode／RtnMsg／'
+            . 'response id／digest／timestamp（缺：' . ( implode( ', ', $missing_fields ) ?: '無' ) . '）'
+    );
+
+    // (i3) 🔴 傳輸不確定與明確拒絕必須分成**不同的** transport 分類：
+    //      前者不得重送（可能已生效），後者可以。
+    $seed();
+    EcpayPaymentClient::$close = [ 'state' => 'closed', 'message' => '' ];
+    EcpayPaymentClient::$do_action_results = [
+        [ 'success' => false, 'indeterminate' => true, 'data' => [], 'message' => 'timeout' ],
+    ];
+    $r   = $refund();
+    $ops = is_array( $ledger()['operations'] ?? null ) ? $ledger()['operations'] : [];
+    $ind = $by_result( $ops, 'result' );
+    $assert(
+        'indeterminate' === ( $r['outcome'] ?? '' )
+        && 1 === count( $ind )
+        && 'indeterminate' === ( $ind[0]['transport'] ?? '' )
+        && 'timeout' === ( $ind[0]['rtn_msg'] ?? '' ),
+        '(i3) 🔴 傳輸中斷記為 transport=indeterminate（與 rejected 分開）'
+    );
+
+    $seed();
+    EcpayPaymentClient::$do_action_results = [
+        [ 'success' => false, 'indeterminate' => false, 'data' => [ 'RtnCode' => '10200047' ], 'message' => '拒絕' ],
+    ];
+    $r   = $refund();
+    $ops = is_array( $ledger()['operations'] ?? null ) ? $ledger()['operations'] : [];
+    $rej = $by_result( $ops, 'result' );
+    $assert(
+        'rejected_terminal' === ( $r['outcome'] ?? '' )
+        && 1 === count( $rej )
+        && 'rejected' === ( $rej[0]['transport'] ?? '' )
+        && '10200047' === ( $rej[0]['rtn_code'] ?? '' ),
+        '(i4) 🔴 明確拒絕記為 transport=rejected，並保存 RtnCode'
     );
 
     // ══ #2F：post-send 失敗一律 append orphan fact ═══════════════════════
@@ -657,6 +764,112 @@ namespace {
         && str_contains( $cli_src, 'payment_detail 無法解析為 JSON' )
         && str_contains( $cli_src, "\$operations = is_array( \$entry['operations'] ?? null )" ),
         '(k2) CLI 以 provider／core／orphan 聯集輸出、corrupt JSON 明確報錯、每步歷史可見'
+    );
+
+    // ══ #2G：身分必須 typed-present——gwsr 不得消失 ═══════════════════════
+    //
+    // #2F 的 identity_drift 對 gwsr 有一條例外：「當下缺值不算漂移」。於是期間有人
+    // 把 gwsr 刪掉、或資料修復把欄位清空，比對就自動跳過，DoAction 照送。
+    $seed();
+    $wpdb->before_write = static function ( FakeWpdb $db, string $sql ): void {
+        if ( ! str_contains( $sql, '_ys_ecpay_refunds' ) ) {
+            return;
+        }
+        $db->before_write = null;
+        $detail = json_decode( (string) $db->value, true ) ?: [];
+        unset( $detail['gwsr'], $detail['ecpay_gwsr'] ); // 有人把 gwsr 刪了
+        $db->value = json_encode( $detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+    };
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(j1) 🔴 gwsr 在準備期間消失 → identity drift，DoAction 呼叫次數 0'
+    );
+
+    // 其他身分欄位同樣不得消失
+    foreach ( [ 'trade_no', 'mer_trade_no', 'ecpay_merchant_id', 'ecpay_environment' ] as $field ) {
+        $seed();
+        $wpdb->before_write = static function ( FakeWpdb $db, string $sql ) use ( $field ): void {
+            if ( ! str_contains( $sql, '_ys_ecpay_refunds' ) ) {
+                return;
+            }
+            $db->before_write = null;
+            $detail = json_decode( (string) $db->value, true ) ?: [];
+            unset( $detail[ $field ] );
+            $db->value = json_encode( $detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        };
+        $r = $refund();
+        $assert(
+            empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+            '(j2:' . $field . ') 🔴 身分欄位消失 → 拒絕，DoAction 0'
+        );
+    }
+
+    // 型別不對（null／數字）也算缺
+    $seed( [ 'gwsr' => 0 ] );
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(j3) 🔴 身分欄位型別不是非空字串 → 拒絕（`(string)` 轉型會把 0 變成看得下去的值）'
+    );
+
+    // ══ #2G：授權身分用 raw bytes 比較，不做 trim ═════════════════════════
+    //
+    // MAC 驗證可以依綠界的正規化規則；但「這份回應講的是不是我送出去的那一筆」
+    // 不能靠正規化拉近。padding 只可能來自兩件事：回應不是我們以為的那一筆，
+    // 或中間有東西改過它。
+    $seed();
+    EcpayPaymentClient::$query = [
+        'success'      => true,
+        'mac_verified' => true,
+        'data'         => [ 'MerchantTradeNo' => ' YS7Tabc', 'TradeNo' => 'TN-1' ],
+    ];
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(k1) 🔴 MerchantTradeNo 前後有空白 → 拒絕（不得 trim 之後視為相符）'
+    );
+
+    $seed();
+    EcpayPaymentClient::$query = [
+        'success'      => true,
+        'mac_verified' => true,
+        'data'         => [ 'MerchantTradeNo' => 'YS7Tabc', 'TradeNo' => "TN-1\n" ],
+    ];
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(k2) 🔴 TradeNo 帶換行 → 拒絕'
+    );
+
+    // 正常（逐位元相符）仍要放行，否則這道 gate 就是壞的
+    $seed();
+    $r = $refund();
+    $assert(
+        ! empty( $r['success'] ) && 1 === EcpayPaymentClient::do_action_count(),
+        '(k3) 逐位元相符 → 正常放行（gate 不是一律否決）'
+    );
+
+    // ══ #2G：charged_amount 禁止 string-cast alias ════════════════════════
+    $seed( [ 'ecpay_charged_amount' => '1000abc' ] );
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(l1) 🔴 請款金額為 "1000abc" → 拒絕（`(int)` 會把它變成 1000）'
+    );
+
+    $seed( [ 'ecpay_charged_amount' => '1e3' ] );
+    $r = $refund();
+    $assert(
+        empty( $r['success'] ) && 0 === EcpayPaymentClient::do_action_count(),
+        '(l2) 🔴 請款金額為 "1e3" → 拒絕（`(int)` 會把它變成 1）'
+    );
+
+    $seed( [ 'ecpay_charged_amount' => '1000' ] );
+    $r = $refund();
+    $assert(
+        ! empty( $r['success'] ),
+        '(l3) canonical 整數字串 "1000" 仍可解讀（不是一律否決）'
     );
 
     echo "\nrefund authorization contract: {$pass} PASS / {$fail} FAIL\n";

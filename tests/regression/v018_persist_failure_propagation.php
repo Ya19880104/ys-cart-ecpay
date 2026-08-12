@@ -171,6 +171,7 @@ namespace {
     $core = dirname(__DIR__, 3) . '/ys-cart/src/Services/Payment/';
     require_once $core . 'YSPaymentDetailResult.php';
     require_once $core . 'YSPaymentDetailStore.php';
+    require_once $core . 'YSPaymentDispatch.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayGatewayBase.php';

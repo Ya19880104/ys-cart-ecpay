@@ -93,6 +93,39 @@ $assert(
     '(A3) 排除政策：CHANGELOG／tests／bin／superpowers 排除，README／docs／SDK／skills 保留'
 );
 
+// 🔴 #2G：AI 代理／編輯器的工作目錄與 macOS 殘留檔一律不得出貨。
+//
+// 它們裝的是交接筆記、審查紀錄、未完成的 gate 清單——給我們自己看的東西，卻會
+// 隨包散佈到每一個安裝站點的檔案系統（多半在 web root 底下）。
+$agent_leak_cases = [
+    '.codex/handoff.md',
+    '.codex/notes/x.txt',
+    '.claude/settings.json',
+    '.claude/skills/y/SKILL.md',
+    '.agents/reviewer.md',
+    '.DS_Store',
+    'src/.DS_Store',
+    'docs/.DS_Store',
+];
+$agent_leaks = [];
+foreach ($agent_leak_cases as $case) {
+    if (null === ys_cart_ecpay_release_exclusion_reason($case)) {
+        $agent_leaks[] = $case;
+    }
+}
+$assert(
+    [] === $agent_leaks,
+    '(A8) 🔴 .codex／.claude／.agents／.DS_Store 一律排除（漏網：' . (implode(', ', $agent_leaks) ?: '無') . '）'
+);
+
+// 反例的反例：名字**看起來像**但不是的，不得被誤擋。
+$assert(
+    null === ys_cart_ecpay_release_exclusion_reason('docs/claude-integration.md')
+    && null === ys_cart_ecpay_release_exclusion_reason('src/Support/DSStoreHelper.php')
+    && null === ys_cart_ecpay_release_exclusion_reason('skills/agents-guide.md'),
+    '(A9) 排除以完整路徑片段為準——名字相近的正常檔案不受影響'
+);
+
 $assert(
     str_contains((string) file_get_contents($root . '/bin/build-release.php'), "require_once __DIR__ . '/release-policy.php'"),
     '(A4) builder 與本測試共用同一份 policy（不得各自抄一份排除規則）'
@@ -412,6 +445,101 @@ if ($mismatched) {
     $abort("  The artifact was not built from this branch's current bytes.");
 }
 $assert(true, sprintf('(H1) %d 個 eligible 檔案與工作目錄逐位相同', count($scan['files'])));
+
+// ── I. 🔴 #2G：正式 package gate 比對的是**committed Git blob**，不只工作樹 ──
+//
+// 工作樹逐位相同只證明「這個包是從我現在看到的檔案打出來的」。它不證明那些檔案
+// 已經進版控——未 commit 的修改、被 .gitignore 忽略卻仍被打包的檔案、以及
+// 「artifact 建好之後又改了原始碼」都能通過 (H1)。
+//
+// 而我們回報給審查者的是 hash：那個 hash 必須對應到一個**可以被別人重現的
+// commit**，否則「這個包來自那份 commit」只是宣稱。因此比對基準是
+// `git cat-file blob HEAD:<path>` 的原始位元組。
+//
+// 這道 gate **不會**因為環境不方便而放行：不是 git repo、git 不可用、檔案未追蹤、
+// 或內容與 HEAD 不同，全部視為未通過。
+$git_problems = [];
+$git_checked  = 0;
+
+$run_git = static function (array $args) use ($root): array {
+    $cmd = 'git -C ' . escapeshellarg($root);
+    foreach ($args as $a) {
+        $cmd .= ' ' . escapeshellarg((string) $a);
+    }
+    $cmd .= ' 2>&1';
+
+    $out  = [];
+    $code = 0;
+    exec($cmd, $out, $code);
+
+    return ['code' => $code, 'out' => implode("\n", $out)];
+};
+
+$head = $run_git(['rev-parse', 'HEAD']);
+if (0 !== $head['code']) {
+    $git_problems[] = 'git rev-parse HEAD 失敗（不是 git repo 或 git 不可用）：' . $head['out'];
+} else {
+    $head_sha = trim($head['out']);
+
+    // 逐檔比對 ZIP 的位元組與 HEAD 的 blob。ZIP 已在上方 close，重開一次。
+    $zip2 = new ZipArchive();
+    if (true !== $zip2->open($zipPath)) {
+        $git_problems[] = 'ZIP 無法重新開啟以進行 Git-blob 比對';
+    } else {
+        foreach ($scan['files'] as $relative) {
+            $blob = $run_git(['cat-file', 'blob', $head_sha . ':' . $relative]);
+            if (0 !== $blob['code']) {
+                $git_problems[] = sprintf('%s：HEAD 沒有這個檔案（未追蹤或未 commit）', $relative);
+                continue;
+            }
+
+            $zipped = $zip2->getFromName($slug . '/' . $relative);
+            if (false === $zipped) {
+                $git_problems[] = sprintf('%s：ZIP 內讀不到', $relative);
+                continue;
+            }
+
+            ++$git_checked;
+
+            // 🔴 `exec()` 會把輸出按行拆開再 implode，尾端換行會被吃掉，因此比對
+            // 前把兩邊的尾端換行都正規化掉；行**內**的差異（包含 CRLF vs LF）
+            // 仍然會被抓出來——那正是我們要抓的。
+            if (rtrim($zipped, "\r\n") !== rtrim($blob['out'], "\r\n")) {
+                $git_problems[] = sprintf(
+                    '%s：ZIP 與 HEAD blob 不同（zip %s／blob %s）',
+                    $relative,
+                    substr(hash('sha256', rtrim($zipped, "\r\n")), 0, 16),
+                    substr(hash('sha256', rtrim($blob['out'], "\r\n")), 0, 16)
+                );
+            }
+        }
+        $zip2->close();
+    }
+}
+
+if ($git_problems) {
+    fwrite(STDERR, "Git-blob equality gate failed:\n");
+    foreach (array_slice($git_problems, 0, 30) as $problem) {
+        fwrite(STDERR, "  {$problem}\n");
+    }
+    if (count($git_problems) > 30) {
+        fwrite(STDERR, sprintf("  ...（另有 %d 項）\n", count($git_problems) - 30));
+    }
+
+    // 🔴 與 (H1) 同一個道理：本地 CRLF checkout 的工作樹與 LF 的 blob 必然逐位不同。
+    // 那不是缺陷，是兩個不同的樹——但**仍然不通過**，因為可出貨的 artifact 只能從
+    // autocrlf=false 的乾淨 clone 建置。訊息要說清楚，才不會有人往「漏打包」的方向查。
+    fwrite(
+        STDERR,
+        "  這道 gate 只在 autocrlf=false 的乾淨 clone 內會通過（工作樹與 blob 同為 LF）。\n"
+        . "  在本地 CRLF checkout 內它必然是紅的：請在乾淨 clone 內執行本測試以驗證可出貨的那一份。\n"
+    );
+}
+
+$assert(
+    [] === $git_problems,
+    sprintf('(I1) 🔴 %d 個 eligible 檔案與 HEAD 的 Git blob 逐位相同（問題 %d 項）', $git_checked, count($git_problems))
+);
 
 echo "\nrelease package contract (version {$version}): {$pass} PASS / {$fail} FAIL\n";
 exit($fail > 0 ? 1 : 0);

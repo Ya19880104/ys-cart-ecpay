@@ -243,6 +243,7 @@ namespace {
     $core = dirname(__DIR__, 3) . '/ys-cart/src/Services/Payment/';
     require_once $core . 'YSPaymentDetailResult.php';
     require_once $core . 'YSPaymentDetailStore.php';
+    require_once $core . 'YSPaymentDispatch.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/CoreRefundAuthorization.php';
@@ -365,18 +366,81 @@ namespace {
         '(c) 併發不同 request_id：全單凍結（不分 request_id），DoAction 呼叫次數 0'
     );
 
-    // (d) 冪等重放
+    // (d) 冪等重放 —— 🔴 #2G：既有 done 必須是**完整**的才算數
+    //
+    // 「status 是 done」不足以宣告冪等：冪等重放會讓核心結案（標記已退款、寫進
+    // 帳、不再回頭核對）。因此完整的證據四項缺一不可——plan、executed===plan、
+    // 每一步的 operations 歷史、綠界確認的 response_trade_no。
     $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
         'status' => 'done', 'amount' => 1000, 'charged_amount' => 1000, 'trade_no' => 'TN-1',
         'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
         'merchant_id' => 'M1', 'environment' => 'live',
+        'plan' => 'R', 'executed' => 'R',
+        'operations' => [
+            ['step' => 'R', 'token' => 'op-token-1', 'sent_at' => '2026-08-12 00:00:00', 'result' => 'sent'],
+        ],
+        'response_trade_no' => 'ECPAY-REPLAY',
     ]]]);
     $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
     $assert(
         true === ($r['success'] ?? false)
         && 0 === EcpayPaymentClient::do_action_count()
+        && 'ECPAY-REPLAY' === ($r['transaction_id'] ?? '')
         && str_contains((string) ($r['message'] ?? ''), '冪等重放'),
-        '(d) done + fingerprint 相符 → 冪等重放，不再送金流'
+        '(d) done + 完整證據 → 冪等重放，回報 response_trade_no，不再送金流'
+    );
+
+    // (d2) 🔴 done 但 executed 只做了一半 → **不得**冪等成功
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
+        'status' => 'done', 'amount' => 1000, 'charged_amount' => 1000, 'trade_no' => 'TN-1',
+        'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
+        'merchant_id' => 'M1', 'environment' => 'live',
+        'plan' => 'R', 'executed' => '',
+        'operations' => [
+            ['step' => 'R', 'token' => 'op-token-1', 'sent_at' => '2026-08-12 00:00:00', 'result' => 'sent'],
+        ],
+        'response_trade_no' => 'ECPAY-REPLAY',
+    ]]]);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true)
+        && 'indeterminate' === ($r['outcome'] ?? '')
+        && 0 === EcpayPaymentClient::do_action_count(),
+        '(d2) 🔴 done 但 executed 不等於 plan → 不得冪等成功（回 indeterminate，DoAction 0）'
+    );
+
+    // (d3) 🔴 done 但缺綠界確認的交易編號 → 不得回報成功，也不得退回原始 trade_no
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
+        'status' => 'done', 'amount' => 1000, 'charged_amount' => 1000, 'trade_no' => 'TN-1',
+        'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
+        'merchant_id' => 'M1', 'environment' => 'live',
+        'plan' => 'R', 'executed' => 'R',
+        'operations' => [
+            ['step' => 'R', 'token' => 'op-token-1', 'sent_at' => '2026-08-12 00:00:00', 'result' => 'sent'],
+        ],
+    ]]]);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true)
+        && 'TN-1' !== ($r['transaction_id'] ?? '')
+        && 0 === EcpayPaymentClient::do_action_count(),
+        '(d3) 🔴 缺 response_trade_no → 不得回報成功、不得靜默退回原始 trade_no'
+    );
+
+    // (d4) 🔴 done 但沒有 operations 歷史 → 講不清楚做了什麼，不算完成
+    $w = $seed(['_ys_ecpay_refunds' => ['req-1' => [
+        'status' => 'done', 'amount' => 1000, 'charged_amount' => 1000, 'trade_no' => 'TN-1',
+        'merchant_trade_no' => 'YS7Tabc', 'gwsr' => 'GW-1',
+        'merchant_id' => 'M1', 'environment' => 'live',
+        'plan' => 'R', 'executed' => 'R',
+        'response_trade_no' => 'ECPAY-REPLAY',
+    ]]]);
+    $r = $gw->process_refund(7, 1000.0, '', ['refund_request_id' => 'req-1']);
+    $assert(
+        false === ($r['success'] ?? true)
+        && 'indeterminate' === ($r['outcome'] ?? '')
+        && 0 === EcpayPaymentClient::do_action_count(),
+        '(d4) 🔴 缺 operations 歷史 → 不得冪等成功'
     );
 
     // (e) fingerprint 不符（request_id 撞號）

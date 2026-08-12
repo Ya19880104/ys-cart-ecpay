@@ -146,38 +146,77 @@ final class EcpayRefundAttemptCommand {
 				\WP_CLI::log( sprintf( '   註記      %s', (string) $entry['note'] ) );
 			}
 
-			// E→N 這類多步流程：每一步的 operation 都要看得到，不能只留最後一步。
+			// 🔴 v0.3.0（#2G）：**每一筆 operation 事實都要看得到，一個欄位都不省。**
+			//
+			// 人工核定要回答的問題是「綠界那邊到底發生了什麼」。少印一個 RtnMsg 或
+			// transport 分類，核定的人就得回頭翻 log——而 log 可能已經輪替掉了。
+			// 因此已知欄位固定順序印出，未知欄位（未來版本新增的）也一律附在後面，
+			// 不做白名單過濾。
 			$operations = is_array( $entry['operations'] ?? null ) ? $entry['operations'] : [];
 			foreach ( $operations as $index => $op ) {
 				if ( ! is_array( $op ) ) {
 					continue;
 				}
-				\WP_CLI::log( sprintf(
-					'   步驟 #%d   step=%s  token=%s  sent_at=%s  result=%s  RtnCode=%s',
-					(int) $index + 1,
-					(string) ( $op['step'] ?? '-' ),
-					(string) ( $op['token'] ?? '-' ),
-					(string) ( $op['sent_at'] ?? '-' ),
-					(string) ( $op['result'] ?? '-' ),
-					(string) ( $op['rtn_code'] ?? '-' )
-				) );
+
+				$known = [ 'step', 'token', 'result', 'transport', 'attempted', 'executed', 'sent_at', 'rtn_code', 'rtn_msg', 'response_trade_no', 'digest', 'recorded_at' ];
+				$parts = [];
+				foreach ( $known as $field ) {
+					if ( array_key_exists( $field, $op ) ) {
+						$parts[] = $field . '=' . self::scalarize( $op[ $field ] );
+					}
+				}
+				foreach ( $op as $field => $value ) {
+					if ( ! in_array( (string) $field, $known, true ) ) {
+						$parts[] = $field . '=' . self::scalarize( $value );
+					}
+				}
+
+				\WP_CLI::log( sprintf( '   步驟 #%d   %s', (int) $index + 1, implode( '  ', $parts ) ) );
 			}
 
 			// 失去授權時保存下來的 provider 事實：多步流程／crash 後的唯一線索。
+			// 同樣全欄印出——這些紀錄存在的唯一理由就是「ledger 寫不進去」，
+			// 這時候再挑欄位顯示等於把僅存的線索又砍掉一半。
 			$facts = is_array( $orphans[ (string) $request_id ] ?? null ) ? $orphans[ (string) $request_id ] : [];
 			foreach ( $facts as $index => $fact ) {
 				if ( ! is_array( $fact ) ) {
 					continue;
 				}
-				\WP_CLI::log( sprintf(
-					'   孤兒事實 #%d  phase=%s  trade_no=%s  recorded_at=%s',
-					(int) $index + 1,
-					(string) ( $fact['phase'] ?? '-' ),
-					(string) ( $fact['trade_no'] ?? '-' ),
-					(string) ( $fact['recorded_at'] ?? '-' )
-				) );
+
+				$parts = [];
+				foreach ( $fact as $field => $value ) {
+					$parts[] = $field . '=' . self::scalarize( $value );
+				}
+
+				\WP_CLI::log( sprintf( '   孤兒事實 #%d  %s', (int) $index + 1, implode( '  ', $parts ) ) );
 			}
 		}
+	}
+
+	/**
+	 * 把任意值印成一行可讀的字串（CLI 用，v0.3.0，#2G）
+	 *
+	 * 巢狀結構不省略——JSON 一行印出來，總比印 `Array` 好；長字串截斷但**標示**
+	 * 截斷過，不讓人誤以為那就是完整內容。
+	 */
+	private static function scalarize( mixed $value ): string {
+		if ( is_bool( $value ) ) {
+			return $value ? 'true' : 'false';
+		}
+		if ( null === $value ) {
+			return '-';
+		}
+		if ( is_scalar( $value ) ) {
+			$text = (string) $value;
+		} else {
+			$text = (string) wp_json_encode( $value );
+		}
+
+		if ( mb_strlen( $text ) > 300 ) {
+			return mb_substr( $text, 0, 300 ) . '…(truncated)';
+		}
+
+		return '' === $text ? '-' : $text;
 	}
 
 	/**
@@ -370,18 +409,48 @@ final class EcpayRefundAttemptCommand {
 				// 把 aborted 的標成 `aborted_provider_rejected`。舊版只認
 				// paid/aborted/submitting，於是每一次人工核定的同步都必然被拒——
 				// provider ledger 永遠留在 pending，凍結永遠解不開。
+				// 🔴 v0.3.0（#2G）：**只接受 Core 實際寫得出來的那一個 terminal tuple。**
+				//
+				// #2F 接受了一整排狀態（paid／submitting／provider_done…）。那太寬：
+				// `submitting` 代表「核定還沒完成」，把 provider ledger 標成終態等於
+				// 在核心還沒下結論之前就解除凍結；`paid`／`failed`／`aborted` 這些
+				// 名稱核心根本不會寫進 `status`。
+				//
+				// 核心的兩個終態是成對的（`YSRefundHandler::resolve_finalization()`）：
+				//   paid    → status = 'provider_done'            ＋ provider_done === true
+				//   aborted → status = 'aborted_provider_rejected' ＋ finalized === true
+				//
+				// 兩者都要**逐項 exact** 才算數：狀態字串對了而旗標沒設起來，代表寫入
+				// 只完成一半，那時候同步 provider ledger 會讓兩邊永久互相矛盾。
 				$core_status = (string) ( $core_current['status'] ?? '' );
-				$accepted    = 'paid' === $mark
-					? [ 'paid', 'submitting', 'provider_done' ]
-					: [ 'aborted', 'failed', 'submitting', 'aborted_provider_rejected' ];
 
-				if ( ! in_array( $core_status, $accepted, true ) ) {
-					$decision = [ 'action' => 'core_status_inconsistent', 'status' => $core_status ];
-					return null;
+				if ( 'paid' === $mark ) {
+					if ( 'provider_done' !== $core_status ) {
+						$decision = [ 'action' => 'core_status_inconsistent', 'status' => $core_status ];
+						return null;
+					}
+					if ( true !== ( $core_current['provider_done'] ?? null ) ) {
+						$decision = [ 'action' => 'core_flag_inconsistent', 'flag' => 'provider_done' ];
+						return null;
+					}
+				} else {
+					if ( 'aborted_provider_rejected' !== $core_status ) {
+						$decision = [ 'action' => 'core_status_inconsistent', 'status' => $core_status ];
+						return null;
+					}
+					if ( true !== ( $core_current['finalized'] ?? null ) ) {
+						$decision = [ 'action' => 'core_flag_inconsistent', 'flag' => 'finalized' ];
+						return null;
+					}
+					// aborted 代表「provider 沒退成」——provider_done 若為 true，兩個
+					// 事實互相矛盾，不得同步。
+					if ( true === ( $core_current['provider_done'] ?? null ) ) {
+						$decision = [ 'action' => 'core_flag_inconsistent', 'flag' => 'provider_done' ];
+						return null;
+					}
 				}
 
-				// paid 方向：core 也可能已經把 provider_done 旗標設起來——那是
-				// 「核定已完成」的正常形狀，不是矛盾。
+				// record-only（人工記帳、未經金流）的請求不該有 provider ledger 終態。
 				if ( 'paid' === $mark && true === ( $core_current['record_only'] ?? null ) ) {
 					$decision = [ 'action' => 'core_record_only' ];
 					return null;
@@ -461,9 +530,15 @@ final class EcpayRefundAttemptCommand {
 			),
 			'core_entry_gone'          => 'core 的退款請求在同步期間消失了，無法核對' . $manual,
 			'core_status_inconsistent' => sprintf(
-				'core 的終態（%s）與本次要寫入的方向（%s）不一致——兩邊會永久互相矛盾%s',
+				'core 的狀態（%s）不是本次方向（%s）唯一接受的終態'
+					. '（paid→provider_done／aborted→aborted_provider_rejected）%s',
 				is_array( $sync_decision ) ? (string) ( $sync_decision['status'] ?? '?' ) : '?',
 				$target,
+				$manual
+			),
+			'core_flag_inconsistent'   => sprintf(
+				'core 的終態旗標（%s）與狀態不一致——核定寫入只完成一半，現在同步會讓兩邊永久互相矛盾%s',
+				is_array( $sync_decision ) ? (string) ( $sync_decision['flag'] ?? '?' ) : '?',
 				$manual
 			),
 			'amount_unverifiable'      => 'attempt 金額無法核對（core 或 ecpay entry 缺 amount）' . $manual,

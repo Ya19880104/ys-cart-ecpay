@@ -23,7 +23,19 @@ Standalone ECPay provider plugin for YS CART.
 
 - WordPress 6.2+
 - PHP 8.1+
-- YS CART with provider hook support
+- **YS CART >= 2.57.0** (hard requirement)
+
+### Why YS CART 2.57.0 is a hard requirement
+
+This plugin does not carry its own writer for the order `payment_detail` column.
+It writes through the core's `YSPaymentDetailStore` compare-and-swap service and
+relies on the core's `YSPaymentDispatch` ambient guard so that every provider
+write is owner-conditioned. Neither exists before 2.57.0.
+
+If the core is older, the plugin **registers no payment gateways and no shipping
+methods** and shows an admin notice instead. A provider that is registered but
+cannot persist safely is more dangerous than one that is visibly absent — the
+first one takes money.
 
 ## Callback Routes
 

@@ -163,8 +163,13 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			// 查詢成功但沒有 gwsr → 退回已持久化的值（webhook 當時寫下的同一筆事實）。
 			$gwsr = (string) ( $payment_detail['gwsr'] ?? $payment_detail['ecpay_gwsr'] ?? '' );
 		} else {
-			// gwsr 回寫只是快取（查詢失敗時仍有依據），寫不進去不影響本次判定，
-			// 但仍要留下紀錄——它同時是「CAS 是否健康」的早期訊號。
+			// 🔴 v0.3.0（#2G）：gwsr 落盤是**必要條件**，不再是 best-effort 快取。
+			//
+			// 舊版把它當快取：寫不進去只記一筆 warning 就繼續。但 gwsr 同時是身分
+			// 指紋的一部分，而 `identity_drift()` 現在要求每一次 CAS 都能在 detail
+			// 裡看到它——沒落盤就代表之後每一次 arm 都會失敗，而失敗的時機會落在
+			// 「已經送出第一步」之後。與其讓它在中途炸開，不如在還沒動任何錢的
+			// 現在就停下來。
 			$cached = OrderPaymentDetail::mutate(
 				$order_id,
 				static function ( array $detail ) use ( $gwsr ): array {
@@ -173,10 +178,12 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				}
 			);
 			if ( ! $cached->is_persisted() ) {
-				YSLogger::warning( 'ecpay', 'gwsr 快取回寫失敗（不影響本次退款判定）', array_merge(
+				YSLogger::error( 'ecpay', 'CRITICAL: gwsr 無法落盤，已中止退款（未送出任何金流動作）', array_merge(
 					[ 'order_id' => $order_id ],
 					$cached->to_log_context()
 				) );
+
+				return self::reject( '無法保存綠界授權單號（gwsr），退款身分無法在後續每一步重新證明，已中止；未執行任何金流操作，請重試。' );
 			}
 		}
 
@@ -204,11 +211,15 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// v0.3.0：基準是**建單時實際送出的金額**，不是 $order->total。total 可能在
 		// 建單之後被改動，而且 `(int) round( total )` 會讓 1000.5 的訂單把 1001 元的
 		// 退款判成「全額」——那不是同一筆錢。
-		$charged_amount = isset( $payment_detail['ecpay_charged_amount'] )
-			? (int) $payment_detail['ecpay_charged_amount']
-			: null;
+		// 🔴 v0.3.0（#2G）：**禁止 string-cast alias**。
+		//
+		// 舊版是 `(int) $payment_detail['ecpay_charged_amount']`。`(int)` 會把
+		// `'1000abc'` 變成 1000、把 `'1e3'` 變成 1、把超界字串**飽和**成
+		// PHP_INT_MAX——每一種都是「看起來合理」的金額，而它是退款上界的依據，
+		// 也是指紋的一部分。同一個值用不同轉型算出不同結果，指紋就不再證明任何事。
+		$charged_amount = CoreRefundAuthorization::canonical_int( $payment_detail['ecpay_charged_amount'] ?? null );
 		if ( null === $charged_amount || $charged_amount <= 0 ) {
-			return self::reject( '此訂單未記錄實際請款金額（v0.3.0 之前建立），無法判定全額／部分退款；請人工處理。' );
+			return self::reject( '此訂單未記錄可解讀的實際請款金額，無法判定全額／部分退款；請人工處理。' );
 		}
 		if ( $amount_twd > $charged_amount ) {
 			return self::reject( sprintf( '退刷金額超過實際請款金額（請款 %d 元）。', $charged_amount ) );
@@ -302,12 +313,28 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 					return null;
 				}
 
-				// (a) 同一請求已成功 → 冪等重放；但 fingerprint 必須相符，否則代表
-				//     request_id 撞號（不同交易共用同一個鍵），絕不能回報成功。
+				// (a) 同一請求已成功 → 冪等重放。
+				//
+				// 🔴 v0.3.0（#2G）：「status 是 done」遠遠不足以宣告冪等成功。
+				//
+				// 冪等的意義是「這一次要做的事，先前**完全**做完了」。一筆
+				// `status=done` 卻只執行了 E（漏了 N）、或缺 operations 歷史、或沒有
+				// 綠界確認的交易編號的 entry，代表的是「有人把它標成 done」，不是
+				// 「這筆退款完成了」。把它當冪等回報成功，核心就會結案，而那筆錢
+				// 可能根本沒退。
 				if ( $existing && 'done' === ( $existing['status'] ?? '' ) ) {
-					$decision = self::fingerprint_matches( $existing, $fingerprint )
-						? [ 'action' => 'idempotent_replay', 'entry' => $existing ]
-						: [ 'action' => 'fingerprint_mismatch', 'entry' => $existing ];
+					if ( ! self::fingerprint_matches( $existing, $fingerprint ) ) {
+						$decision = [ 'action' => 'fingerprint_mismatch', 'entry' => $existing ];
+						return null;
+					}
+
+					$incomplete = self::done_replay_problem( $existing, $plan );
+					if ( null !== $incomplete ) {
+						$decision = [ 'action' => 'done_incomplete', 'problem' => $incomplete ];
+						return null;
+					}
+
+					$decision = [ 'action' => 'idempotent_replay', 'entry' => $existing ];
 					return null;
 				}
 
@@ -347,13 +374,46 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 
 		if ( 'idempotent_replay' === $action ) {
 			$entry = is_array( $decision['entry'] ?? null ) ? $decision['entry'] : [];
-			// 冪等重放回報**綠界確認的**交易編號（response_trade_no）；沒有它就退回
-			// 指紋內的 trade_no——但兩者語意不同，不能靜默混用，所以順序固定。
-			$replay_trade_no = (string) ( $entry['response_trade_no'] ?? '' );
+
+			// 🔴 v0.3.0（#2G）：**禁止 fallback**。
+			//
+			// 舊版是 `'' !== $replay ? $replay : ( $entry['trade_no'] ?? $trade_no )`。
+			// 那個 fallback 把兩個語意完全不同的值混成一個：`response_trade_no` 是
+			// **綠界回應確認的退款交易編號**，`trade_no` 是我們送出去的原始交易編號。
+			// 靜默退回後者，呼叫端拿到一個「看起來像是退款憑據」的值，而它其實只是
+			// 原始交易——對帳時無從發現。
+			//
+			// `done_replay_problem()` 已經在 CAS 內保證它是非空字串；這裡再驗一次是
+			// 因為這個回傳值會被核心當成退款憑據存進帳本。
+			$replay_trade_no = $entry['response_trade_no'] ?? null;
+			if ( ! is_string( $replay_trade_no ) || '' === $replay_trade_no ) {
+				return self::reject( '既有的退款紀錄缺少綠界確認的交易編號，無法作為冪等重放的依據；請人工核對後處理。' );
+			}
+
 			return [
 				'success'        => true,
-				'transaction_id' => '' !== $replay_trade_no ? $replay_trade_no : (string) ( $entry['trade_no'] ?? $trade_no ),
+				'transaction_id' => $replay_trade_no,
 				'message'        => '（冪等重放：此退刷請求先前已成功）',
+			];
+		}
+
+		if ( 'done_incomplete' === $action ) {
+			$problem = is_array( $decision ) ? (string) ( $decision['problem'] ?? '' ) : '';
+
+			YSLogger::error( 'ecpay', 'CRITICAL: 既有 done 紀錄不完整，不得當成冪等重放', [
+				'order_id'   => $order_id,
+				'request_id' => $request_id,
+				'problem'    => $problem,
+			] );
+
+			return [
+				'success' => false,
+				'outcome' => 'indeterminate',
+				'message' => sprintf(
+					'既有的退款紀錄標為完成，但內容不完整（%s）：無法證明這筆退款真的執行完畢，'
+						. '已拒絕回報成功。請於綠界後台確認實際狀態後人工核定。',
+					sanitize_text_field( $problem )
+				),
 			];
 		}
 
@@ -505,6 +565,31 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			$result           = $client->do_action_refund( $merchant_trade_no, $trade_no, (float) $amount_twd, $step );
 			$attempted        = array_merge( $executed, [ $step ] );
 
+			// 🔴 v0.3.0（#2G）：每一步的**結果**也 append 一筆不可變事件。
+			//
+			// #2F 只寫 `sent`。回應是什麼、是被明確拒絕還是傳輸中斷、綠界回了哪個
+			// RtnCode——全都只在 log 檔裡，而人工核定看的是訂單。
+			//
+			// 三個分支共用同一次寫入，因此無論走哪一條路都留得下同一組事實。
+			self::append_operation_result( $order_id, $request_id, $fingerprint, [
+				'step'      => $step,
+				'token'     => $op_token,
+				'result'    => 'result',
+				// 傳輸分類：三態，不是 bool。indeterminate 與 rejected 對「可不可以
+				// 重送」的答案完全相反。
+				'transport' => ! empty( $result['indeterminate'] )
+					? 'indeterminate'
+					: ( ! empty( $result['success'] ) ? 'ok' : 'rejected' ),
+				'attempted' => implode( ',', $attempted ),
+				'executed'  => implode( ',', $executed ),
+				'rtn_code'  => (string) ( $result['data']['RtnCode'] ?? '' ),
+				'rtn_msg'   => mb_substr( (string) ( $result['message'] ?? '' ), 0, 300 ),
+				'response_trade_no' => is_string( $result['data']['TradeNo'] ?? null )
+					? (string) $result['data']['TradeNo']
+					: '',
+				'sent_at'   => $sent_at,
+			] );
+
 			if ( ! empty( $result['indeterminate'] ) ) {
 				// 傳輸不確定：綠界端可能已生效 → attempt 維持 pending，等人工核定。
 				// executed 不含本步（我們不知道它有沒有生效），另記 attempted。
@@ -653,6 +738,81 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	}
 
 	/**
+	 * 一筆 `status=done` 的 entry 是否真的「做完了」？（v0.3.0，#2G）
+	 *
+	 * 🔴 冪等重放會讓核心**結案**：它會把訂單標成已退款、把金額寫進帳、不再有任何
+	 * 機制回來核對。所以「先前已成功」這個結論必須有完整證據，而不是一個狀態字串。
+	 *
+	 * 四項全部要過，任何一項不成立都代表這筆紀錄講不清楚它做了什麼：
+	 *
+	 *   1. `plan` 逐字元等於這一次算出來的計畫——關帳狀態可能已經改變，
+	 *      當時做的是 `N`、現在需要的是 `E,N`，那不是同一件事
+	 *   2. `executed` 逐字元等於 `plan`——`plan=E,N` 而 `executed=E` 代表只做了一半
+	 *   3. `operations` 是完整的 append-only 歷史：計畫裡的每一步都有一筆，
+	 *      而且每一筆都帶得出 token 與送出時間
+	 *   4. `response_trade_no` 是**非空字串**——綠界確認的退款交易編號，
+	 *      沒有它就沒有任何東西可以拿去對帳
+	 *
+	 * @param array<string,mixed> $entry
+	 * @param list<string>        $plan
+	 * @return string|null null＝完整；否則是可回報的原因
+	 */
+	private static function done_replay_problem( array $entry, array $plan ): ?string {
+		$expected_plan = implode( ',', $plan );
+
+		$entry_plan = $entry['plan'] ?? null;
+		if ( ! is_string( $entry_plan ) || $entry_plan !== $expected_plan ) {
+			return sprintf(
+				'plan 不符（紀錄 %s／本次 %s）',
+				is_scalar( $entry_plan ) ? (string) $entry_plan : gettype( $entry_plan ),
+				$expected_plan
+			);
+		}
+
+		$executed = $entry['executed'] ?? null;
+		if ( ! is_string( $executed ) || $executed !== $expected_plan ) {
+			return sprintf(
+				'executed 與 plan 不一致（executed %s／plan %s）',
+				is_scalar( $executed ) ? (string) $executed : gettype( $executed ),
+				$expected_plan
+			);
+		}
+
+		$operations = $entry['operations'] ?? null;
+		if ( ! is_array( $operations ) || ! array_is_list( $operations ) ) {
+			return 'operations 歷史缺失或格式異常';
+		}
+
+		foreach ( $plan as $index => $step ) {
+			$op = $operations[ $index ] ?? null;
+			if ( ! is_array( $op ) ) {
+				return sprintf( 'operations 缺少第 %d 步（%s）', $index + 1, $step );
+			}
+			if ( ( $op['step'] ?? null ) !== $step ) {
+				return sprintf(
+					'operations 第 %d 步不符（紀錄 %s／計畫 %s）',
+					$index + 1,
+					is_scalar( $op['step'] ?? null ) ? (string) $op['step'] : gettype( $op['step'] ?? null ),
+					$step
+				);
+			}
+			foreach ( [ 'token', 'sent_at' ] as $field ) {
+				$value = $op[ $field ] ?? null;
+				if ( ! is_string( $value ) || '' === $value ) {
+					return sprintf( 'operations 第 %d 步缺少 %s', $index + 1, $field );
+				}
+			}
+		}
+
+		$response_trade_no = $entry['response_trade_no'] ?? null;
+		if ( ! is_string( $response_trade_no ) || '' === $response_trade_no ) {
+			return '缺少綠界確認的交易編號（response_trade_no）';
+		}
+
+		return null;
+	}
+
+	/**
 	 * 這一筆 attempt 的交易身分是否仍與 detail 的**當下值**一致？（v0.3.0，#2F）
 	 *
 	 * 🔴 交易證據（trade_no、mer_trade_no、gwsr、商店、環境、請款金額）是在
@@ -669,38 +829,59 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 * @return string|null null＝一致；否則是漂移的欄位說明
 	 */
 	private static function identity_drift( array $detail, array $fingerprint ): ?string {
+		// 🔴 v0.3.0（#2G）：每一個身分欄位都必須 **typed-present**。
+		//
+		// 舊版的兩條寬鬆規則各自製造一個洞：
+		//   1. `(string)` 轉型——`null`、`0`、`false` 都會變成看得下去的值
+		//   2. 「當下缺值不算漂移」（gwsr 專屬）——期間有人把 gwsr 刪掉、或
+		//      資料修復把欄位清空，比對就自動跳過，DoAction 照送
+		//
+		// 身分是不可逆動作的依據：**缺欄位不是「沒變」，是「無法證明沒變」**。
 		$checks = [
-			'trade_no'          => (string) ( $detail['trade_no'] ?? '' ),
-			'merchant_trade_no' => (string) ( $detail['mer_trade_no'] ?? '' ),
-			'merchant_id'       => (string) ( $detail['ecpay_merchant_id'] ?? '' ),
-			'environment'       => (string) ( $detail['ecpay_environment'] ?? '' ),
+			'trade_no'          => $detail['trade_no'] ?? null,
+			'merchant_trade_no' => $detail['mer_trade_no'] ?? null,
+			'merchant_id'       => $detail['ecpay_merchant_id'] ?? null,
+			'environment'       => $detail['ecpay_environment'] ?? null,
+			// gwsr 兩個歷史鍵名都接受，但**必須有一個存在**。
+			'gwsr'              => $detail['gwsr'] ?? $detail['ecpay_gwsr'] ?? null,
 		];
 
 		foreach ( $checks as $key => $current ) {
-			$expected = (string) ( $fingerprint[ $key ] ?? '' );
+			$expected = $fingerprint[ $key ] ?? null;
 
-			// 期望值為空代表 reservation 當時就沒有它——那是另一道 gate 的職責。
-			if ( '' === $expected ) {
-				continue;
+			// 期望值本身不是非空字串 → 指紋在建立時就不合格，不得放行。
+			if ( ! is_string( $expected ) || '' === $expected ) {
+				return sprintf( '%s（指紋缺值）', $key );
 			}
 
-			if ( '' === $current || ! hash_equals( $expected, $current ) ) {
-				return sprintf( '%s（指紋 %s／當下 %s）', $key, $expected, '' === $current ? '缺' : $current );
+			if ( ! is_string( $current ) || '' === $current ) {
+				return sprintf(
+					'%s（指紋 %s／當下 %s）',
+					$key,
+					$expected,
+					null === $current ? '缺' : gettype( $current )
+				);
 			}
-		}
 
-		// gwsr：detail 有值時必須相符。快取寫入失敗導致缺值不算漂移——指紋裡的
-		// 值來自 QueryTradeInfo，本來就不依賴快取。
-		$gwsr_now      = (string) ( $detail['gwsr'] ?? $detail['ecpay_gwsr'] ?? '' );
-		$gwsr_expected = (string) ( $fingerprint['gwsr'] ?? '' );
-		if ( '' !== $gwsr_expected && '' !== $gwsr_now && ! hash_equals( $gwsr_expected, $gwsr_now ) ) {
-			return sprintf( 'gwsr（指紋 %s／當下 %s）', $gwsr_expected, $gwsr_now );
+			if ( ! hash_equals( $expected, $current ) ) {
+				return sprintf( '%s（指紋 %s／當下 %s）', $key, $expected, $current );
+			}
 		}
 
 		// 請款金額：退款金額的上界依據，改變了就不能沿用原本的判定。
+		//
+		// 🔴 #2G：指紋端也必須 typed-present。舊版的 `null !== $charged_exp` 讓
+		// 「指紋根本沒有這個欄位」變成跳過檢查——而缺欄位的指紋正是最該擋下的那種。
+		$charged_exp = $fingerprint['charged_amount'] ?? null;
+		if ( ! is_int( $charged_exp ) || $charged_exp <= 0 ) {
+			return sprintf(
+				'charged_amount（指紋 %s）',
+				null === $charged_exp ? '缺' : gettype( $charged_exp )
+			);
+		}
+
 		$charged_now = CoreRefundAuthorization::canonical_int( $detail['ecpay_charged_amount'] ?? null );
-		$charged_exp = CoreRefundAuthorization::canonical_int( $fingerprint['charged_amount'] ?? null );
-		if ( null !== $charged_exp && $charged_now !== $charged_exp ) {
+		if ( $charged_now !== $charged_exp ) {
 			return sprintf(
 				'charged_amount（指紋 %d／當下 %s）',
 				$charged_exp,
@@ -738,19 +919,29 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			return '回應內容格式異常';
 		}
 
-		$resp_mtn = isset( $data['MerchantTradeNo'] ) && is_string( $data['MerchantTradeNo'] )
-			? trim( $data['MerchantTradeNo'] )
-			: '';
-		if ( '' === $resp_mtn || ! hash_equals( $merchant_trade_no, $resp_mtn ) ) {
-			return sprintf( 'MerchantTradeNo 不符（回應 %s）', sanitize_text_field( $resp_mtn ) );
+		// 🔴 v0.3.0（#2G）：**授權身分用 raw bytes 逐位元比較，不做任何正規化。**
+		//
+		// CheckMacValue 的計算允許——而且必須——依綠界的正規化規則（URL encode 的
+		// 大小寫、特定字元的替換）。那是**驗簽**的需要。
+		//
+		// 但「這份回應講的是不是我送出去的那一筆交易」是另一個問題，它的答案不能
+		// 靠正規化拉近。舊版對兩個識別碼都先 `trim()`：`" YS123"` 與 `"YS123"` 於
+		// 是相等。綠界的 MerchantTradeNo 不含空白，會出現空白只有兩種可能——回應
+		// 不是我們以為的那一筆，或中間有東西改過它。兩種都不該放行。
+		$resp_mtn = $data['MerchantTradeNo'] ?? null;
+		if ( ! is_string( $resp_mtn ) || '' === $resp_mtn || ! hash_equals( $merchant_trade_no, $resp_mtn ) ) {
+			return sprintf(
+				'MerchantTradeNo 不符（回應 %s）',
+				is_scalar( $resp_mtn ) ? sanitize_text_field( (string) $resp_mtn ) : gettype( $resp_mtn )
+			);
 		}
 
 		// 🔴 #2F：TradeNo 必須**存在**且相符。
 		//
 		// 舊版只在「有值時」比對：MAC 正確、MerchantTradeNo 正確、但 TradeNo 缺
 		// 失的回應仍可授權退款——而 TradeNo 正是我們要送去 DoAction 的識別碼。
-		$resp_tn = isset( $data['TradeNo'] ) && is_string( $data['TradeNo'] ) ? trim( $data['TradeNo'] ) : '';
-		if ( '' === $resp_tn ) {
+		$resp_tn = $data['TradeNo'] ?? null;
+		if ( ! is_string( $resp_tn ) || '' === $resp_tn ) {
 			return '回應未帶 TradeNo（無法證明是同一筆交易）';
 		}
 		if ( '' === $trade_no || ! hash_equals( $trade_no, $resp_tn ) ) {
@@ -773,6 +964,88 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 */
 	private static function operation_token( string $request_id, string $step, int $sequence ): string {
 		return substr( hash( 'sha256', $request_id . '|' . $step . '|' . $sequence ), 0, 32 );
+	}
+
+	/**
+	 * 交易指紋的摘要（v0.3.0，#2G）
+	 *
+	 * 每一筆 forensic event 都帶著它。人工核定時只要比對這個值，就能判斷兩筆
+	 * 紀錄講的是不是同一筆交易身分——不必逐欄比對，也不必把完整指紋重複塞進
+	 * 每一筆事件裡。
+	 *
+	 * @param array<string,mixed> $fingerprint
+	 */
+	private static function fingerprint_digest( array $fingerprint ): string {
+		$canonical = $fingerprint;
+		ksort( $canonical );
+
+		return substr( hash( 'sha256', (string) wp_json_encode( $canonical ) ), 0, 32 );
+	}
+
+	/**
+	 * 把一筆**不可變**的 result event 追加到 operations 歷史（v0.3.0，#2G）
+	 *
+	 * 🔴 #2F 只 append `sent`：送出去之前寫一筆，然後就沒有了。回應是什麼、
+	 * 是被明確拒絕還是傳輸中斷、綠界回了哪個 RtnCode——全都只在 log 檔裡，而
+	 * 人工核定看的是訂單，不是 log。
+	 *
+	 * 這裡補上另一半：每一步的結果也 append 一筆，內容涵蓋核定需要的全部事實：
+	 * token、步驟、attempted／executed、傳輸分類、RtnCode／RtnMsg、回應交易編號、
+	 * 指紋摘要、時間戳。
+	 *
+	 * append 是**冪等**的：同一個 (token, phase) 已存在就不重複追加——CAS 重試與
+	 * 供方重送都不會讓歷史長出重複的事件。既有事件一律不修改（immutable）。
+	 *
+	 * @param array<string,mixed> $fingerprint
+	 * @param array<string,mixed> $event
+	 */
+	private static function append_operation_result(
+		int $order_id,
+		string $request_id,
+		array $fingerprint,
+		array $event
+	): bool {
+		$event['digest']      = self::fingerprint_digest( $fingerprint );
+		$event['recorded_at'] = current_time( 'mysql' );
+
+		$appended = self::mark_attempt(
+			$order_id,
+			$request_id,
+			[],
+			$fingerprint,
+			null,
+			static function ( array $entry ) use ( $event ): array {
+				$ops = is_array( $entry['operations'] ?? null ) && array_is_list( $entry['operations'] )
+					? $entry['operations']
+					: [];
+
+				foreach ( $ops as $existing ) {
+					if ( ! is_array( $existing ) ) {
+						continue;
+					}
+					// 已經有同一個動作、同一個階段的事件 → 不重複追加，也不覆寫。
+					if ( ( $existing['token'] ?? null ) === ( $event['token'] ?? null )
+						&& ( $existing['result'] ?? null ) === ( $event['result'] ?? null ) ) {
+						return $entry;
+					}
+				}
+
+				$ops[]               = $event;
+				$entry['operations'] = $ops;
+
+				return $entry;
+			}
+		);
+
+		if ( $appended ) {
+			return true;
+		}
+
+		// 🔴 ledger 寫不進去時，事件本身仍必須保存下來——它是「綠界那邊發生了
+		// 什麼」的唯一紀錄，而人工核定只能依據它。
+		self::record_orphan_facts( $order_id, $request_id, array_merge( $event, [ 'phase' => 'operation_result' ] ) );
+
+		return false;
 	}
 
 	private static function reject( string $message ): array {
@@ -1003,7 +1276,20 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 	 *
 	 * @param array<string,mixed> $facts
 	 */
-	private static function record_orphan_facts( int $order_id, string $request_id, array $facts ): void {
+	/** orphan 寫入成功。 */
+	public const ORPHAN_WRITTEN = 'written';
+
+	/** 核心 CAS 服務缺席（舊核心）——寫不進去，但原因與 DB 故障不同。 */
+	public const ORPHAN_CORE_UNAVAILABLE = 'core_unavailable';
+
+	/** 寫入失敗（DB 故障、欄位損壞、CAS 耗盡）。 */
+	public const ORPHAN_FAILED = 'failed';
+
+	/**
+	 * @param array<string,mixed> $facts
+	 * @return string self::ORPHAN_* 之一
+	 */
+	private static function record_orphan_facts( int $order_id, string $request_id, array $facts ): string {
 		$written = OrderPaymentDetail::mutate(
 			$order_id,
 			static function ( array $detail ) use ( $request_id, $facts ): array {
@@ -1019,12 +1305,31 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 			}
 		);
 
-		if ( ! $written->is_persisted() ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: 失去授權後的 provider 事實也寫不進去（只剩 log）', array_merge(
-				[ 'order_id' => $order_id, 'request_id' => $request_id ],
-				$facts
-			) );
+		if ( $written->is_persisted() ) {
+			return self::ORPHAN_WRITTEN;
 		}
+
+		// 🔴 v0.3.0（#2G）：資料庫全失敗時，log 是**唯一**的載體——因此它必須帶著
+		// 與 orphan 紀錄**完全相同**的那一份完整事實，而不是一個摘要。
+		//
+		// 舊版把 `$facts` 攤平 merge 進 context：鍵名撞到 `order_id`／`request_id`
+		// 時會被覆蓋，而且沒有 outcome、沒有時間戳、沒有指紋摘要——人工核定從 log
+		// 撈出來的東西與從訂單撈出來的形狀不一樣，對不起來。
+		$outcome = \YangSheep\YSCartEcpay\Support\DetailWriteOutcome::CORE_UNAVAILABLE === $written->get_outcome()
+			? self::ORPHAN_CORE_UNAVAILABLE
+			: self::ORPHAN_FAILED;
+
+		YSLogger::error( 'ecpay', 'CRITICAL: provider 事實無法落盤（只剩這一筆 log）', [
+			'order_id'    => $order_id,
+			'request_id'  => $request_id,
+			'outcome'     => $outcome,
+			'write_state' => $written->get_outcome(),
+			'recorded_at' => current_time( 'mysql' ),
+			// 同一份 facts，原樣保留（不攤平、不截斷）。
+			'facts'       => $facts,
+		] );
+
+		return $outcome;
 	}
 
 	/** 非終態註記；寫不進去不改變結論（凍結由送出前的 pending 保證），僅記錄。 */
