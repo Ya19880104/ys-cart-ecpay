@@ -154,8 +154,17 @@ final class EcpayLogisticsController {
 		global $wpdb;
 		$attempts = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_label_attempts';
 
-		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $attempts ) ) !== $attempts ) {
-			// 表不存在（核心未升級）＝證明不了，但也不該無限重送。交給既有的
+		$exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $attempts ) );
+
+		// 🔴 `SHOW TABLES` 也會失敗（連線斷了、權限被撤）。把失敗讀成「表不存在」
+		// 就會走到「不是我們的單」→ ACK，而那是不可逆的。查不動時回 error，
+		// 呼叫端會回 503 讓對方重送。
+		if ( '' !== (string) $wpdb->last_error ) {
+			return 'error';
+		}
+
+		if ( $exists !== $attempts ) {
+			// 表確實不存在（核心未升級）＝證明不了，但也不該無限重送。交給既有的
 			// 核心版本 gate 處理，這裡當成「不是我們的」。
 			return 'not_found';
 		}
@@ -294,14 +303,23 @@ final class EcpayLogisticsController {
 		if ( ! is_array( $payment_detail ) ) {
 			$payment_detail = [];
 		}
-		$payment_detail['shipping'] = array_merge( (array) ( $payment_detail['shipping'] ?? [] ), [
-			'provider'             => 'ecpay',
-			'allpay_logistics_id'  => (string) ( $params['AllPayLogisticsID'] ?? '' ),
-			'logistics_status'     => $status,
-			'logistics_status_msg' => (string) ( $params['LogisticsStatusName'] ?? $params['RtnMsg'] ?? '' ),
-			'tracking_number'      => $tracking,
-			'updated_at'           => current_time( 'mysql' ),
-		] );
+		// 🔴 狀態類的欄位只在 pipeline 允許前進時才覆寫。
+		// 遲到／亂序的通知若照樣寫進投影，訂單狀態說「已取貨」而 payment_detail
+		// 說「配送中」——同一件事兩邊各說各話，而我們還 ACK 了。
+		// 憑據類（物流編號、追蹤碼）不受影響：它們是補齊，不是倒退。
+		$projection = [
+			'provider'            => 'ecpay',
+			'allpay_logistics_id' => (string) ( $params['AllPayLogisticsID'] ?? '' ),
+			'tracking_number'     => $tracking,
+			'updated_at'          => current_time( 'mysql' ),
+		];
+
+		if ( $status_advance_allowed ) {
+			$projection['logistics_status']     = $status;
+			$projection['logistics_status_msg'] = (string) ( $params['LogisticsStatusName'] ?? $params['RtnMsg'] ?? '' );
+		}
+
+		$payment_detail['shipping'] = array_merge( (array) ( $payment_detail['shipping'] ?? [] ), $projection );
 
 		$order_update = [
 			'payment_detail'  => wp_json_encode( $payment_detail ),

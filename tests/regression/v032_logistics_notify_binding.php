@@ -84,6 +84,8 @@ namespace {
         public bool $attempt_read_fails = false;
         /** 授權表存不存在（舊核心）。 */
         public bool $attempts_table_exists = true;
+        /** 連 SHOW TABLES 都查不動（連線斷了、權限被撤）。 */
+        public bool $show_tables_fails = false;
         /** readback 時 label 的追蹤碼（sync_label 會比對）。 */
         public string $readback_tracking = '';
         /** @var array<int,array{table:string,data:array<string,mixed>,where:array<string,mixed>}> */
@@ -100,6 +102,10 @@ namespace {
             $this->last_error = '';
 
             if (false !== strpos($sql, 'SHOW TABLES LIKE')) {
+                if ($this->show_tables_fails) {
+                    $this->last_error = 'MySQL server has gone away';
+                    return null;
+                }
                 preg_match("/LIKE '([^']*)'/", $sql, $m);
                 $table = $m[1] ?? '';
                 if (false !== strpos($table, 'shipping_label_attempts') && !$this->attempts_table_exists) {
@@ -419,18 +425,46 @@ namespace {
         503 === notify(base_notify())
     );
 
+    // 🔴 連 `SHOW TABLES` 都可能失敗（連線斷了、權限被撤）。把它讀成「表不存在」
+    // 就會走到「不是我們的單」→ ACK，而 ACK 不可逆。
+    $wpdb = seed_label();
+    $wpdb->label = null;
+    $wpdb->show_tables_fails = true;
+    check(
+        '(t2) SHOW TABLES 查不動時回 503（不得讀成「表不存在」而 ACK）',
+        503 === notify(base_notify())
+    );
+
     // pipeline 拒絕轉換（遲到／亂序的通知）：ACK 沒問題，但**不得**把 label 的
     // 狀態寫回一個更早的值——那會讓訂單與 label 各說各話。
     $wpdb = seed_label();
     pipeline_reset([ 'success' => false, 'persisted' => true, 'message' => '不允許的轉換' ]);
     $code   = notify(base_notify([ 'LogisticsStatus' => '2030' ]));
     $update = $wpdb->updates[0]['data'] ?? [];
+    $order_projection = [];
+    foreach (YSOrder::$updates as $u) {
+        if (array_key_exists('payment_detail', $u)) {
+            $decoded          = json_decode((string) $u['payment_detail'], true);
+            $order_projection = (array) (($decoded['shipping'] ?? []));
+        }
+    }
+
     check(
         '(u) pipeline 拒絕轉換時照樣 ACK，但不寫 label 狀態（不倒退）',
         200 === $code
             && ! array_key_exists('status', $update)
             && ! array_key_exists('status_code', $update)
             && 'BN999' === ($update['tracking_number'] ?? '')
+    );
+
+    // 🔴 訂單那一側的投影同樣不得倒退——否則訂單說「已取貨」、payment_detail
+    // 說「配送中」，而我們還 ACK 了。憑據類欄位仍然要補上。
+    check(
+        '(u2) pipeline 拒絕轉換時 payment_detail 的狀態投影也不被覆寫',
+        ! array_key_exists('logistics_status', $order_projection)
+            && ! array_key_exists('logistics_status_msg', $order_projection)
+            && 'BN999' === ($order_projection['tracking_number'] ?? '')
+            && '900000001' === ($order_projection['allpay_logistics_id'] ?? '')
     );
 
     // pipeline 寫不進去＝retryable，而且必須在**動任何東西之前**就擋下來。

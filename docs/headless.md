@@ -19,6 +19,13 @@ Without an identifiable shopper the map endpoint refuses to open — that is
 deliberate: issuing a token whose owner is unknown means checkout would reject
 it later, after the customer has already picked a store.
 
+**Send the same header on every cart and checkout call.** Since core 2.56.6 the
+cart itself resolves its identity from this header when no cookie is present, so
+a request without it lands on a *different, empty* cart than the one you built.
+
+The token must be the 32-character value the core cart API issued; anything else
+is ignored (it would otherwise let any string mint a cart).
+
 ## Requesting the map form
 
 `payment_method` is **required**. ECPay filters the store list by whether the
@@ -107,9 +114,15 @@ YsCartEcpay.submitForm(form.data.action_url, form.data.fields, '_blank');
 
 const selection = JSON.parse(localStorage.getItem('ys_ec_selected_store'));
 
-await fetch('/wp-json/ys-ecommerce/v1/checkout/process', {
+await fetch('/wp-json/ys-ecommerce-headless/v1/checkout/process', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    // guests: the same identity that owns the store token — and, since core
+    // 2.56.6, the same identity that owns the cart. Omit it and you are
+    // checking out a different (empty) cart than the one you built.
+    'X-YS-Guest-Token': guestCartToken,
+  },
   body: JSON.stringify({
     shipping_method: selection.shipping_id,
     payment_method:  selectedPaymentMethod,

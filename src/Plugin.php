@@ -9,6 +9,7 @@ use YangSheep\Ecommerce\Api\Storefront\YSRequestParser;
 use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
 use YangSheep\Ecommerce\Api\Storefront\YSRestResponder;
 use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
+use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
@@ -68,7 +69,7 @@ final class Plugin {
 			];
 		}
 
-		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.5';
+		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.6';
 		if ( version_compare( (string) YS_ECOMMERCE_VERSION, $required, '<' ) ) {
 			return [
 				'met'     => false,
@@ -103,7 +104,7 @@ final class Plugin {
 			return [
 				'met'     => false,
 				'reason'  => 'core_schema_not_ready',
-				'message' => 'YS CART 的物流資料表尚未完成 v2.56.5 升級（欄位或索引缺失），'
+				'message' => 'YS CART 的物流資料表尚未完成 v2.56.6 升級（欄位或索引缺失），'
 					. '綠界物流方式未註冊。請重新啟用 YS CART 以完成升級。',
 			];
 		}
@@ -138,7 +139,7 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
 		add_filter( 'ys_ec_validate_store_selection', [ $this, 'validate_store_selection' ], 10, 4 );
-		add_filter( 'ys_ec_claim_store_selection', [ $this, 'claim_store_selection' ], 10, 4 );
+		add_filter( 'ys_ec_claim_store_selection', [ $this, 'claim_store_selection' ], 10, 5 );
 	}
 
 	/**
@@ -183,7 +184,7 @@ final class Plugin {
 	 * @param array<string,mixed> $data
 	 * @return string|null
 	 */
-	public function claim_store_selection( $error, $data, string $shipping_method, string $payment_method ) {
+	public function claim_store_selection( $error, $data, string $shipping_method, string $payment_method, $order_id = 0 ) {
 		// 前面已經有人擋下來了就不要覆蓋。
 		if ( is_string( $error ) && '' !== $error ) {
 			return $error;
@@ -193,11 +194,39 @@ final class Plugin {
 			return $error;
 		}
 
-		return EcpayStoreSelector::claim_selection(
+		$claim = EcpayStoreSelector::claim_selection_authoritative(
 			is_array( $data ) ? $data : [],
 			$shipping_method,
 			$payment_method
 		);
+
+		if ( null !== $claim['error'] ) {
+			return $claim['error'];
+		}
+
+		// 🔴 用**伺服器保存的**門市資料覆寫訂單。
+		//
+		// 驗證只比得了門市代號（那是唯一有權威副本可比的欄位）；名稱與地址是
+		// 前端從 localStorage 送上來的，代號對得上也照樣可以被改成任何字串——
+		// 而那兩個欄位會原樣出現在出貨單、通知信與客服畫面上。
+		$this->apply_authoritative_store( (int) $order_id, $claim['store'] );
+
+		return null;
+	}
+
+	/**
+	 * @param array<string,string> $store
+	 */
+	private function apply_authoritative_store( int $order_id, array $store ): void {
+		if ( $order_id <= 0 || [] === $store || '' === ( $store['cvs_store_id'] ?? '' ) ) {
+			return;
+		}
+
+		if ( ! class_exists( YSOrder::class ) || ! method_exists( YSOrder::class, 'update' ) ) {
+			return;
+		}
+
+		YSOrder::update( $order_id, $store );
 	}
 
 	private function is_cvs_method( string $shipping_method ): bool {
@@ -523,7 +552,14 @@ final class Plugin {
 			// 在該 scope 尚無購物車時仍進入讀取路徑，觸發 get_or_create_session() 產生
 			// 新 session cookie（純讀請求不該有此副作用），且讀到的是另一個 scope 的車。
 			$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
-			if ( empty( $_COOKIE[ $cookie ] ) ) {
+
+			// headless 前端在另一個 origin 時沒有我方 cookie，訪客身分來自
+			// `X-YS-Guest-Token`（核心的購物車自 2.56.6 起也認它）。少了這一條，
+			// header-only 的訪客會被當成空車，於是所有物流方式都「不受商品限制」。
+			$has_guest_token = method_exists( $handler, 'guest_token_for_cart' )
+				&& '' !== $handler::guest_token_for_cart();
+
+			if ( empty( $_COOKIE[ $cookie ] ) && ! $has_guest_token ) {
 				return [];
 			}
 		}

@@ -319,12 +319,33 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed> $data 結帳送出的資料
 	 */
 	public static function claim_selection( array $data, string $shipping_id, string $payment_method ): ?string {
+		return self::claim_selection_authoritative( $data, $shipping_id, $payment_method )['error'];
+	}
+
+	/**
+	 * 認領，並把**伺服器保存的門市資料**一起交回去。
+	 *
+	 * 🔴 只比對門市代號是不夠的。名稱與地址是跟著代號一起從綠界回來的，但結帳
+	 * 送上來的是前端 localStorage 裡那一份——代號對得上、名稱地址卻可以被改成
+	 * 任何字串，而那兩個欄位會原樣印在出貨單與通知信上。權威資料一直都存在
+	 * 伺服器這一側，用它覆寫就沒有這個問題。
+	 *
+	 * @param array<string,mixed> $data
+	 * @return array{error:?string,store:array<string,string>}
+	 */
+	public static function claim_selection_authoritative( array $data, string $shipping_id, string $payment_method ): array {
 		$rejection = self::verify_selection( $data, $shipping_id, $payment_method );
 		if ( null !== $rejection ) {
-			return $rejection;
+			return [ 'error' => $rejection, 'store' => [] ];
 		}
 
-		$token = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		$token  = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		$record = get_transient( self::SELECTION_PREFIX . $token );
+		$store  = is_array( $record ) ? [
+			'cvs_store_id'   => (string) ( $record['store_id'] ?? '' ),
+			'cvs_store_name' => (string) ( $record['store_name'] ?? '' ),
+			'cvs_store_addr' => (string) ( $record['store_address'] ?? '' ),
+		] : [];
 
 		// 🔴 一次性消耗必須是**原子的**。
 		//
@@ -337,10 +358,10 @@ final class EcpayStoreSelector {
 		// WordPress 的 `delete_transient()` 最終走到 `wp_cache_delete()` 或
 		// `delete_option()`，兩者對「那一列本來就不在」都回 false。
 		if ( ! delete_transient( self::SELECTION_PREFIX . $token ) ) {
-			return '這次的取貨門市選擇已被使用，請重新選擇門市。';
+			return [ 'error' => '這次的取貨門市選擇已被使用，請重新選擇門市。', 'store' => [] ];
 		}
 
-		return null;
+		return [ 'error' => null, 'store' => $store ];
 	}
 
 	/**

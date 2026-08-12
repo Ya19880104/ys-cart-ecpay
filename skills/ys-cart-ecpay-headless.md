@@ -2,7 +2,7 @@
 
 Use this when integrating ECPay with a headless YS CART checkout.
 
-1. Let YS CART `/checkout/process` handle payment creation.
+1. Let YS CART `/wp-json/ys-ecommerce-headless/v1/checkout/process` handle payment creation. Guests must send `X-YS-Guest-Token` on **every** cart and checkout call — since core 2.56.6 the cart resolves its identity from that header when there is no cookie, so omitting it checks out a different (empty) cart.
 2. If the response contains `form_data.action_url`, submit the returned `fields` as a POST form to ECPay.
 3. For ECPay CVS shipping, call `/stores/ecpay/map-url` with the selected shipping method ID as `shipping_id` **and the customer's currently selected `payment_method`** (required since v0.2.12 — ECPay filters stores by cash-on-delivery mode). The bundled SDK helper is `YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`.
 4. Identify the shopper before opening the map. The token's owner is decided on the **map request** (a same-origin call that carries cookies), never on ECPay's callback — that callback is a cross-site POST and has none of your cookies. Guests on another origin must send the core `X-YS-Guest-Token`; call `YsCartEcpay.setGuestToken(token)` and the SDK adds it. With no identifiable shopper the endpoint refuses to open the map rather than issue a token checkout would later reject.

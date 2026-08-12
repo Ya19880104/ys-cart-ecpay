@@ -360,12 +360,12 @@ namespace {
     // cookie、改用 header，地圖要開得起來、憑證要能用；換一個 token 就不能用。
     $cookie_backup = $_COOKIE;
     $_COOKIE       = [];
-    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guest-token-aaa';
+    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guesttokenaaaaaaaaaaaaaaaaaaaaaa';
 
     $headless_token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
     $headless_ok    = verify($headless_token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
 
-    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guest-token-bbb';
+    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guesttokenbbbbbbbbbbbbbbbbbbbbbb';
     $headless_other = verify($headless_token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
 
     unset($_SERVER['HTTP_X_YS_GUEST_TOKEN']);
@@ -381,8 +381,38 @@ namespace {
             && false === $headless_none
     );
 
+    // 🔴 憑證裡的門市名稱與地址是**權威**的，不是裝飾。
+    // 只比對門市代號的話，前端可以把名稱地址改成任何字串——而那兩個欄位會原樣
+    // 出現在出貨單與通知信上。認領時要把伺服器那一份交出來。
+    $token  = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $claim  = EcpayStoreSelector::claim_selection_authoritative(
+        [
+            'ecpay_store_token' => $token,
+            'cvs_store_id'      => '001234',
+            'cart_scope'        => 'default',
+            // 前端把名稱與地址改掉了
+            'cvs_store_name'    => '被竄改的門市',
+            'cvs_store_addr'    => '不存在的地址',
+        ],
+        'ys_ec_ecpay_ship_family',
+        'ys_ec_credit'
+    );
+    check(
+        '(q6) 認領時交回伺服器保存的門市名稱與地址（不是前端送上來的）',
+        null === $claim['error']
+            && '001234' === ($claim['store']['cvs_store_id'] ?? '')
+            && '測試門市' === ($claim['store']['cvs_store_name'] ?? '')
+            && '台北市中正區測試路 1 號' === ($claim['store']['cvs_store_addr'] ?? '')
+    );
+
     // 文件必須跟著契約走：payload、SDK 簽名、訪客身分、兩階段消耗。
     $doc = (string) file_get_contents(dirname(__DIR__, 2) . '/docs/headless.md');
+    check(
+        '(q7) headless 文件的結帳 endpoint 帶 -headless namespace，範例也帶訪客身分',
+        false !== strpos($doc, 'ys-ecommerce-headless/v1/checkout/process')
+            && 1 === preg_match("/checkout\/process.*?'X-YS-Guest-Token'/s", $doc)
+    );
+
     check(
         '(q5) headless 文件已更新（payment_method、guest token、SDK 簽名、消耗時機）',
         false !== strpos($doc, '"payment_method"')

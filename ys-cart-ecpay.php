@@ -39,8 +39,8 @@ spl_autoload_register(
 	}
 );
 
-/** 本外掛要求的 YS CART 核心最低版本（物流落盤契約與建單授權都在 2.56.5）。 */
-define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.5' );
+/** 本外掛要求的 YS CART 核心最低版本（建單授權在 2.56.5，訂單級鎖與其修復在 2.56.6）。 */
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.6' );
 
 add_action(
 	'plugins_loaded',
