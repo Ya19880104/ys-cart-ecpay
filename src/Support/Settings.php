@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\Ecommerce\YSEcommerce;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 
 final class Settings {
 	public const ENABLED = 'ys_ec_ecpay_enabled';
@@ -25,17 +26,35 @@ final class Settings {
 		'hash_iv'     => 'ys_ec_ecpay_logistics_hash_iv',
 	];
 
-	public const METHOD_KEYS = [
-		'credit'         => 'ys_ec_ecpay_credit_enabled',
-		'atm'            => 'ys_ec_ecpay_atm_enabled',
-		'cvs'            => 'ys_ec_ecpay_cvs_enabled',
-		'barcode'        => 'ys_ec_ecpay_barcode_enabled',
-		'ship_family'    => 'ys_ec_ecpay_ship_family_enabled',
-		'ship_unimart'   => 'ys_ec_ecpay_ship_unimart_enabled',
-		'ship_hilife'    => 'ys_ec_ecpay_ship_hilife_enabled',
-		'ship_tcat'      => 'ys_ec_ecpay_ship_tcat_enabled',
-		'ship_post'      => 'ys_ec_ecpay_ship_post_enabled',
+	/**
+	 * 金流方式的啟用開關。
+	 *
+	 * 物流的部分**不在這裡**——它由 {@see EcpayShippingCatalog} 導出（見
+	 * {@see self::method_keys()}）。抄第二份清單正是「後台勾得到、卻註冊不進去」
+	 * 這類半開狀態的來源。
+	 */
+	public const PAYMENT_METHOD_KEYS = [
+		'credit'  => 'ys_ec_ecpay_credit_enabled',
+		'atm'     => 'ys_ec_ecpay_atm_enabled',
+		'cvs'     => 'ys_ec_ecpay_cvs_enabled',
+		'barcode' => 'ys_ec_ecpay_barcode_enabled',
 	];
+
+	/**
+	 * alias → 啟用開關設定 key（金流 ＋ 物流）。
+	 *
+	 * @return array<string,string>
+	 */
+	public static function method_keys(): array {
+		return self::PAYMENT_METHOD_KEYS + EcpayShippingCatalog::enabled_option_by_alias();
+	}
+
+	/**
+	 * 單一 alias 的啟用開關設定 key；未知 alias 回空字串。
+	 */
+	public static function method_key( string $alias ): string {
+		return (string) ( self::method_keys()[ $alias ] ?? '' );
+	}
 
 	public const SENDER_KEYS = [
 		'name'    => 'shipping_ecpay_sender_name',
@@ -57,11 +76,13 @@ final class Settings {
 	}
 
 	public static function gateway_enabled( string $key ): bool {
-		return self::enabled() && '1' === (string) self::get( self::METHOD_KEYS[ $key ] ?? '', '0' );
+		$setting_key = self::method_key( $key );
+		return '' !== $setting_key && self::enabled() && '1' === (string) self::get( $setting_key, '0' );
 	}
 
 	public static function shipping_enabled( string $key ): bool {
-		return self::enabled() && '1' === (string) self::get( self::METHOD_KEYS[ $key ] ?? '', '0' );
+		$setting_key = self::method_key( $key );
+		return '' !== $setting_key && self::enabled() && '1' === (string) self::get( $setting_key, '0' );
 	}
 
 	/**

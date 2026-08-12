@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -40,12 +41,97 @@ final class EcpayLogisticsController {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
 
-		$order = $this->find_order( $params );
+		$label = $this->find_label( $params );
+		if ( null === $label ) {
+			// 找不到對應的物流單就不要動任何訂單。回 1|OK 是為了讓綠界停止重送
+			// （這不是我們的單），但**什麼都不寫**。
+			$this->respond_text( '1|OK' );
+		}
+
+		// 🔴 綁定必須逐項相符，缺欄位也拒絕。
+		//
+		// 舊版只用一個 AllPayLogisticsID 認人，而且 MerchantTradeNo／
+		// LogisticsSubType 寫成「有傳才比」——不傳就自動通過。B2C 與 C2C 是兩份
+		// 不同的合約、兩組不同的編號空間，這樣認人遲早會把狀態寫到別人的訂單上。
+		if ( ! $this->binding_matches( $label, $params ) ) {
+			$this->respond_text( '0|Logistics binding mismatch', 400 );
+		}
+
+		$order = $this->find_order_by_label( $label );
 		if ( $order ) {
-			$this->update_order_shipping( $order, $params );
+			$this->update_order_shipping( $order, $params, $label );
 		}
 
 		$this->respond_text( '1|OK' );
+	}
+
+	/**
+	 * 依物流編號找出本站的物流單列。
+	 *
+	 * @param array<string,string> $params
+	 */
+	private function find_label( array $params ): ?object {
+		$logistics_id = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
+		if ( '' === $logistics_id ) {
+			return null;
+		}
+
+		global $wpdb;
+		$labels_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
+		$label        = $wpdb->get_row( $wpdb->prepare(
+			"SELECT * FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s ORDER BY id DESC LIMIT 1",
+			'ecpay',
+			$logistics_id
+		) );
+
+		return $label ?: null;
+	}
+
+	/**
+	 * 這則通知是不是真的屬於這張物流單。
+	 *
+	 * 三道都必須通過：
+	 *   1. `MerchantTradeNo` 必須帶，且（已落盤時）與建單當初的完全相同。
+	 *   2. `LogisticsSubType` 必須帶，且與這個物流方式在型錄中的 subtype 相同。
+	 *   3. 這張 label 的 shipping_method 必須是本外掛型錄裡的方式。
+	 *
+	 * 第 2 道刻意以**型錄**為準而不是只看 label 落盤值：升級前建立的舊單沒有
+	 * 落盤 subtype，但它的 shipping_method 一定在型錄裡，因此仍然驗得出來。
+	 *
+	 * @param array<string,string> $params
+	 */
+	private function binding_matches( object $label, array $params ): bool {
+		$descriptor = EcpayShippingCatalog::get( (string) ( $label->shipping_method ?? '' ) );
+		if ( null === $descriptor ) {
+			return false;
+		}
+
+		foreach ( [ 'MerchantTradeNo', 'LogisticsSubType' ] as $field ) {
+			if ( ! array_key_exists( $field, $params ) || '' === trim( (string) $params[ $field ] ) ) {
+				return false;
+			}
+		}
+
+		$stored_trade_no = trim( (string) ( $label->merchant_trade_no ?? '' ) );
+		if ( '' !== $stored_trade_no && trim( (string) $params['MerchantTradeNo'] ) !== $stored_trade_no ) {
+			return false;
+		}
+
+		$stored_subtype   = trim( (string) ( $label->logistics_subtype ?? '' ) );
+		$expected_subtype = '' !== $stored_subtype ? $stored_subtype : (string) $descriptor['logistics_subtype'];
+
+		return trim( (string) $params['LogisticsSubType'] ) === $expected_subtype;
+	}
+
+	private function find_order_by_label( object $label ): ?object {
+		global $wpdb;
+		$orders_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
+		$order        = $wpdb->get_row( $wpdb->prepare(
+			"SELECT * FROM {$orders_table} WHERE id = %d",
+			(int) $label->order_id
+		) );
+
+		return $order ?: null;
 	}
 
 	/**
@@ -80,35 +166,15 @@ final class EcpayLogisticsController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function find_order( array $params ): ?object {
-		$logistics_id = (string) ( $params['AllPayLogisticsID'] ?? '' );
-		if ( '' === $logistics_id ) {
-			return null;
+	private function update_order_shipping( object $order, array $params, object $label ): void {
+		// 追蹤碼優先取託運單號；沒有時才退回物流編號。
+		// 🔴 寄貨編號（CVSPaymentNo）**不是**追蹤碼，不要混進來——它是賣家交貨用的
+		// 憑據，另外落盤。
+		$tracking = trim( (string) ( $params['BookingNote'] ?? '' ) );
+		if ( '' === $tracking ) {
+			$tracking = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
 		}
-
-		global $wpdb;
-		$orders_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
-		$labels_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
-		$order = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT o.* FROM {$orders_table} o
-				 INNER JOIN {$labels_table} l ON l.order_id = o.id
-				 WHERE l.provider = %s AND l.provider_trade_no = %s
-				 ORDER BY l.id DESC LIMIT 1",
-				'ecpay',
-				$logistics_id
-			)
-		);
-
-		return $order ?: null;
-	}
-
-	/**
-	 * @param array<string,string> $params
-	 */
-	private function update_order_shipping( object $order, array $params ): void {
-		$tracking = (string) ( $params['CVSPaymentNo'] ?? $params['BookingNote'] ?? $params['AllPayLogisticsID'] ?? '' );
-		$status   = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
+		$status = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
 
 		$payment_detail = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
 		if ( ! is_array( $payment_detail ) ) {
@@ -134,7 +200,7 @@ final class EcpayLogisticsController {
 
 		YSOrder::update( (int) $order->id, $order_update );
 
-		$this->sync_label( (int) $order->id, (string) ( $params['AllPayLogisticsID'] ?? '' ), $tracking, $status );
+		$this->sync_label( $label, $params, $tracking, $status );
 
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
 			YSShippingPipelineService::advance_from_carrier_status(
@@ -155,25 +221,42 @@ final class EcpayLogisticsController {
 		return 'in_transit';
 	}
 
-	private function sync_label( int $order_id, string $provider_trade_no, string $tracking, string $status ): void {
-		if ( '' === $provider_trade_no ) {
-			return;
-		}
-
+	/**
+	 * 更新這**一張**物流單。
+	 *
+	 * 🔴 舊版以 (order_id, provider_trade_no) 當條件更新，同一張訂單有多張物流單
+	 * 時可能一次改到不只一列。綁定既然已經驗到具體那一列，就直接以主鍵更新。
+	 *
+	 * @param array<string,string> $params
+	 */
+	private function sync_label( object $label, array $params, string $tracking, string $status ): void {
 		global $wpdb;
 		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
-		$wpdb->update(
-			$table,
-			[
-				'tracking_number' => $tracking,
-				'status'          => $this->map_status( $status ),
-				'updated_at'      => current_time( 'mysql' ),
-			],
-			[
-				'order_id'          => $order_id,
-				'provider_trade_no' => $provider_trade_no,
-			]
-		);
+
+		$update = [
+			'status'            => $this->map_status( $status ),
+			'status_code'       => $status,
+			'status_updated_at' => current_time( 'mysql' ),
+			'updated_at'        => current_time( 'mysql' ),
+		];
+
+		if ( '' !== $tracking ) {
+			$update['tracking_number'] = $tracking;
+		}
+
+		// C2C 的寄件憑據有可能在通知裡才補齊；有帶就補上，但**不覆蓋**既有值——
+		// 建單當下拿到的那一份才是權威。
+		$carried = [
+			'cvs_payment_no' => trim( (string) ( $params['CVSPaymentNo'] ?? '' ) ),
+			'validation_no'  => trim( (string) ( $params['CVSValidationNo'] ?? '' ) ),
+		];
+		foreach ( $carried as $column => $value ) {
+			if ( '' !== $value && '' === trim( (string) ( $label->{$column} ?? '' ) ) ) {
+				$update[ $column ] = $value;
+			}
+		}
+
+		$wpdb->update( $table, $update, [ 'id' => (int) $label->id ] );
 	}
 
 	private function respond_text( string $body, int $status = 200 ): void {

@@ -22,12 +22,8 @@ use YangSheep\YSCartEcpay\Payment\EcpayCvsGateway;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamily;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingHilife;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingPost;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimart;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -41,13 +37,14 @@ final class Plugin {
 		'ys_ec_ecpay_barcode',
 	];
 
-	private const REGISTERED_SHIPPING_IDS = [
-		'ys_ec_ecpay_ship_family',
-		'ys_ec_ecpay_ship_unimart',
-		'ys_ec_ecpay_ship_hilife',
-		'ys_ec_ecpay_ship_tcat',
-		'ys_ec_ecpay_ship_post',
-	];
+	/**
+	 * 本外掛註冊的物流方式 ID——由型錄導出，不維護第二份清單。
+	 *
+	 * @return array<int,string>
+	 */
+	private static function registered_shipping_ids(): array {
+		return EcpayShippingCatalog::ids();
+	}
 
 	public static function instance(): self {
 		if ( null === self::$instance ) {
@@ -129,24 +126,22 @@ final class Plugin {
 			return;
 		}
 
-		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_family' ) ) {
-			YSShippingRegistry::register( new EcpayShippingFamily() );
-		}
+		// 逐一由型錄註冊。加一個方式＝在型錄加一列，這裡不需要動——
+		// 「型錄加了、註冊忘了」在語法上不可能發生。
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			if ( ! $this->is_method_enabled( 'shipping', $method_id ) ) {
+				continue;
+			}
 
-		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_unimart' ) ) {
-			YSShippingRegistry::register( new EcpayShippingUnimart() );
-		}
+			$class = (string) $descriptor['class'];
+			if ( ! class_exists( $class ) ) {
+				continue;
+			}
 
-		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_hilife' ) ) {
-			YSShippingRegistry::register( new EcpayShippingHilife() );
-		}
-
-		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_tcat' ) ) {
-			YSShippingRegistry::register( new EcpayShippingTcat() );
-		}
-
-		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_post' ) ) {
-			YSShippingRegistry::register( new EcpayShippingPost() );
+			$method = new $class();
+			if ( $method instanceof EcpayShipping ) {
+				YSShippingRegistry::register( $method );
+			}
 		}
 	}
 
@@ -222,11 +217,38 @@ final class Plugin {
 			return YSRestResponder::error( 'missing_shipping_id', '缺少物流方式 ID。' );
 		}
 
+		// 🔴 付款方式決定電子地圖要用「代收」還是「不代收」去篩門市，而綠界對兩者
+		// 給的門市清單不同。缺這個欄位不是「預設不代收」，是**無法證明**——
+		// 猜錯的代價是顧客選得到門市、結完帳、送單當下才被綠界拒絕。
+		if ( ! isset( $params['payment_method'] ) ) {
+			return YSRestResponder::error(
+				'missing_payment_method',
+				'缺少付款方式，無法決定電子地圖的代收模式。'
+			);
+		}
+
+		$payment_method = sanitize_text_field( (string) $params['payment_method'] );
+
 		if ( ! $this->is_method_enabled( 'shipping', $shipping_id ) ) {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
-		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url );
+		// 本端點不接受訂單 ID。以 `0 === $order_id` 分流等於任何非零值都能整段跳過
+		// 下方守門，而 order_id 直接取自請求、不驗訂單存在、擁有者或品項——呼叫端
+		// 可自行偽造以繞過商品物流限制。兩個既有呼叫端都不送此參數，故直接拒收。
+		if ( 0 !== $order_id ) {
+			return YSRestResponder::error( 'order_id_not_supported', '本端點不接受訂單 ID。' );
+		}
+
+		// 與核心結帳共用同一份守門：只驗 provider／全域啟用狀態是不夠的，未驗購物車
+		// 商品的「允許的物流方式」交集時，可對商品禁用的 sub-type 簽發**已簽章**的
+		// 電子地圖表單——使用者選完門市、callback 也寫進 session 與 localStorage，
+		// 直到送單才被擋。fail-closed：購物車讀取失敗亦視為不允許。
+		if ( ! $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope ) ) {
+			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
+		}
+
+		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url, $payment_method );
 		if ( $result ) {
 			return YSRestResponder::success( 'map_url_ready', '', $result );
 		}
@@ -241,6 +263,82 @@ final class Plugin {
 		}
 
 		return $scope;
+	}
+
+	/**
+	 * 購物車商品是否允許此物流方式
+	 *
+	 * 與核心結帳共用 `YSShippingRegistry::is_method_allowed_for_cart()` 這一份守門，
+	 * 避免 provider 端自建平行邏輯而與核心漂移。
+	 *
+	 * 🔴 核心述詞不存在時一律拒絕。回 true 以「相容舊核心」等於整道守門在舊核心上
+	 * 不存在——而發版順序（先發核心再發本外掛）是流程約定，不能取代 runtime gate：
+	 * 任何降版、部分部署或安裝順序錯誤都會讓守門靜默消失。
+	 *
+	 * @param string $shipping_id 物流方式 ID
+	 * @param string $cart_scope  已消毒的購物車 scope
+	 */
+	private function is_shipping_allowed_for_cart( string $shipping_id, string $cart_scope ): bool {
+		if ( ! class_exists( YSShippingRegistry::class )
+			|| ! method_exists( YSShippingRegistry::class, 'is_method_allowed_for_cart' ) ) {
+			return false;
+		}
+
+		$items = self::read_cart_items( $cart_scope );
+		if ( null === $items ) {
+			// 讀不到購物車 ≠ 空購物車。核心把空車視為「不限物流」，若把讀取失敗
+			// 一併轉成空陣列，失敗反而會簽發地圖表單。此處分流並 fail-closed。
+			return false;
+		}
+
+		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, $items );
+	}
+
+	/**
+	 * 純讀取指定 scope 的購物車品項
+	 *
+	 * 以 `ys_ec_cart_key_scope` filter 綁定 scope，取核心的 error-aware
+	 * `try_get_items_raw()`（單一 SELECT，不計算總額、不觸發 cart 事件、不寫入）。
+	 * 訪客若尚無 session cookie 代表購物車必為空，直接短路以避免
+	 * `get_or_create_session()` 的 `setcookie()` 副作用。
+	 *
+	 * 回傳陣列＝讀取成功（空陣列＝確定為空購物車）；回傳 null＝讀取失敗，呼叫端
+	 * 必須 fail-closed。兩者不可混為一談：核心把空購物車視為「不限物流」。
+	 *
+	 * @return array<int,array<string,mixed>>|null
+	 */
+	private static function read_cart_items( string $cart_scope ): ?array {
+		$handler = '\\YangSheep\\Ecommerce\\Handlers\\YSCartHandler';
+
+		// 必須有 error-aware 的 typed API。舊核心的 get_items_raw() 在 load_from_db()
+		// 內就把「SQL 錯誤」「items 壞 JSON」「查無 row」全部抹平成 []，而空車在核心
+		// 語意等於「無商品設限」——用它做守門，讀取失敗必然 fail-open。API 不存在即拒絕。
+		if ( ! class_exists( $handler ) || ! method_exists( $handler, 'try_get_items_raw' ) ) {
+			return null;
+		}
+
+		if ( ! is_user_logged_in() ) {
+			// 只檢查**本 scope** 的 cookie。額外接受 default cookie 會讓非 default scope
+			// 在該 scope 尚無購物車時仍進入讀取路徑，觸發 get_or_create_session() 產生
+			// 新 session cookie（純讀請求不該有此副作用），且讀到的是另一個 scope 的車。
+			$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
+			if ( empty( $_COOKIE[ $cookie ] ) ) {
+				return [];
+			}
+		}
+
+		$scoper = static function ( $current ) use ( $cart_scope ) {
+			return 'default' === $current ? $cart_scope : $current;
+		};
+		add_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
+		try {
+			$items = $handler::get_instance()->try_get_items_raw();
+			return is_array( $items ) ? $items : null;
+		} catch ( \Throwable $e ) {
+			return null;
+		} finally {
+			remove_filter( 'ys_ec_cart_key_scope', $scoper, 1 );
+		}
 	}
 
 	public function register_shipping_requester( $requester, $method ) {
@@ -344,7 +442,7 @@ final class Plugin {
 			return false;
 		}
 
-		foreach ( self::REGISTERED_SHIPPING_IDS as $method_id ) {
+		foreach ( self::registered_shipping_ids() as $method_id ) {
 			if ( $this->is_method_enabled( 'shipping', $method_id ) ) {
 				return true;
 			}
@@ -369,14 +467,8 @@ final class Plugin {
 		}
 
 		if ( 'shipping' === $domain ) {
-			$legacy_map = [
-				'ys_ec_ecpay_ship_family'  => 'ship_family',
-				'ys_ec_ecpay_ship_unimart' => 'ship_unimart',
-				'ys_ec_ecpay_ship_hilife'  => 'ship_hilife',
-				'ys_ec_ecpay_ship_tcat'    => 'ship_tcat',
-				'ys_ec_ecpay_ship_post'    => 'ship_post',
-			];
-			return isset( $legacy_map[ $method_id ] ) && Settings::shipping_enabled( $legacy_map[ $method_id ] );
+			$alias = EcpayShippingCatalog::id_to_alias()[ $method_id ] ?? '';
+			return '' !== $alias && Settings::shipping_enabled( $alias );
 		}
 
 		return false;

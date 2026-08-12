@@ -33,46 +33,10 @@ return [
 			'test_mode_available'  => true,
 		],
 		'shipping' => [
-			'methods'             => [
-				[
-					'id'             => 'ys_ec_ecpay_ship_family',
-					'label'          => '全家超商取貨',
-					'provider_label' => 'ECPay',
-					'class'          => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamily::class,
-					'shipping_type'  => 'cvs',
-					'store_selector' => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector::class,
-				],
-				[
-					'id'             => 'ys_ec_ecpay_ship_unimart',
-					'label'          => '7-ELEVEN 超商取貨',
-					'provider_label' => 'ECPay',
-					'class'          => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimart::class,
-					'shipping_type'  => 'cvs',
-					'store_selector' => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector::class,
-				],
-				[
-					'id'             => 'ys_ec_ecpay_ship_hilife',
-					'label'          => '萊爾富超商取貨',
-					'provider_label' => 'ECPay',
-					'class'          => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingHilife::class,
-					'shipping_type'  => 'cvs',
-					'store_selector' => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector::class,
-				],
-				[
-					'id'             => 'ys_ec_ecpay_ship_tcat',
-					'label'          => '黑貓宅配',
-					'provider_label' => 'ECPay',
-					'class'          => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat::class,
-					'shipping_type'  => 'home',
-				],
-				[
-					'id'             => 'ys_ec_ecpay_ship_post',
-					'label'          => '郵局宅配',
-					'provider_label' => 'ECPay',
-					'class'          => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingPost::class,
-					'shipping_type'  => 'home',
-				],
-			],
+			// 🔴 物流方式清單由型錄導出，這裡**不再**抄一份。
+			// 抄第二份的後果不是「少一個方式」，而是它半開著：後台勾得到、
+			// manifest 認不得，於是 provider lifecycle 一律判定停用。
+			'methods'             => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog::manifest_methods(),
 			'supported_countries' => [ 'TW' ],
 			'shipping_requester'  => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester::class,
 			'carrier_adapter'     => \YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter::class,

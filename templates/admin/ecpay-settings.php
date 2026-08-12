@@ -130,6 +130,23 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
 					<h2><?php esc_html_e( '物流方式', 'ys-cart-ecpay' ); ?></h2>
+					<p class="description">
+						<?php esc_html_e( 'B2C（大宗寄倉）與 C2C（店到店）是綠界兩份不同的合約，服務金鑰也不同，請依你實際申請的合約開啟對應的方式。', 'ys-cart-ecpay' ); ?>
+					</p>
+
+					<?php
+					$ys_ec_channel_labels = [
+						'b2c'  => __( 'B2C 大宗寄倉', 'ys-cart-ecpay' ),
+						'c2c'  => __( 'C2C 店到店', 'ys-cart-ecpay' ),
+						'home' => __( '宅配', 'ys-cart-ecpay' ),
+					];
+					$ys_ec_temp_labels    = [
+						'0001' => __( '常溫', 'ys-cart-ecpay' ),
+						'0002' => __( '冷藏', 'ys-cart-ecpay' ),
+						'0003' => __( '冷凍', 'ys-cart-ecpay' ),
+					];
+					?>
+
 					<?php foreach ( (array) $settings['shipping_methods'] as $key => $method ) : ?>
 						<div class="ys-ec-form-group">
 							<label class="ysca-switch-label">
@@ -139,12 +156,50 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 								</span>
 								<strong><?php echo esc_html( (string) ( $method['label'] ?? $key ) ); ?></strong>
 								<code class="ysca-code-pill"><?php echo esc_html( (string) ( $method['id'] ?? '' ) ); ?></code>
+								<span class="description">
+									<?php echo esc_html( (string) ( $ys_ec_channel_labels[ (string) ( $method['channel'] ?? '' ) ] ?? '' ) ); ?>
+									·
+									<?php echo esc_html( (string) ( $ys_ec_temp_labels[ (string) ( $method['temperature'] ?? '' ) ] ?? '' ) ); ?>
+									·
+									<?php echo esc_html( (string) ( $method['logistics_subtype'] ?? '' ) ); ?>
+								</span>
 							</label>
+
+							<?php if ( ! empty( $method['requires_return_store'] ) ) : ?>
+								<label class="ysca-field ysca-mt-sm">
+									<span class="ysca-field__label"><?php esc_html_e( '退貨門市代號（必填）', 'ys-cart-ecpay' ); ?></span>
+									<input class="ysca-input ysca-field--compact"
+									       type="text"
+									       name="ys_ec_ecpay_<?php echo esc_attr( (string) $key ); ?>_return_store_id"
+									       value="<?php echo esc_attr( (string) ( $method['return_store_id'] ?? '' ) ); ?>"
+									       autocomplete="off">
+									<span class="description">
+										<?php esc_html_e( '綠界規定 C2C 店到店必須指定退貨門市；未填寫時這個方式無法啟用，也不會建立物流訂單。每個通路各自填寫，不共用。', 'ys-cart-ecpay' ); ?>
+									</span>
+								</label>
+							<?php endif; ?>
+
+							<?php if ( ! empty( $method['requires_goods_weight'] ) ) : ?>
+								<label class="ysca-field ysca-mt-sm">
+									<span class="ysca-field__label"><?php esc_html_e( '包裹預設重量（公斤，必填）', 'ys-cart-ecpay' ); ?></span>
+									<input class="ysca-input ysca-field--compact"
+									       type="number" step="0.001" min="0" max="20"
+									       name="ys_ec_ecpay_<?php echo esc_attr( (string) $key ); ?>_goods_weight"
+									       value="<?php echo esc_attr( (string) ( $method['goods_weight'] ?? '' ) ); ?>">
+									<span class="description">
+										<?php esc_html_e( '綠界規定中華郵政建單必填重量（上限 20 公斤）。訂單本身算得出重量時優先使用訂單的值，此處為後援；未填寫時這個方式無法啟用。', 'ys-cart-ecpay' ); ?>
+									</span>
+								</label>
+							<?php endif; ?>
 						</div>
 					<?php endforeach; ?>
+
 					<p class="description ysca-mt-md">
 						<?php esc_html_e( '運費、免運門檻與排序由 YS CART 物流設定管理。', 'ys-cart-ecpay' ); ?>
 						<a href="<?php echo esc_url( $shipping_settings_url ); ?>"><?php esc_html_e( '前往物流設定', 'ys-cart-ecpay' ); ?></a>
+					</p>
+					<p class="description">
+						<?php esc_html_e( '貨到付款是否代收，由訂單實際的付款方式決定，不需要（也不能）在這裡另外開關。', 'ys-cart-ecpay' ); ?>
 					</p>
 				</div>
 			</div>

@@ -9,21 +9,215 @@ use YangSheep\Ecommerce\Shipping\YSShippingInterface;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
 
+/**
+ * 綠界物流方式基底
+ *
+ * 🔴 這個類別**不再**要求子類別自己回答 subtype／型別／溫層。所有 wire 屬性一律
+ * 由 {@see EcpayShippingCatalog} 依 `get_id()` 查表導出，子類別只宣告自己是誰。
+ *
+ * 理由：subtype 寫在子類別時，它就是第二份清單——電子地圖那張 SUBTYPES 表是第一份。
+ * 兩份只要有一處手滑，症狀是「地圖開得起來、送單卻被綠界拒絕」，而且兩邊各自看起來
+ * 都對。查表就沒有兩份可以不一致。
+ */
 abstract class EcpayShipping implements YSShippingInterface {
-	abstract protected function settings_key(): string;
-	abstract public function get_logistics_subtype(): string;
+	/** 每個子類別只回答這一件事。 */
+	abstract public function get_id(): string;
+
+	/**
+	 * 本方式的 descriptor；不在型錄內回 null（呼叫端一律 fail-closed）。
+	 *
+	 * @return array<string,mixed>|null
+	 */
+	final protected function descriptor(): ?array {
+		return EcpayShippingCatalog::get( $this->get_id() );
+	}
+
+	/**
+	 * wire 欄位取值：型錄裡沒有這個方式就直接中止。
+	 *
+	 * 缺 descriptor 代表這個類別根本不該被註冊；此時「猜一個預設值」會送出
+	 * 錯的 subtype／溫層，那比噴錯嚴重得多。
+	 *
+	 * @return array<string,mixed>
+	 */
+	final protected function require_descriptor(): array {
+		$descriptor = $this->descriptor();
+		if ( null === $descriptor ) {
+			throw new \RuntimeException(
+				sprintf( '綠界物流方式 %s 不在型錄（EcpayShippingCatalog）內，已中止。', $this->get_id() )
+			);
+		}
+
+		return $descriptor;
+	}
 
 	public function get_provider(): string {
 		return 'ecpay';
 	}
 
+	public function get_title(): string {
+		$descriptor = $this->descriptor();
+		return '綠界' . (string) ( $descriptor['label'] ?? $this->get_id() );
+	}
+
+	/** 核心契約的粗分類：cvs／home。 */
+	public function get_type(): string {
+		$descriptor = $this->descriptor();
+		return 'CVS' === ( $descriptor['logistics_type'] ?? '' ) ? 'cvs' : 'home';
+	}
+
+	/** 綠界 `LogisticsType`：CVS／HOME。 */
+	public function get_logistics_type(): string {
+		return (string) $this->require_descriptor()['logistics_type'];
+	}
+
+	/** 綠界 `LogisticsSubType`；電子地圖與送單必須送同一個。 */
+	public function get_logistics_subtype(): string {
+		return (string) $this->require_descriptor()['logistics_subtype'];
+	}
+
+	/**
+	 * 這個物流方式的溫層代碼。
+	 *
+	 * 🔴 溫層是**物流方式的屬性**，不是訂單的臨時欄位。舊版讀
+	 * `$order_data['temperature_code']`，而那個 key 全 repo 只出現在讀取的那一行、
+	 * 沒有任何寫入點——換句話說宅配永遠送常溫（0001）。賣冷藏／冷凍商品時，
+	 * 貨到就已經退冰了。
+	 */
+	public function get_temperature_code(): string {
+		return (string) $this->require_descriptor()['temperature'];
+	}
+
+	/** b2c／c2c／home。 */
+	public function get_channel(): string {
+		$descriptor = $this->descriptor();
+		return (string) ( $descriptor['channel'] ?? '' );
+	}
+
+	public function is_c2c(): bool {
+		return EcpayShippingCatalog::CHANNEL_C2C === $this->get_channel();
+	}
+
+	public function requires_return_store(): bool {
+		$descriptor = $this->descriptor();
+		return (bool) ( $descriptor['requires_return_store'] ?? false );
+	}
+
+	/** 本方式**專屬**的退貨門市設定 key（非 C2C 為空字串）。 */
+	public function get_return_store_option(): string {
+		$descriptor = $this->descriptor();
+		return (string) ( $descriptor['return_store_option'] ?? '' );
+	}
+
+	/**
+	 * C2C 退貨門市代號。
+	 *
+	 * 🔴 每個 C2C 方式讀**自己的** option。共用一把 key 的後果是：業主填了全家的
+	 * 退貨門市，7-ELEVEN 的退貨就寄到全家去——而且送單當下不會有任何錯誤訊息。
+	 *
+	 * 缺值時回空字串，由 requester fail-closed（不猜一個門市）。
+	 */
+	public function get_return_store_id(): string {
+		$option = $this->get_return_store_option();
+		if ( '' === $option ) {
+			return '';
+		}
+
+		return trim( (string) Settings::get( $option, '' ) );
+	}
+
+	/**
+	 * 綠界載明本 subtype 需一併傳 `CollectionAmount`（值等於 `GoodsAmount`）。
+	 *
+	 * 適用 UNIMART／UNIMARTC2C／UNIMARTFREEZE；缺了會建單失敗。
+	 */
+	public function requires_collection_amount(): bool {
+		$descriptor = $this->descriptor();
+		return (bool) ( $descriptor['requires_collection_amount'] ?? false );
+	}
+
+	/**
+	 * 綠界載明本 subtype 必填 `GoodsWeight`（目前只有中華郵政）。
+	 */
+	public function requires_goods_weight(): bool {
+		$descriptor = $this->descriptor();
+		return (bool) ( $descriptor['requires_goods_weight'] ?? false );
+	}
+
+	/**
+	 * 是否送宅配專屬條件（溫層／距離／規格／指定時段）。
+	 *
+	 * 🔴 綠界官方明載中華郵政「請忽略」這些欄位；舊版對郵局照送，那是把
+	 * 一份不屬於它的合約塞給它。
+	 */
+	public function sends_home_conditions(): bool {
+		$descriptor = $this->descriptor();
+		return (bool) ( $descriptor['sends_home_conditions'] ?? false );
+	}
+
+	/**
+	 * 後台設定的包裹預設重量（公斤）；0 表示未設定。
+	 *
+	 * 只在訂單本身算不出重量時當後援；兩邊都沒有時由 requester fail-closed。
+	 */
+	public function get_default_goods_weight(): float {
+		return max( 0.0, (float) Settings::shipping_method_option( $this->get_id(), 'goods_weight', '0' ) );
+	}
+
+	/**
+	 * 建單回應中缺了就代表「貨出不去」的欄位。
+	 *
+	 * @return array<int,string>
+	 */
+	public function required_response_fields(): array {
+		$descriptor = $this->descriptor();
+		$fields     = $descriptor['required_response_fields'] ?? [];
+
+		return is_array( $fields ) ? array_values( array_map( 'strval', $fields ) ) : [];
+	}
+
+	protected function settings_key(): string {
+		$descriptor = $this->descriptor();
+		return (string) ( $descriptor['alias'] ?? '' );
+	}
+
+	/**
+	 * 這個方式**設定完整、可以送單**嗎？
+	 *
+	 * C2C 沒填退貨門市時回 false：綠界規定必填，沒有它建單一定被拒。與其讓顧客
+	 * 選得到、結帳後才失敗，不如一開始就不要出現。
+	 */
+	public function is_configured(): bool {
+		if ( $this->requires_return_store() && '' === $this->get_return_store_id() ) {
+			return false;
+		}
+
+		// 郵局的重量是綠界必填欄位。訂單本身算得出重量時優先用訂單的，但
+		// 商品沒填重量的站台算出來會是 0——所以後台的預設重量必須先有值，
+		// 否則這個方式就是「選得到、送不出」。
+		if ( $this->requires_goods_weight() && $this->get_default_goods_weight() <= 0.0 ) {
+			return false;
+		}
+
+		return true;
+	}
+
 	public function is_enabled(): bool {
+		$descriptor = $this->descriptor();
+		if ( null === $descriptor ) {
+			return false;
+		}
+
 		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' )
 			&& ! \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $this->get_id(), Plugin::manifest() ) ) {
 			return false;
 		}
 
-		return Settings::shipping_enabled( $this->settings_key() ) && Settings::has_logistics_credentials();
+		if ( ! Settings::shipping_enabled( $this->settings_key() ) || ! Settings::has_logistics_credentials() ) {
+			return false;
+		}
+
+		return $this->is_configured();
 	}
 
 	public function is_available( array $order_data ): bool {
@@ -55,8 +249,19 @@ abstract class EcpayShipping implements YSShippingInterface {
 		return 'cvs' === $this->get_type();
 	}
 
+	/**
+	 * 這個通路**能不能**代收貨款。
+	 *
+	 * 🔴 這是**能力**，不是「這張訂單要代收」。核心以它決定貨到付款這個付款方式
+	 * 在結帳頁要不要出現（`YSCheckoutAvailabilityService::is_cod_available()`）；
+	 * 送單時 `IsCollection` 一律看**訂單實際的付款方式**，兩者不可混為一談。
+	 *
+	 * 混在一起的後果是：線上已刷卡的訂單也送出 `IsCollection=Y`，顧客在門市被
+	 * 再收一次錢。
+	 */
 	public function supports_cod(): bool {
-		return false;
+		$descriptor = $this->descriptor();
+		return (bool) ( $descriptor['cod_capable'] ?? false );
 	}
 
 	public function get_settings_fields(): array {

@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Admin\YSAdminApp;
 use YangSheep\YSCartEcpay\Plugin;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpaySettings {
@@ -24,13 +25,14 @@ final class EcpaySettings {
 		'cvs'     => 'ys_ec_ecpay_cvs',
 		'barcode' => 'ys_ec_ecpay_barcode',
 	];
-	private const SHIPPING_METHOD_IDS = [
-		'ship_family'  => 'ys_ec_ecpay_ship_family',
-		'ship_unimart' => 'ys_ec_ecpay_ship_unimart',
-		'ship_hilife'  => 'ys_ec_ecpay_ship_hilife',
-		'ship_tcat'    => 'ys_ec_ecpay_ship_tcat',
-		'ship_post'    => 'ys_ec_ecpay_ship_post',
-	];
+	/**
+	 * alias → method_id。由型錄導出，不維護第二份清單。
+	 *
+	 * @return array<string,string>
+	 */
+	private static function shipping_method_ids(): array {
+		return EcpayShippingCatalog::alias_to_id();
+	}
 
 	public static function register(): void {
 		add_action( 'admin_post_ys_cart_ecpay_save_settings', [ __CLASS__, 'handle_save' ] );
@@ -63,11 +65,22 @@ final class EcpaySettings {
 		}
 
 		if ( 'shipping' === $tab ) {
-			$aliases      = [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ];
-			$selected_ids = self::selected_ids_from_post( $aliases, self::SHIPPING_METHOD_IDS );
-			self::save_method_switches( $aliases );
+			$ids     = self::shipping_method_ids();
+			$aliases = array_keys( $ids );
+
+			// 🔴 先存每個方式的專屬設定（C2C 退貨門市、郵局包裹重量），再決定
+			// 誰可以被啟用——因為「能不能啟用」取決於這些值填了沒有。
+			self::save_shipping_method_options();
+
+			$selected_aliases = self::selectable_aliases( $aliases );
+			$selected_ids     = [];
+			foreach ( $selected_aliases as $alias ) {
+				$selected_ids[] = $ids[ $alias ];
+			}
+
+			self::save_method_switches( $aliases, $selected_aliases );
 			self::sync_shipping_enabled_list( $selected_ids );
-			self::sync_lifecycle_methods( 'shipping', self::SHIPPING_METHOD_IDS, $selected_ids );
+			self::sync_lifecycle_methods( 'shipping', $ids, $selected_ids );
 			self::save_sender_fields();
 		}
 
@@ -103,16 +116,87 @@ final class EcpaySettings {
 	}
 
 	/**
-	 * @param array<int,string> $aliases
+	 * @param array<int,string>      $aliases
+	 * @param array<int,string>|null $allowed 實際獲准啟用的 alias；null 表示照勾選存。
 	 */
-	private static function save_method_switches( array $aliases ): void {
+	private static function save_method_switches( array $aliases, ?array $allowed = null ): void {
 		foreach ( $aliases as $alias ) {
-			$setting_key = Settings::METHOD_KEYS[ $alias ] ?? '';
+			$setting_key = Settings::method_key( $alias );
 			if ( '' === $setting_key ) {
 				continue;
 			}
-			Settings::update( $setting_key, isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ? '1' : '0' );
+
+			$checked = isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] );
+			$enabled = null === $allowed ? $checked : in_array( $alias, $allowed, true );
+
+			Settings::update( $setting_key, $enabled ? '1' : '0' );
 		}
+	}
+
+	/**
+	 * 存每個物流方式的專屬設定。
+	 *
+	 * 🔴 C2C 的退貨門市**每個方式一把 key**。舊版全部共用一個隱藏設定，而且後台
+	 * 根本沒有輸入欄位——業主無從填起，送單必然失敗；就算手動塞進資料庫，全家的
+	 * 退貨門市也會被 7-ELEVEN 拿去用。
+	 */
+	private static function save_shipping_method_options(): void {
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			$alias = (string) $descriptor['alias'];
+
+			if ( true === $descriptor['requires_return_store'] ) {
+				$option = (string) $descriptor['return_store_option'];
+				if ( '' !== $option ) {
+					Settings::update(
+						$option,
+						sanitize_text_field( wp_unslash( (string) ( $_POST[ 'ys_ec_ecpay_' . $alias . '_return_store_id' ] ?? '' ) ) )
+					);
+				}
+			}
+
+			if ( true === $descriptor['requires_goods_weight'] ) {
+				$raw    = (string) wp_unslash( $_POST[ 'ys_ec_ecpay_' . $alias . '_goods_weight' ] ?? '' );
+				$weight = max( 0.0, min( 20.0, (float) $raw ) );
+				Settings::update( 'shipping_' . $method_id . '_goods_weight', $weight > 0 ? number_format( $weight, 3, '.', '' ) : '' );
+			}
+		}
+	}
+
+	/**
+	 * 勾選了、而且**設定完整**因此真的可以啟用的 alias。
+	 *
+	 * 缺退貨門市的 C2C、沒填重量的郵局一律擋下來：讓它「開著但送不出」是最糟的
+	 * 狀態——後台看起來是好的，顧客選得到，錯誤要到出貨那天才出現。
+	 *
+	 * @param array<int,string> $aliases
+	 * @return array<int,string>
+	 */
+	private static function selectable_aliases( array $aliases ): array {
+		$out = [];
+		foreach ( $aliases as $alias ) {
+			if ( ! isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ) {
+				continue;
+			}
+
+			$descriptor = EcpayShippingCatalog::get_by_alias( $alias );
+			if ( null === $descriptor ) {
+				continue;
+			}
+
+			if ( true === $descriptor['requires_return_store']
+				&& '' === trim( (string) Settings::get( (string) $descriptor['return_store_option'], '' ) ) ) {
+				continue;
+			}
+
+			if ( true === $descriptor['requires_goods_weight']
+				&& (float) Settings::get( 'shipping_' . (string) $descriptor['method_id'] . '_goods_weight', '0' ) <= 0.0 ) {
+				continue;
+			}
+
+			$out[] = $alias;
+		}
+
+		return $out;
 	}
 
 	private static function save_sender_fields(): void {
@@ -154,7 +238,7 @@ final class EcpaySettings {
 	 * @param array<int,string> $selected_ids
 	 */
 	private static function sync_shipping_enabled_list( array $selected_ids ): void {
-		self::sync_enabled_list( 'ys_ec_shipping_enabled_list', array_values( self::SHIPPING_METHOD_IDS ), $selected_ids );
+		self::sync_enabled_list( 'ys_ec_shipping_enabled_list', array_values( self::shipping_method_ids() ), $selected_ids );
 	}
 
 	/**
@@ -241,14 +325,24 @@ final class EcpaySettings {
 				'cvs'     => '超商代碼',
 				'barcode' => '超商條碼',
 			],
-			'shipping_methods'      => [
-				'ship_family'  => [ 'label' => '全家超商取貨', 'id' => 'ys_ec_ecpay_ship_family' ],
-				'ship_unimart' => [ 'label' => '7-ELEVEN 超商取貨', 'id' => 'ys_ec_ecpay_ship_unimart' ],
-				'ship_hilife'  => [ 'label' => '萊爾富超商取貨', 'id' => 'ys_ec_ecpay_ship_hilife' ],
-				'ship_tcat'    => [ 'label' => '黑貓宅配', 'id' => 'ys_ec_ecpay_ship_tcat' ],
-				'ship_post'    => [ 'label' => '郵局宅配', 'id' => 'ys_ec_ecpay_ship_post' ],
-			],
+			// 物流方式清單、通路、溫層、是否需要退貨門市——全部由型錄導出。
+			'shipping_methods'      => EcpayShippingCatalog::admin_rows(),
 		];
+
+		// 每個方式的專屬設定目前值（後台必須讀得回來，否則存了等於沒存）。
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			$alias = (string) $descriptor['alias'];
+
+			if ( true === $descriptor['requires_return_store'] ) {
+				$out['shipping_methods'][ $alias ]['return_store_id'] =
+					(string) Settings::get( (string) $descriptor['return_store_option'], '' );
+			}
+
+			if ( true === $descriptor['requires_goods_weight'] ) {
+				$out['shipping_methods'][ $alias ]['goods_weight'] =
+					(string) Settings::get( 'shipping_' . $method_id . '_goods_weight', '' );
+			}
+		}
 
 		foreach ( [ 'payment' => Settings::PAYMENT_KEYS, 'logistics' => Settings::LOGISTICS_KEYS ] as $prefix => $keys ) {
 			$out[ $prefix . '_test_mode' ]       = '1' === (string) Settings::get( $keys['test_mode'], '1' );
@@ -259,13 +353,14 @@ final class EcpaySettings {
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
 		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );
-		foreach ( Settings::METHOD_KEYS as $alias => $setting_key ) {
+		$shipping_ids          = self::shipping_method_ids();
+		foreach ( Settings::method_keys() as $alias => $setting_key ) {
 			$enabled = '1' === (string) Settings::get( $setting_key, '0' );
 			if ( isset( self::PAYMENT_GATEWAY_IDS[ $alias ] ) && null !== $gateway_enabled_list ) {
 				$enabled = $enabled && in_array( self::PAYMENT_GATEWAY_IDS[ $alias ], $gateway_enabled_list, true );
 			}
-			if ( isset( self::SHIPPING_METHOD_IDS[ $alias ] ) && null !== $shipping_enabled_list ) {
-				$enabled = $enabled && in_array( self::SHIPPING_METHOD_IDS[ $alias ], $shipping_enabled_list, true );
+			if ( isset( $shipping_ids[ $alias ] ) && null !== $shipping_enabled_list ) {
+				$enabled = $enabled && in_array( $shipping_ids[ $alias ], $shipping_enabled_list, true );
 			}
 			$out[ $alias . '_enabled' ] = $enabled;
 		}
