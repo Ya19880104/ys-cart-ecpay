@@ -20,6 +20,7 @@
 - 核心核定同步只接受 Core **實際**寫得出來的那一個 terminal tuple：paid → `status = provider_done` 且 `provider_done === true`；aborted → `status = aborted_provider_rejected` 且 `finalized === true`（且 `provider_done` 不得為 true）。#2F 接受了一整排狀態，其中 `submitting` 代表核定還沒完成——那時候同步等於在核心下結論之前就解除凍結。
 - orphan 寫入改回 typed outcome（`written`／`core_unavailable`／`failed`）。資料庫全失敗時，log 輸出與 orphan 紀錄**同一份**完整事實（不攤平、不截斷），兩邊撈出來的形狀才對得起來。
 - `wp ys-cart-ecpay refund-attempt list` 印出每一筆 operation 與 orphan 事實的**全部**欄位（未知欄位一併附上），不再挑欄位顯示。這些紀錄存在的唯一理由就是 ledger 寫不進去，這時候再砍一半等於把僅存的線索丟掉。
+- MerchantTradeNo 改由核心的**穩定 operation key** 導出（order_id／attempt 世代／nonce 的函數），不再是 `'YS' . $order_id . 'T' . time()`。舊寫法讓同一次付款嘗試每被驅動一次就得到一個新的交易編號：只要 `process_payment()` 被重新進入（續作、接管、未來新增的任何路徑），綠界那邊就多出一筆新交易，而顧客手上那張舊表單仍然付得成——我們的 `mer_trade_no` 已經指向另一筆，那筆錢因此無人認領。缺 dispatch context 時回空字串並中止建單，**不得**退回時間值。
 - 發佈包排除 `.codex`／`.claude`／`.agents`／`.DS_Store`。這些是交接筆記、審查紀錄與未完成的 gate 清單，會隨包散佈到每一個安裝站點的檔案系統（多半在 web root 底下）。v004 補上正反例。
 - 正式 package gate 改為比對 **committed Git blob**，不只比工作樹。工作樹逐位相同只證明「這個包是從我現在看到的檔案打出來的」；我們回報給審查者的 hash 必須對應到一個可以被別人重現的 commit。
 

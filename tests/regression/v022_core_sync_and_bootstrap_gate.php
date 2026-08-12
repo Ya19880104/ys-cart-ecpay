@@ -132,6 +132,34 @@ namespace YangSheep\Ecommerce\Utils {
     }
 }
 
+namespace YangSheep\Ecommerce\Gateways {
+    /** 核心的 gateway 介面替身（只需存在，供 EcpayGatewayBase implements）。 */
+    interface YSGatewayInterface {}
+}
+
+namespace YangSheep\YSCartEcpay\Support {
+    class Settings {
+        public static function payment_credentials(): array {
+            return [ 'merchant_id' => 'M1', 'test_mode' => false ];
+        }
+        public static function has_payment_credentials(): bool {
+            return true;
+        }
+        public static function gateway_enabled( string $k ): bool {
+            return true;
+        }
+    }
+
+    class ScalarColumnWriter {
+        public static function write( int $id, array $data ): array {
+            return [ 'state' => 'VERIFIED' ];
+        }
+        public static function is_persisted( array $r ): bool {
+            return true;
+        }
+    }
+}
+
 namespace {
     $core = dirname( __DIR__, 3 ) . '/ys-cart/src/Services/Payment/';
     require_once $core . 'YSPaymentDetailResult.php';
@@ -340,6 +368,86 @@ namespace {
     // 版本足夠時放行（用常數模擬已載入的核心）
     define( 'YS_ECOMMERCE_VERSION', '2.57.0' );
     $assert( true === Plugin::core_version_ok(), '(h5) 核心 2.57.0 → 放行' );
+
+    // ══ #2G：MerchantTradeNo 由穩定 operation key 導出 ═══════════════════════
+    //
+    // 舊版是 `'YS' . $order_id . 'T' . time()`：同一次付款嘗試每被驅動一次就得到
+    // 一個新的交易編號。只要 process_payment() 被重新進入（續作、接管、未來新增
+    // 的任何路徑），綠界那邊就多出一筆新交易，而顧客手上那張舊表單仍然付得成——
+    // 我們的 mer_trade_no 已經指向另一筆，那筆錢因此無人認領。
+    require_once dirname( __DIR__, 2 ) . '/src/Payment/EcpayGatewayBase.php';
+
+    use YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch as Dispatch;
+
+    $gateway = new class extends \YangSheep\YSCartEcpay\Payment\EcpayGatewayBase {
+        public function get_id(): string {
+            return 'ys_ec_ecpay_credit';
+        }
+        public function get_title(): string {
+            return 'ECPay';
+        }
+        protected function gateway_key(): string {
+            return 'credit';
+        }
+        protected function choose_payment(): string {
+            return 'Credit';
+        }
+        /** 讓測試看得到 protected 的導出邏輯。 */
+        public function derive( int $order_id, array $detail = [] ): string {
+            return $this->make_merchant_trade_no( $order_id, $detail );
+        }
+    };
+
+    $attempt_a = [ 'generation' => 1, 'nonce' => 'nonce-a' ];
+    $attempt_b = [ 'generation' => 2, 'nonce' => 'nonce-b' ];
+
+    $derive = static function ( array $attempt, int $order_id = 7, array $detail = [] ) use ( $gateway ): string {
+        return Dispatch::with_context(
+            'tok',
+            $order_id,
+            Dispatch::operation_key( $order_id, $attempt ),
+            static fn (): string => $gateway->derive( $order_id, $detail )
+        );
+    };
+
+    $mtn_1 = $derive( $attempt_a );
+    $mtn_2 = $derive( $attempt_a );
+    $mtn_3 = $derive( $attempt_b );
+    $mtn_4 = $derive( $attempt_a, 8 );
+
+    $assert(
+        '' !== $mtn_1
+        && $mtn_1 === $mtn_2
+        && $mtn_1 !== $mtn_3
+        && $mtn_1 !== $mtn_4,
+        '(i1) 🔴 同一次嘗試導出同一個 MerchantTradeNo；換 attempt／換訂單則不同 — ' . $mtn_1
+    );
+
+    $assert(
+        20 === strlen( $mtn_1 ) && 1 === preg_match( '/^[A-Za-z0-9]+$/', $mtn_1 ),
+        '(i2) 符合綠界格式（20 字元英數） — 長度 ' . strlen( $mtn_1 )
+    );
+
+    // 沒有 dispatch context → 空字串（呼叫端據此中止），**不得**退回 time()
+    $assert(
+        '' === $gateway->derive( 7 ),
+        '(i3) 🔴 沒有 dispatch context → 回空字串，不得用時間頂替'
+    );
+
+    // 續作：這個 operation 已經有交易編號就沿用（已送到綠界的那一個才是事實）
+    $key      = Dispatch::operation_key( 7, $attempt_a );
+    $existing = [ 'ecpay_operation_key' => $key, 'mer_trade_no' => 'YSLEGACY0000000001' ];
+    $assert(
+        'YSLEGACY0000000001' === $derive( $attempt_a, 7, $existing ),
+        '(i4) 🔴 同一個 operation 已有交易編號 → 沿用，不另外導出新的'
+    );
+
+    // 但別的 operation 的交易編號不得被沿用
+    $other = [ 'ecpay_operation_key' => Dispatch::operation_key( 7, $attempt_b ), 'mer_trade_no' => 'YSOTHER00000000001' ];
+    $assert(
+        $mtn_1 === $derive( $attempt_a, 7, $other ),
+        '(i5) 🔴 屬於別的 operation 的交易編號不得沿用'
+    );
 
     echo "\ncore sync tuple + bootstrap gate: {$pass} PASS / {$fail} FAIL\n";
     exit( $fail > 0 ? 1 : 0 );
