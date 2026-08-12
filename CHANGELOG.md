@@ -6,10 +6,21 @@
 
 ### Added
 
+- 新增綠界 **C2C（店到店）** 物流方式：`UNIMARTC2C`／`FAMIC2C`／`HILIFEC2C`。B2C 與 C2C 是兩份不同的綠界合約，subtype 與服務金鑰都不同；舊版只有 B2C，因此合約是 C2C 的站台拿 B2C 的 subtype 打自己的商店代號——電子地圖回「找不到加密金鑰，請確認是否有申請開通**此物流方式**!」，送單直接失敗。照核心 PayUni provider 已驗證的雙軌模板：兩者各自註冊成獨立的物流方式，由業主依合約決定開哪一個。
+- 新增**低溫**物流：超商冷凍（`UNIMARTFREEZE`／`UNIMARTFREEZEC2C`，獨立 subtype）與宅配溫層（黑貓冷藏 `0002`／冷凍 `0003`）。
+- 新增 **C2C 退貨門市代號**（`ReturnStoreID`，綠界規定 C2C 建單必填）與**貨到付款**設定。
+- C2C 回單保留 `CVSPaymentNo`／`CVSValidationNo`（寄件代碼）。店到店的流程是賣家拿這兩個碼到門市寄件；舊版只把 `CVSPaymentNo` 混在 tracking 裡、驗證碼整個丟掉——訂單進得來，**貨出不去**。
+
+
 - 宣告核心版本硬性需求 `YS CART >= 2.57.0`（`Plugin::REQUIRES_CORE`）。本外掛沒有自己的 `payment_detail` 寫入器，全部走核心的 `YSPaymentDetailStore`，並依賴 `YSPaymentDispatch` 的 ambient guard 讓每一次 provider 寫入都是 owner-conditioned；兩者在 2.57.0 之前都不存在。版本不符時 `init()` 只掛 `admin_notices`，**不註冊任何 gateway、物流方式、REST 路由或 CLI**——一個註冊了卻無法安全落盤的 provider 會收到錢，比明顯缺席危險得多。
 - 每一步金流動作都追加一筆**不可變**的 result event（先前只有送出前的 `sent`）。內容涵蓋人工核定需要的全部事實：`token`、`step`、`attempted`／`executed`、傳輸分類（`ok`／`rejected`／`indeterminate`）、`RtnCode`／`RtnMsg`、回應交易編號、指紋摘要與時間戳。舊版這些只存在於 log 檔，而核定的人看的是訂單。追加是冪等的（同一個 token＋階段不重複），既有事件一律不修改。
 
 ### Changed
+
+- **自動退款預設關閉**（0.3.0 維持 record-only／manual-only）。`supports_gateway_refund()` 舊版無條件回 `true`，核心因此真的會呼叫 DoAction——而 `docs/credit-refund-sandbox-gate.md` 明訂：在受控正式商店實測完成之前不得宣稱支援。「程式碼寫好了」與「可以拿真錢跑」是兩件事；gate 沒過就交給這條路徑，等於用客戶的錢做第一次驗證。站方可在 gate 完成後以 `ys_ec_ecpay_auto_refund_enabled` 明確開啟。
+- 核心缺席時的真實 entrypoint 改為 **notice-only**：舊版直接 `return`，外掛完全靜默，站方只看得到「綠界不見了」然後去猜。
+- v004 的 Git-blob 比對改用 **binary-safe** 讀取（`proc_open`，不 split、不 `rtrim`）。舊寫法用 line-oriented `exec()` 再 `rtrim`，尾端 LF 不同仍可能 false-GREEN——公開套件的衛生契約要求逐位元相同，測試本身就不能有這個天窗。
+- `Temperature`／`IsCollection`／`ReturnStoreID` 一律由**物流方式**回答。舊版 `Temperature` 讀 `$order_data['temperature_code']`，而那個 key 全 repo 只出現在讀取的那一行、沒有任何寫入點——宅配因此**永遠**送常溫；`IsCollection` 則在送單與電子地圖兩處都寫死 `'N'`。
 
 - `done` 的冪等重放改為要求**完整證據**：`plan` 逐字元等於本次計畫、`executed === plan`、`operations` 對計畫裡的每一步都有一筆（且帶得出 token 與送出時間）、`response_trade_no` 是非空字串。任一項不成立即回 `indeterminate` 而非成功。冪等重放會讓核心結案（標記已退款、寫進帳、不再回頭核對），因此「status 是 done」這個字串遠遠不足以支撐那個結論——一筆只執行了 `E`（漏了 `N`）的 entry 先前會被當成完成。
 - 冪等重放回報的交易編號**禁止 fallback**。舊版在 `response_trade_no` 為空時退回指紋內的 `trade_no`，把「綠界確認的退款交易編號」與「我們送出去的原始交易編號」混成一個值——呼叫端拿到一個看起來像退款憑據的東西，對帳時無從發現。

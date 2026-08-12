@@ -461,18 +461,43 @@ $assert(true, sprintf('(H1) %d 個 eligible 檔案與工作目錄逐位相同', 
 $git_problems = [];
 $git_checked  = 0;
 
-$run_git = static function (array $args) use ($root): array {
+// 🔴 #2H：**binary-safe** 讀取，不 split、不 rtrim。
+//
+// 舊版用 `exec()` 收 `git cat-file` 的輸出：exec 依行切開再 implode，尾端的
+// 換行會被吃掉，於是最後只能 `rtrim()` 兩邊再比——那讓「ZIP 少一個結尾 LF」
+// 這種真實差異變成 false-GREEN。公開套件的衛生契約要求逐位元相同，測試本身
+// 就不能有這個天窗。
+//
+// 改用 proc_open 直接讀 stdout 的原始位元組。
+$git_bytes = static function (array $args) use ($root): array {
     $cmd = 'git -C ' . escapeshellarg($root);
     foreach ($args as $a) {
         $cmd .= ' ' . escapeshellarg((string) $a);
     }
-    $cmd .= ' 2>&1';
 
-    $out  = [];
-    $code = 0;
-    exec($cmd, $out, $code);
+    $descriptors = [
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
 
-    return ['code' => $code, 'out' => implode("\n", $out)];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if (!is_resource($proc)) {
+        return ['code' => 1, 'out' => '', 'err' => 'proc_open failed'];
+    }
+
+    $out = stream_get_contents($pipes[1]);
+    $err = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $code = proc_close($proc);
+
+    return ['code' => $code, 'out' => (string) $out, 'err' => (string) $err];
+};
+
+$run_git = static function (array $args) use ($git_bytes): array {
+    $r = $git_bytes($args);
+
+    return ['code' => $r['code'], 'out' => trim($r['out'] . $r['err'])];
 };
 
 $head = $run_git(['rev-parse', 'HEAD']);
@@ -487,7 +512,7 @@ if (0 !== $head['code']) {
         $git_problems[] = 'ZIP 無法重新開啟以進行 Git-blob 比對';
     } else {
         foreach ($scan['files'] as $relative) {
-            $blob = $run_git(['cat-file', 'blob', $head_sha . ':' . $relative]);
+            $blob = $git_bytes(['cat-file', 'blob', $head_sha . ':' . $relative]);
             if (0 !== $blob['code']) {
                 $git_problems[] = sprintf('%s：HEAD 沒有這個檔案（未追蹤或未 commit）', $relative);
                 continue;
@@ -501,15 +526,16 @@ if (0 !== $head['code']) {
 
             ++$git_checked;
 
-            // 🔴 `exec()` 會把輸出按行拆開再 implode，尾端換行會被吃掉，因此比對
-            // 前把兩邊的尾端換行都正規化掉；行**內**的差異（包含 CRLF vs LF）
-            // 仍然會被抓出來——那正是我們要抓的。
-            if (rtrim($zipped, "\r\n") !== rtrim($blob['out'], "\r\n")) {
+            // 🔴 #2H：**逐位元**比較，不 rtrim。少一個結尾 LF 也是差異——
+            // 那正是「artifact 不是從這個 commit 建出來的」最常見的形狀之一。
+            if ($zipped !== $blob['out']) {
                 $git_problems[] = sprintf(
-                    '%s：ZIP 與 HEAD blob 不同（zip %s／blob %s）',
+                    '%s：ZIP 與 HEAD blob 不同（zip %s／%d B、blob %s／%d B）',
                     $relative,
-                    substr(hash('sha256', rtrim($zipped, "\r\n")), 0, 16),
-                    substr(hash('sha256', rtrim($blob['out'], "\r\n")), 0, 16)
+                    substr(hash('sha256', $zipped), 0, 16),
+                    strlen($zipped),
+                    substr(hash('sha256', $blob['out']), 0, 16),
+                    strlen($blob['out'])
                 );
             }
         }

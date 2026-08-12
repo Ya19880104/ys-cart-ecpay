@@ -54,6 +54,25 @@ final class EcpayShippingRequester {
 
 		$tracking = (string) ( $params['CVSPaymentNo'] ?? $params['BookingNote'] ?? $params['AllPayLogisticsID'] ?? '' );
 
+		// 🔴 v0.3.0：C2C 的**寄件代碼**必須完整帶回來。
+		//
+		// 店到店的流程是：賣家拿著綠界回的 `CVSPaymentNo`（寄貨編號）＋
+		// `CVSValidationNo`（驗證碼）到門市寄件。少了它們，訂單進得來、**貨出不去**
+		// ——而舊版只把 `CVSPaymentNo` 當成 tracking 混在一起，驗證碼整個丟掉。
+		//
+		// 7-11 的驗證碼是必要的第二段；其他超商可能不回，因此只在 C2C 且缺
+		// `CVSPaymentNo` 時才算失敗（那是真的寄不出去）。
+		$cvs_payment_no    = (string) ( $params['CVSPaymentNo'] ?? '' );
+		$cvs_validation_no = (string) ( $params['CVSValidationNo'] ?? '' );
+
+		if ( $this->method->is_c2c() && '' === $cvs_payment_no ) {
+			return [
+				'success'      => false,
+				'message'      => 'C2C 店到店建立成功但未取得寄貨編號（CVSPaymentNo），賣家無法到門市寄件；請於綠界後台確認後重試。',
+				'raw_response' => $params,
+			];
+		}
+
 		return [
 			'success'           => true,
 			'label_id'          => (string) ( $params['AllPayLogisticsID'] ?? $fields['MerchantTradeNo'] ),
@@ -61,6 +80,10 @@ final class EcpayShippingRequester {
 			'tracking_number'   => $tracking,
 			'merchant_trade_no' => $fields['MerchantTradeNo'],
 			'provider_trade_no' => (string) ( $params['AllPayLogisticsID'] ?? '' ),
+			// 寄件代碼分開存：它們是「賣家怎麼把貨交出去」的依據，不是追蹤碼。
+			'cvs_payment_no'    => $cvs_payment_no,
+			'cvs_validation_no' => $cvs_validation_no,
+			'is_c2c'            => $this->method->is_c2c(),
 			'raw_response'      => $params,
 			'message'           => (string) ( $params['RtnMsg'] ?? '' ),
 		];
@@ -104,12 +127,32 @@ final class EcpayShippingRequester {
 			'ReceiverName'      => mb_substr( (string) ( $order_data['receiver_name'] ?? '' ), 0, 10 ),
 			'ReceiverCellPhone' => (string) ( $order_data['receiver_phone'] ?? '' ),
 			'ServerReplyURL'    => rest_url( 'ys-ecommerce/v1/ecpay/logistics-notify' ),
-			'IsCollection'      => 'N',
+			// 🔴 v0.3.0：代收與否由**物流方式**回答，不再寫死 'N'。
+			// 寫死的後果是：業主開了貨到付款，送出去的仍然是「不代收」——
+			// 貨送到了，錢沒收。
+			'IsCollection'      => $this->method->supports_cod() ? 'Y' : 'N',
 		];
 
 		if ( 'CVS' === $fields['LogisticsType'] ) {
 			$fields['ReceiverStoreID'] = (string) ( $order_data['receiver_store_id'] ?? '' );
-			if ( 'UNIMART' === $fields['LogisticsSubType'] ) {
+
+			// 🔴 v0.3.0：C2C（店到店）必填**退貨門市**。
+			//
+			// 綠界規定 C2C 建立訂單時必須指定退貨門市；沒有它，送單直接被拒。
+			// 缺值時 fail-closed——不猜一個門市，那會讓退貨寄到別人家。
+			if ( $this->method->is_c2c() ) {
+				$return_store = $this->method->get_return_store_id();
+				if ( '' === $return_store ) {
+					throw new \RuntimeException(
+						'C2C 店到店尚未設定退貨門市代號（綠界規定必填），已中止建立物流訂單。'
+					);
+				}
+
+				$fields['ReturnStoreID'] = $return_store;
+			}
+
+			// 代收金額只在真的代收時才送。
+			if ( 'Y' === $fields['IsCollection'] ) {
 				$fields['CollectionAmount'] = (string) $amount;
 			}
 		} else {
@@ -117,7 +160,12 @@ final class EcpayShippingRequester {
 			$fields['SenderAddress']     = (string) ( $order_data['sender_address'] ?? Settings::get( Settings::SENDER_KEYS['address'], '' ) );
 			$fields['ReceiverZipCode']   = (string) ( $order_data['receiver_zipcode'] ?? '' );
 			$fields['ReceiverAddress']   = (string) ( $order_data['receiver_address'] ?? '' );
-			$fields['Temperature']       = (string) ( $order_data['temperature_code'] ?? '0001' );
+			// 🔴 v0.3.0：溫層由**物流方式**回答。
+			//
+			// 舊版讀 `$order_data['temperature_code']`，而那個 key 全 repo 只出現
+			// 在這一行、沒有任何寫入點——因此宅配永遠送常溫（0001）。賣冷藏／
+			// 冷凍商品時，貨到就已經退冰了。
+			$fields['Temperature']       = $this->method->get_temperature_code();
 			$fields['Distance']          = '00';
 			$fields['Specification']     = '0001';
 			$fields['ScheduledDeliveryTime'] = '4';

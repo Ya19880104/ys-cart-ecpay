@@ -30,6 +30,16 @@ final class EcpaySettings {
 		'ship_hilife'  => 'ys_ec_ecpay_ship_hilife',
 		'ship_tcat'    => 'ys_ec_ecpay_ship_tcat',
 		'ship_post'    => 'ys_ec_ecpay_ship_post',
+
+		// v0.3.0：C2C（店到店）與低溫。B2C 與 C2C 是兩份不同的綠界合約，各自
+		// 獨立啟用；開錯一邊的症狀是電子地圖回「找不到加密金鑰」、送單失敗。
+		'ship_family_c2c'         => 'ys_ec_ecpay_ship_family_c2c',
+		'ship_unimart_c2c'        => 'ys_ec_ecpay_ship_unimart_c2c',
+		'ship_hilife_c2c'         => 'ys_ec_ecpay_ship_hilife_c2c',
+		'ship_unimart_freeze'     => 'ys_ec_ecpay_ship_unimart_freeze',
+		'ship_unimart_freeze_c2c' => 'ys_ec_ecpay_ship_unimart_freeze_c2c',
+		'ship_tcat_chilled'       => 'ys_ec_ecpay_ship_tcat_chilled',
+		'ship_tcat_frozen'        => 'ys_ec_ecpay_ship_tcat_frozen',
 	];
 
 	public static function register(): void {
@@ -63,7 +73,9 @@ final class EcpaySettings {
 		}
 
 		if ( 'shipping' === $tab ) {
-			$aliases      = [ 'ship_family', 'ship_unimart', 'ship_hilife', 'ship_tcat', 'ship_post' ];
+			// v0.3.0：清單從 SHIPPING_METHOD_IDS 導出——新增方式時只要改一處，
+			// 兩份清單漂移就是「後台看得到、存檔卻不生效」的來源。
+			$aliases      = array_keys( self::SHIPPING_METHOD_IDS );
 			$selected_ids = self::selected_ids_from_post( $aliases, self::SHIPPING_METHOD_IDS );
 			self::save_method_switches( $aliases );
 			self::sync_shipping_enabled_list( $selected_ids );
@@ -250,6 +262,14 @@ final class EcpaySettings {
 				'ship_hilife'  => [ 'label' => '萊爾富超商取貨', 'id' => 'ys_ec_ecpay_ship_hilife' ],
 				'ship_tcat'    => [ 'label' => '黑貓宅配', 'id' => 'ys_ec_ecpay_ship_tcat' ],
 				'ship_post'    => [ 'label' => '郵局宅配', 'id' => 'ys_ec_ecpay_ship_post' ],
+
+				'ship_family_c2c'         => [ 'label' => '全家超商取貨（C2C 店到店）', 'id' => 'ys_ec_ecpay_ship_family_c2c' ],
+				'ship_unimart_c2c'        => [ 'label' => '7-ELEVEN 超商取貨（C2C 店到店）', 'id' => 'ys_ec_ecpay_ship_unimart_c2c' ],
+				'ship_hilife_c2c'         => [ 'label' => '萊爾富超商取貨（C2C 店到店）', 'id' => 'ys_ec_ecpay_ship_hilife_c2c' ],
+				'ship_unimart_freeze'     => [ 'label' => '7-ELEVEN 冷凍取貨（B2C）', 'id' => 'ys_ec_ecpay_ship_unimart_freeze' ],
+				'ship_unimart_freeze_c2c' => [ 'label' => '7-ELEVEN 冷凍取貨（C2C 店到店）', 'id' => 'ys_ec_ecpay_ship_unimart_freeze_c2c' ],
+				'ship_tcat_chilled'       => [ 'label' => '黑貓宅配（冷藏）', 'id' => 'ys_ec_ecpay_ship_tcat_chilled' ],
+				'ship_tcat_frozen'        => [ 'label' => '黑貓宅配（冷凍）', 'id' => 'ys_ec_ecpay_ship_tcat_frozen' ],
 			],
 		];
 

@@ -37,6 +37,18 @@ final class Settings {
 		'ship_hilife'    => 'ys_ec_ecpay_ship_hilife_enabled',
 		'ship_tcat'      => 'ys_ec_ecpay_ship_tcat_enabled',
 		'ship_post'      => 'ys_ec_ecpay_ship_post_enabled',
+
+		// v0.3.0：C2C（店到店）——與 B2C 是兩種不同的合約、不同的 subtype，
+		// 綁定的服務金鑰也不同。各自獨立啟用，由業主依合約決定開哪一個。
+		'ship_family_c2c'  => 'ys_ec_ecpay_ship_family_c2c_enabled',
+		'ship_unimart_c2c' => 'ys_ec_ecpay_ship_unimart_c2c_enabled',
+		'ship_hilife_c2c'  => 'ys_ec_ecpay_ship_hilife_c2c_enabled',
+
+		// v0.3.0：低溫——超商冷凍（B2C／C2C）與宅配溫層
+		'ship_unimart_freeze'     => 'ys_ec_ecpay_ship_unimart_freeze_enabled',
+		'ship_unimart_freeze_c2c' => 'ys_ec_ecpay_ship_unimart_freeze_c2c_enabled',
+		'ship_tcat_chilled'       => 'ys_ec_ecpay_ship_tcat_chilled_enabled',
+		'ship_tcat_frozen'        => 'ys_ec_ecpay_ship_tcat_frozen_enabled',
 	];
 
 	public const SENDER_KEYS = [
@@ -173,6 +185,16 @@ final class Settings {
 
 	public static function shipping_free_threshold( string $method_id ): float {
 		return max( 0.0, (float) self::shipping_method_option( $method_id, 'free_threshold', '0' ) );
+	}
+
+	/**
+	 * 貨到付款（代收）是否啟用（v0.3.0）
+	 *
+	 * 🔴 舊版 `IsCollection` 在送單與電子地圖兩處都寫死 `'N'`，因此就算業主在
+	 * 後台開了貨到付款，送出去的仍然是「不代收」——貨送到了，錢沒收。
+	 */
+	public static function shipping_cod_enabled( string $method_id ): bool {
+		return '1' === (string) self::shipping_method_option( $method_id, 'cod_enabled', '0' );
 	}
 
 	public static function has_payment_credentials(): bool {

@@ -13,16 +13,40 @@ use YangSheep\Ecommerce\Services\Setup\YSPageResolver;
 final class EcpayStoreSelector {
 	private const MAP_PATH = '/Express/map';
 
+	/**
+	 * 物流方式 → 綠界 LogisticsSubType（v0.3.0）
+	 *
+	 * 🔴 B2C 與 C2C 是**兩份不同的合約**，綠界以不同的服務金鑰開通。
+	 * 用 B2C 的 subtype 打 C2C 商店代號，電子地圖會回「找不到加密金鑰，
+	 * 請確認是否有申請開通此物流方式!」——注意是「此物流方式」而非
+	 * 整個服務，那正是 subtype 對不上的症狀。
+	 */
 	private const SUBTYPES = [
 		'ys_ec_ecpay_ship_family'  => 'FAMI',
 		'ys_ec_ecpay_ship_unimart' => 'UNIMART',
 		'ys_ec_ecpay_ship_hilife'  => 'HILIFE',
+
+		// C2C（店到店）
+		'ys_ec_ecpay_ship_family_c2c'  => 'FAMIC2C',
+		'ys_ec_ecpay_ship_unimart_c2c' => 'UNIMARTC2C',
+		'ys_ec_ecpay_ship_hilife_c2c'  => 'HILIFEC2C',
+
+		// 超商冷凍（獨立 subtype，不是常溫加一個溫層參數）
+		'ys_ec_ecpay_ship_unimart_freeze'     => 'UNIMARTFREEZE',
+		'ys_ec_ecpay_ship_unimart_freeze_c2c' => 'UNIMARTFREEZEC2C',
 	];
 
 	private const METHOD_ALIASES = [
 		'ys_ec_ecpay_ship_family'  => 'ship_family',
 		'ys_ec_ecpay_ship_unimart' => 'ship_unimart',
 		'ys_ec_ecpay_ship_hilife'  => 'ship_hilife',
+
+		'ys_ec_ecpay_ship_family_c2c'  => 'ship_family_c2c',
+		'ys_ec_ecpay_ship_unimart_c2c' => 'ship_unimart_c2c',
+		'ys_ec_ecpay_ship_hilife_c2c'  => 'ship_hilife_c2c',
+
+		'ys_ec_ecpay_ship_unimart_freeze'     => 'ship_unimart_freeze',
+		'ys_ec_ecpay_ship_unimart_freeze_c2c' => 'ship_unimart_freeze_c2c',
 	];
 
 	/**
@@ -68,7 +92,9 @@ final class EcpayStoreSelector {
 			'MerchantTradeNo'   => $merchant_trade_no,
 			'LogisticsType'     => 'CVS',
 			'LogisticsSubType'  => self::SUBTYPES[ $shipping_id ],
-			'IsCollection'      => 'N',
+			// 🔴 v0.3.0：代收與否要與送單一致。地圖送 'N'、送單送 'Y'，
+			// 綠界會回門市不支援代收——顧客選得了門市，建單卻失敗。
+			'IsCollection'      => self::is_cod_enabled( $shipping_id ) ? 'Y' : 'N',
 			'ServerReplyURL'    => rest_url( 'ys-ecommerce/v1/ecpay/store-callback' ),
 			'ExtraData'         => $temp_id,
 			'Device'            => wp_is_mobile() ? '1' : '0',
@@ -153,6 +179,16 @@ final class EcpayStoreSelector {
 		}
 
 		return Settings::shipping_enabled( $method_alias );
+	}
+
+	/**
+	 * 這個物流方式有沒有開貨到付款（v0.3.0）
+	 *
+	 * 電子地圖與送單必須送同一個 `IsCollection`：地圖送 'N'、送單送 'Y' 時，
+	 * 綠界會依「不代收」篩門市，顧客選得到的門市卻可能不支援代收——建單就失敗。
+	 */
+	private static function is_cod_enabled( string $shipping_id ): bool {
+		return Settings::shipping_cod_enabled( $shipping_id );
 	}
 
 	private static function validate_map_owner( array $map_data ): bool {

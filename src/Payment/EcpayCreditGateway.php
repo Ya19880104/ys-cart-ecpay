@@ -27,12 +27,27 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		return 'Credit';
 	}
 
+	/** 啟用自動退款的設定鍵（預設關閉）。 */
+	public const AUTO_REFUND_OPTION = 'ys_ec_ecpay_auto_refund_enabled';
+
 	/**
 	 * 宣告具自動金流退款能力（core v2.56.4 `YSGatewayRegistry::supports_auto_refund`
 	 * 的可選方法協定）——後台退款 UI 據此不顯示「訂單退款≠金流退款」警示。
+	 *
+	 * 🔴 v0.3.0（#2H）：**預設關閉，0.3.0 維持 record-only／manual-only。**
+	 *
+	 * 舊版無條件回 true，於是核心真的會呼叫 DoAction——而
+	 * `docs/credit-refund-sandbox-gate.md` 明訂：在受控正式商店把
+	 * `query_credit_close_status` 的狀態對映、`E→N` 與 `R` 的實際回應碼、分期／
+	 * 紅利／銀聯的官方規則實測完成之前，不得宣稱支援自動退款。
+	 *
+	 * 「程式碼寫好了」與「可以拿真錢跑」是兩件事。gate 沒過就讓核心把退款交給
+	 * 這條路徑，等於用客戶的錢做第一次驗證。
+	 *
+	 * 站方在 gate 完成後可以明確開啟；沒有這個 option 就是關的。
 	 */
 	public function supports_gateway_refund(): bool {
-		return true;
+		return '1' === (string) get_option( self::AUTO_REFUND_OPTION, '0' );
 	}
 
 	/**

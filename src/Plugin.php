@@ -23,11 +23,18 @@ use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamily;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamilyC2C;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingHilifeC2C;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingHilife;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingPost;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcatChilled;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcatFrozen;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimart;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimartC2C;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimartFreeze;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimartFreezeC2C;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -45,6 +52,14 @@ final class Plugin {
 		'ys_ec_ecpay_ship_family',
 		'ys_ec_ecpay_ship_unimart',
 		'ys_ec_ecpay_ship_hilife',
+		// v0.3.0：C2C（店到店）與低溫——各自獨立啟用
+		'ys_ec_ecpay_ship_family_c2c',
+		'ys_ec_ecpay_ship_unimart_c2c',
+		'ys_ec_ecpay_ship_hilife_c2c',
+		'ys_ec_ecpay_ship_unimart_freeze',
+		'ys_ec_ecpay_ship_unimart_freeze_c2c',
+		'ys_ec_ecpay_ship_tcat_chilled',
+		'ys_ec_ecpay_ship_tcat_frozen',
 		'ys_ec_ecpay_ship_tcat',
 		'ys_ec_ecpay_ship_post',
 	];
@@ -210,6 +225,39 @@ final class Plugin {
 
 		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_post' ) ) {
 			YSShippingRegistry::register( new EcpayShippingPost() );
+		}
+
+		// v0.3.0：C2C（店到店）——與 B2C 是兩份不同的綠界合約，
+		// subtype 與服務金鑰都不同。照核心 PayUni provider 已驗證的
+		// 雙軌模板：各自註冊成獨立的物流方式，由業主依自己的合約開。
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_family_c2c' ) ) {
+			YSShippingRegistry::register( new EcpayShippingFamilyC2C() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_unimart_c2c' ) ) {
+			YSShippingRegistry::register( new EcpayShippingUnimartC2C() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_hilife_c2c' ) ) {
+			YSShippingRegistry::register( new EcpayShippingHilifeC2C() );
+		}
+
+		// v0.3.0：低溫。超商冷凍是獨立 subtype；宅配溫層是同一個
+		// subtype 搭不同的 `Temperature`。兩者都由物流方式自己回答。
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_unimart_freeze' ) ) {
+			YSShippingRegistry::register( new EcpayShippingUnimartFreeze() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_unimart_freeze_c2c' ) ) {
+			YSShippingRegistry::register( new EcpayShippingUnimartFreezeC2C() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_tcat_chilled' ) ) {
+			YSShippingRegistry::register( new EcpayShippingTcatChilled() );
+		}
+
+		if ( $this->is_method_enabled( 'shipping', 'ys_ec_ecpay_ship_tcat_frozen' ) ) {
+			YSShippingRegistry::register( new EcpayShippingTcatFrozen() );
 		}
 	}
 
