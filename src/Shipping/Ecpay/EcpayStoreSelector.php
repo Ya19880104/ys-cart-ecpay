@@ -157,13 +157,39 @@ final class EcpayStoreSelector {
 			'store_name'        => (string) ( $selection['store_name'] ?? '' ),
 			'store_address'     => (string) ( $selection['store_address'] ?? '' ),
 			'collection_mode'   => (string) ( $selection['collection_mode'] ?? 'N' ),
+			// 🔴 存**精確的**付款方式，不是只存 N/Y。
+			// 只比代收模式的話，信用卡選的門市可以拿去給另一個非代收金流用——
+			// 兩者的門市限制未必相同，而且那本來就是「另一次結帳」。
 			'payment_method'    => (string) ( $selection['payment_method'] ?? '' ),
 			'cart_scope'        => (string) ( $selection['cart_scope'] ?? 'default' ),
-			'user_id'           => get_current_user_id(),
+			// 🔴 訪客也要綁。登入者綁 user id；訪客綁購物車 session——沒有它，
+			// 一張 token 誰撿到都能用。
+			'principal'         => self::current_principal( (string) ( $selection['cart_scope'] ?? 'default' ) ),
 			'issued_at'         => current_time( 'timestamp' ),
 		], self::SELECTION_TTL );
 
 		return $token;
+	}
+
+	/**
+	 * 目前這個請求的身分識別（登入者或購物車 session）。
+	 *
+	 * 回空字串＝**無法識別**。那不是「訪客」，而是「證明不了是誰」——
+	 * consume 端據此拒絕（正常結帳一定有購物車 session）。
+	 */
+	private static function current_principal( string $cart_scope ): string {
+		$user_id = get_current_user_id();
+		if ( $user_id > 0 ) {
+			return 'u:' . $user_id;
+		}
+
+		$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
+		$value  = isset( $_COOKIE[ $cookie ] ) ? (string) $_COOKIE[ $cookie ] : '';
+		if ( '' === $value ) {
+			return '';
+		}
+
+		return 's:' . hash( 'sha256', $value );
 	}
 
 	/**
@@ -193,10 +219,13 @@ final class EcpayStoreSelector {
 			return '所選的物流方式無效，請重新選擇。';
 		}
 
-		// 擁有者：登入者的 token 不得被別人拿去用。訪客（0）無從綁定，
-		// 但其餘欄位仍逐項比對。
-		$owner = (int) ( $record['user_id'] ?? 0 );
-		if ( $owner > 0 && $owner !== get_current_user_id() ) {
+		$scope = self::sanitize_cart_scope( (string) ( $data['cart_scope'] ?? 'default' ) );
+
+		// 🔴 擁有者：登入者綁 user id、訪客綁購物車 session。
+		// 兩邊都必須算得出身分——算不出來就是「證明不了是誰」，一律拒絕。
+		$issued_principal  = (string) ( $record['principal'] ?? '' );
+		$current_principal = self::current_principal( $scope );
+		if ( '' === $issued_principal || '' === $current_principal || $issued_principal !== $current_principal ) {
 			return '取貨門市的選擇無效，請重新選擇門市。';
 		}
 
@@ -213,20 +242,36 @@ final class EcpayStoreSelector {
 			return '取貨門市資料已變更，請重新選擇門市。';
 		}
 
-		$scope = self::sanitize_cart_scope( (string) ( $data['cart_scope'] ?? 'default' ) );
 		if ( (string) ( $record['cart_scope'] ?? 'default' ) !== $scope ) {
 			return '取貨門市與目前的購物車不符，請重新選擇門市。';
 		}
 
-		// 🔴 這一條就是 N→Y／Y→N 的守門：門市是在某一種代收前提下被篩出來的。
+		// 🔴 比**精確的付款方式**，不是只比代收模式。
+		//
+		// 只比 N/Y 的話，用信用卡選的門市可以拿去給另一個非代收金流用——那是另一次
+		// 結帳的條件，而不同金流對超商取貨的限制未必相同。付款方式一改就重選，
+		// 這一條同時涵蓋 N→Y 與 Y→N。
+		if ( (string) ( $record['payment_method'] ?? '' ) !== trim( $payment_method ) ) {
+			return '付款方式已變更，原先選擇的取貨門市可能不支援，請重新選擇門市。';
+		}
+
+		// 代收模式仍然獨立再驗一次：即使付款方式字串相同，方式的代收能力也可能
+		// 因設定變動而改變。
 		$was = 'Y' === (string) ( $record['collection_mode'] ?? 'N' );
 		$now = self::resolve_collection_mode( $method, $payment_method );
 		if ( $was !== $now ) {
 			return '付款方式已變更，原先選擇的取貨門市可能不支援，請重新選擇門市。';
 		}
 
-		// 一次性：驗過就消耗掉，同一張 token 不能重複結帳。
-		delete_transient( self::SELECTION_PREFIX . $token );
+		// 🔴 一次性消耗必須是**原子的**。
+		//
+		// 先 `get_transient()` 驗、再 `delete_transient()` 刪的話，兩個併發的結帳
+		// 會同時通過驗證、同時刪除，兩張訂單共用一次選店。
+		// `delete_transient()` 只有在真的刪掉一列時才回 true——把它當成「認領」，
+		// 搶不到的那一個就是慢的那一個。
+		if ( ! delete_transient( self::SELECTION_PREFIX . $token ) ) {
+			return '這次的取貨門市選擇已被使用，請重新選擇門市。';
+		}
 
 		return null;
 	}

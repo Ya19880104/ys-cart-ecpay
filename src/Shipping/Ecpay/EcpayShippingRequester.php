@@ -37,26 +37,35 @@ final class EcpayShippingRequester {
 
 		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create' ), $fields );
 		if ( ! $result['success'] ) {
+			// 🔴 傳輸層說不出「對方有沒有收到」，因此一律往上傳 indeterminate。
+			// 缺 outcome 時也當 indeterminate——缺欄位不是「明確失敗」。
 			return [
 				'success'           => false,
+				'outcome'           => (string) ( $result['outcome'] ?? 'indeterminate' ),
 				'message'           => $result['message'],
 				'merchant_trade_no' => $fields['MerchantTradeNo'],
 			];
 		}
 
 		$params = $result['params'];
+
+		// 🔴 驗不過簽章 ≠ 沒建單。我們收到了一份看不懂的回應，而綠界那邊很可能
+		// 已經成立了一張單。當成明確失敗會放行下一次建單。
 		if ( ! $this->verify_create_response( $params, $credentials ) ) {
 			return [
 				'success'      => false,
+				'outcome'      => 'indeterminate',
 				'message'      => 'ECPay logistics response signature verification failed.',
 				'raw_response' => $result['body'],
 			];
 		}
 
+		// 這一條才是**明確拒絕**：簽章驗過、綠界明白說「沒建立」。
 		$rtn_code = (string) ( $params['RtnCode'] ?? '' );
 		if ( ! in_array( $rtn_code, [ '1', '300' ], true ) ) {
 			return [
 				'success'      => false,
+				'outcome'      => 'provider_failed',
 				'message'      => (string) ( $params['RtnMsg'] ?? 'ECPay logistics create failed.' ),
 				'raw_response' => $params,
 			];
@@ -71,10 +80,15 @@ final class EcpayShippingRequester {
 		// 舊版只把 `CVSPaymentNo` 混進 tracking，驗證碼整個丟掉。
 		$missing = $this->missing_required_fields( $params );
 		if ( [] !== $missing ) {
+			// 🔴 RtnCode 已經是成功——綠界那邊**確實建了一張單**，只是回來的資料
+			// 不足以出貨。這不是「什麼都沒發生」，因此是 indeterminate 而不是失敗：
+			// 當成失敗就會放行下一次建單，於是兩張單。
 			return [
 				'success'      => false,
+				'outcome'      => 'indeterminate',
 				'message'      => sprintf(
-					'綠界建單回應缺少必要欄位（%s），此物流方式無法出貨；請於綠界後台確認該服務是否已開通後重試。',
+					'綠界建單回應缺少必要欄位（%s）：物流單可能已成立但無法出貨。'
+					. '系統不會自動重送；請於綠界後台確認該服務是否已開通並人工處理。',
 					implode( '、', $missing )
 				),
 				'raw_response' => $params,
@@ -331,16 +345,24 @@ final class EcpayShippingRequester {
 			);
 		}
 
-		$weight = (float) ( $order_data['goods_weight'] ?? 0 );
-		if ( $weight <= 0.0 ) {
+		// 🔴 呼叫端**明確**給了重量就以它為準，給 0 或負數是明確的錯誤資料——
+		// 不得悄悄換成後台預設值。0 的意思是「這批貨沒有重量」，那不是一個
+		// 可以拿去報關／算郵資的事實；用一個猜來的預設值送出去，錯的是賣家的錢。
+		//
+		// 後台預設值只在呼叫端**根本沒提供**這個欄位時當後援（舊核心）。
+		if ( array_key_exists( 'goods_weight', $order_data ) ) {
+			$weight = (float) $order_data['goods_weight'];
+		} else {
 			$weight = $this->method->get_default_goods_weight();
 		}
 
 		if ( $weight <= 0.0 ) {
 			throw new \RuntimeException(
 				sprintf(
-					'物流方式 %s 需要包裹重量（綠界規定中華郵政必填），但訂單與後台預設值都沒有，已中止建立物流訂單。',
-					$this->method->get_id()
+					'物流方式 %s 需要有效的包裹重量（綠界規定中華郵政必填），但取得的是 %s，已中止建立物流訂單。'
+					. '請確認商品重量或後台的包裹預設重量。',
+					$this->method->get_id(),
+					number_format( $weight, 3, '.', '' )
 				)
 			);
 		}

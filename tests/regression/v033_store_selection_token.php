@@ -75,6 +75,9 @@ namespace {
     $GLOBALS['ys_transients'] = [];
     $GLOBALS['ys_user_id']    = 0;
     $GLOBALS['ys_token_seq']  = 0;
+    $GLOBALS['ys_transient_snapshot'] = [];
+    // 訪客的身分來源：購物車 session cookie。正常結帳一定有它。
+    $_COOKIE['ys_ec_session'] = 'guest-session-aaa';
 
     function add_filter(string $t, callable $c, int $p = 10, int $a = 1): void {}
     function remove_filter(string $t, callable $c, int $p = 10): bool { return true; }
@@ -105,8 +108,22 @@ namespace {
     function status_header(int $c): void { throw new Responded($c); }
     function wp_die(string $m, string $t = '', array $a = []): void { throw new WpDie($m, (int) ($a['response'] ?? 500)); }
     function set_transient(string $k, $v, int $ttl = 0): bool { $GLOBALS['ys_transients'][$k] = $v; return true; }
-    function get_transient(string $k) { return $GLOBALS['ys_transients'][$k] ?? false; }
-    function delete_transient(string $k): bool { unset($GLOBALS['ys_transients'][$k]); return true; }
+    function get_transient(string $k) {
+        // 🔴 模擬併發：`ys_transient_snapshot` 打開時，即使記錄已被另一個 process
+        // 刪掉，這個 process 仍讀得到——那正是「兩邊都先讀完才有人刪」的競態。
+        if (!empty($GLOBALS['ys_transient_snapshot']) && isset($GLOBALS['ys_transient_snapshot'][$k])) {
+            return $GLOBALS['ys_transient_snapshot'][$k];
+        }
+        return $GLOBALS['ys_transients'][$k] ?? false;
+    }
+    function delete_transient(string $k): bool {
+        // 🔴 與 WP 一致：只有真的刪掉一列才回 true。一次性消耗就是靠這個認領。
+        if (!array_key_exists($k, $GLOBALS['ys_transients'])) {
+            return false;
+        }
+        unset($GLOBALS['ys_transients'][$k]);
+        return true;
+    }
 
     $root = dirname(__DIR__, 2);
     require_once $root . '/src/Support/CheckMacValue.php';
@@ -202,7 +219,8 @@ namespace {
             && 'FAMI' === ($record['logistics_subtype'] ?? '')
             && 'N' === ($record['collection_mode'] ?? '')
             && 'default' === ($record['cart_scope'] ?? '')
-            && array_key_exists('user_id', $record)
+            && 'ys_ec_credit' === ($record['payment_method'] ?? '')
+            && '' !== (string) ($record['principal'] ?? '')
     );
 
     // ── happy path 與一次性 ───────────────────────────────────────────────
@@ -245,14 +263,35 @@ namespace {
     // 竄改後上面幾次都沒有消耗掉 token，正確的那一次仍應通過。
     check('(l) 前面幾次被拒絕不會消耗 token；正確的結帳仍通過', null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
 
-    // ── 擁有者綁定 ────────────────────────────────────────────────────────
+    // ── 身分綁定（登入者與訪客都要綁） ────────────────────────────────────
     $GLOBALS['ys_user_id'] = 7;
     $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
     $GLOBALS['ys_user_id'] = 9;
-    check('(m) 別人的 token 不能拿來用', null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+    check('(m) 別的登入者不能用', null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
     $GLOBALS['ys_user_id'] = 7;
     check('(n) 本人可以用', null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
     $GLOBALS['ys_user_id'] = 0;
+
+    // 🔴 訪客也要綁：換一個購物車 session 就不能用同一張 token。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $_COOKIE['ys_ec_session'] = 'guest-session-bbb';
+    check('(m2) 訪客：換一個購物車 session 之後不能用', null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+    $_COOKIE['ys_ec_session'] = 'guest-session-aaa';
+    check('(n2) 訪客：同一個購物車 session 可以用', null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+
+    // 完全沒有身分（沒登入、沒購物車 session）＝證明不了是誰，一律拒絕。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    unset($_COOKIE['ys_ec_session']);
+    check('(m3) 沒有任何身分來源時拒絕（證明不了是誰）', null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+    $_COOKIE['ys_ec_session'] = 'guest-session-aaa';
+
+    // 🔴 精確付款方式：只比代收模式（N/Y）是不夠的。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    check(
+        '(m4) 換成另一個**同樣不代收**的金流也要重選（門市限制未必相同）',
+        null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_ecpay_atm')
+    );
+    check('(n4) 同一個金流可以用', null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
 
     // ── 兩個呼叫端都必須送出付款方式 ──────────────────────────────────────
     $native = (string) file_get_contents(dirname(__DIR__, 3) . '/ys-cart/assets/js/ys-ec-store-selector.js');
@@ -275,6 +314,21 @@ namespace {
         false !== strpos($sdk, 'payment_method:')
             && false !== strpos($sdk, 'selectionToken')
             && false !== strpos($sdk, "selectionTokenField: 'ecpay_store_token'")
+    );
+
+    // 🔴 併發：兩次結帳同時通過驗證、同時走到消耗那一步。
+    // 「先 get 再 delete」的寫法會讓兩邊都過；以 delete 的回傳值認領才擋得住。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    // 兩個 process 都已經讀到記錄（快照），接著才各自嘗試消耗。
+    $GLOBALS['ys_transient_snapshot'] = [
+        'ys_ec_ecpay_sel_' . $token => $GLOBALS['ys_transients']['ys_ec_ecpay_sel_' . $token],
+    ];
+    $first  = checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $second = checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $GLOBALS['ys_transient_snapshot'] = [];
+    check(
+        '(s) 兩次併發結帳（兩邊都已讀到記錄）只有一次能消耗同一張憑證',
+        null === $first && null !== $second
     );
 
     $template = (string) file_get_contents(dirname(__DIR__, 3) . '/ys-cart/templates/checkout/form-checkout.php');

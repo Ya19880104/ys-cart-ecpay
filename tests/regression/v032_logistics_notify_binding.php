@@ -19,8 +19,21 @@ namespace YangSheep\Ecommerce\Models {
         /** @var array<int,array<string,mixed>> */
         public static array $updates = [];
 
+        /**
+         * 🔴 production 的 YSOrder::update() 對 affected=0 也回 true。
+         * `$GLOBALS['ys_order_silent_write']` 就是在模擬那個情境：回 true，
+         * 但資料**沒有真的改變**。ACK 之前必須讀回來才抓得到。
+         */
         public static function update( int $id, array $data ): bool {
             self::$updates[] = [ 'id' => $id ] + $data;
+            if ( ! empty( $GLOBALS['ys_order_silent_write'] ) ) {
+                return true;
+            }
+            if ( isset( $GLOBALS['wpdb'] ) && null !== $GLOBALS['wpdb']->order ) {
+                foreach ( $data as $k => $v ) {
+                    $GLOBALS['wpdb']->order->{$k} = $v;
+                }
+            }
             return true;
         }
     }
@@ -290,6 +303,33 @@ namespace {
     check(
         '(o) label 在但訂單讀不到時回 503（那是我們這邊的問題，不是對方送錯）',
         503 === notify(base_notify()) && [] === $wpdb->updates
+    );
+
+    // 🔴 `YSOrder::update()` 對 affected=0 也回 true——「回 true」不代表寫進去了。
+    // 沒有讀回來確認的話，這一筆會被 ACK 掉，而那個狀態永遠不會再送來。
+    $wpdb = seed_label();
+    $GLOBALS['ys_order_silent_write'] = true;
+    $silent = notify(base_notify());
+    $GLOBALS['ys_order_silent_write'] = false;
+    check('(p) 訂單寫入「回 true 但沒真的改變」時回 503（必須讀回來確認）', 503 === $silent);
+
+    // 🔴 追蹤碼只取託運單號。沒有 BookingNote 時**不得**退回物流編號——
+    // 顧客拿 AllPayLogisticsID 去物流商網站是查不到的，而客服看到「有追蹤碼」
+    // 就不會再追下去。
+    $wpdb = seed_label();
+    $no_booking = base_notify();
+    unset($no_booking['BookingNote']);
+    notify($no_booking);
+    $order_tracking = null;
+    foreach (YSOrder::$updates as $u) {
+        if (array_key_exists('tracking_number', $u)) {
+            $order_tracking = (string) $u['tracking_number'];
+        }
+    }
+    check(
+        '(q) 沒有託運單號時不得把 AllPayLogisticsID 當成追蹤碼',
+        '900000001' !== $order_tracking
+            && '900000001' !== ($wpdb->updates[0]['data']['tracking_number'] ?? null)
     );
 
     echo "\nREGRESSION v032_logistics_notify_binding PASS={$pass} FAIL={$fail}\n";

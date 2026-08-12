@@ -196,14 +196,14 @@ final class EcpayLogisticsController {
 	 * @param array<string,string> $params
 	 */
 	private function update_order_shipping( object $order, array $params, object $label ): bool {
-		// 追蹤碼優先取託運單號；沒有時才退回物流編號。
-		// 🔴 寄貨編號（CVSPaymentNo）**不是**追蹤碼，不要混進來——它是賣家交貨用的
-		// 憑據，另外落盤。
+		// 🔴 追蹤碼**只**取託運單號（BookingNote）。
+		//
+		// 寄貨編號（CVSPaymentNo）是賣家交貨用的憑據、物流編號（AllPayLogisticsID）
+		// 是綠界內部的交易序號——三個語意完全不同。舊版沒有託運單號時退回物流編號，
+		// 於是顧客拿去物流商網站查會查不到，而客服看到「有追蹤碼」就不會再追。
+		// 沒有就是沒有（後續的通知會補上）。
 		$tracking = trim( (string) ( $params['BookingNote'] ?? '' ) );
-		if ( '' === $tracking ) {
-			$tracking = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
-		}
-		$status = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
+		$status   = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
 
 		$payment_detail = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
 		if ( ! is_array( $payment_detail ) ) {
@@ -227,9 +227,13 @@ final class EcpayLogisticsController {
 			$order_update['shipping_status'] = $this->map_status( $status );
 		}
 
-		// 🔴 每一個寫入都要確認成功。`YSOrder::update()` 回 true 不代表寫進去了，
-		// 但回 false 一定是失敗——先擋掉明確失敗的那一半。
+		// 🔴 `YSOrder::update()` 對 affected=0 也回 true——「回 true」不代表寫進去了。
+		// ACK 不可逆，所以每一個寫入都要**讀回來**確認。
 		if ( false === YSOrder::update( (int) $order->id, $order_update ) ) {
+			return false;
+		}
+
+		if ( ! $this->order_update_persisted( (int) $order->id, $order_update ) ) {
 			return false;
 		}
 
@@ -238,11 +242,48 @@ final class EcpayLogisticsController {
 		}
 
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
-			YSShippingPipelineService::advance_from_carrier_status(
+			$advanced = YSShippingPipelineService::advance_from_carrier_status(
 				(int) $order->id,
 				$status,
 				'webhook_ecpay'
 			);
+
+			// 🔴 分辨兩種 `success => false`：
+			//   - 不允許的狀態轉換＝**已知**且重送也不會變，不擋 ACK；
+			//   - `persisted => false`＝寫不進去，是 retryable，必須回非 2xx。
+			if ( is_array( $advanced ) && false === ( $advanced['persisted'] ?? true ) ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * 訂單那幾個欄位真的落盤了嗎
+	 *
+	 * @param array<string,mixed> $expected
+	 */
+	private function order_update_persisted( int $order_id, array $expected ): bool {
+		global $wpdb;
+
+		$orders_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
+		$row          = $wpdb->get_row( $wpdb->prepare(
+			"SELECT payment_detail, tracking_number FROM {$orders_table} WHERE id = %d",
+			$order_id
+		) );
+
+		if ( null === $row ) {
+			return false;
+		}
+
+		foreach ( [ 'payment_detail', 'tracking_number' ] as $column ) {
+			if ( ! array_key_exists( $column, $expected ) ) {
+				continue;
+			}
+			if ( (string) ( $row->{$column} ?? '' ) !== (string) $expected[ $column ] ) {
+				return false;
+			}
 		}
 
 		return true;

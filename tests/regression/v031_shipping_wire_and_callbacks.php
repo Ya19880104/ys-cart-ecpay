@@ -97,6 +97,7 @@ namespace {
     $GLOBALS['ys_last_post']   = null;
     $GLOBALS['ys_next_body']   = '';
     $GLOBALS['ys_filters']     = [];
+    $GLOBALS['ys_transport_fails'] = false;
 
     function add_filter(string $tag, callable $cb, int $priority = 10, int $args = 1): void {
         $GLOBALS['ys_filters'][$tag][$priority][] = $cb;
@@ -141,11 +142,21 @@ namespace {
     function get_transient(string $key) { return $GLOBALS['ys_transients'][$key] ?? false; }
     function delete_transient(string $key): bool { unset($GLOBALS['ys_transients'][$key]); return true; }
 
+    /** WP_Error 的替身：傳輸層失敗。 */
+    final class FakeWpError {
+        public function __construct(private string $msg = 'cURL error 28: Operation timed out') {}
+        public function get_error_message(): string { return $this->msg; }
+    }
+
     function wp_remote_post(string $url, array $args = []) {
         $GLOBALS['ys_last_post'] = [ 'url' => $url, 'fields' => $args['body'] ?? [] ];
+        if (!empty($GLOBALS['ys_transport_fails'])) {
+            return new FakeWpError();
+        }
         return [ 'body' => $GLOBALS['ys_next_body'] ];
     }
-    function is_wp_error($thing): bool { return false; }
+    function is_wp_error($thing): bool { return $thing instanceof FakeWpError; }
+    function wp_remote_retrieve_response_code($response): int { return 200; }
     function wp_remote_retrieve_body($response): string { return (string) ($response['body'] ?? ''); }
 
     $root = dirname(__DIR__, 2);
@@ -347,10 +358,25 @@ namespace {
         $post_null_weight instanceof \Throwable
     );
 
+    // 🔴 明確給 0（或負數）是**明確的錯誤資料**，不得悄悄換成後台預設值——
+    // 那等於拿一個猜來的重量去算郵資。後台預設值只在呼叫端根本沒給這個欄位時才用。
     [, $post_zero_weight] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => 0 ]));
     check(
-        '(5g) 訂單重量為 0 時退回後台預設值（0 是「確定沒有」，不是讀取失敗）',
-        is_array($post_zero_weight) && true === ($post_zero_weight['success'] ?? false)
+        '(5g) 明確傳入 goods_weight=0 時 fail-closed（不得退回後台預設值）',
+        $post_zero_weight instanceof \Throwable
+    );
+
+    [, $post_negative] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => -1 ]));
+    check('(5g2) 負數重量同樣 fail-closed', $post_negative instanceof \Throwable);
+
+    $post_absent = base_order();
+    unset($post_absent['goods_weight']);
+    [$post_absent_fields, $post_absent_result] = send('ys_ec_ecpay_ship_post', $post_absent);
+    check(
+        '(5g3) 呼叫端沒給重量欄位時才退回後台預設值',
+        is_array($post_absent_result)
+            && true === ($post_absent_result['success'] ?? false)
+            && '1.500' === ($post_absent_fields['GoodsWeight'] ?? null)
     );
 
     [$post_20] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => 20.0 ]));
@@ -391,6 +417,38 @@ namespace {
     check(
         '(ID-b) 成功時回傳的 provider_trade_no 就是 AllPayLogisticsID（不 fallback 到 MerchantTradeNo）',
         is_array($ok_result) && '900000001' === ($ok_result['provider_trade_no'] ?? '')
+    );
+
+    // ── 傳輸層失敗 ────────────────────────────────────────────────────────
+    //
+    // 🔴 逾時只證明「我們沒收到回應」，不證明「綠界沒收到請求」。回一個沒有
+    // outcome 的失敗，呼叫端會預設成終局失敗而放行下一次建單——重複出貨。
+    $GLOBALS['ys_transport_fails'] = true;
+    [, $timeout_result] = send('ys_ec_ecpay_ship_tcat', base_order());
+    $GLOBALS['ys_transport_fails'] = false;
+
+    check(
+        '(TX-a) 逾時／連線失敗回 outcome=indeterminate（不是可重試的失敗）',
+        is_array($timeout_result)
+            && false === ($timeout_result['success'] ?? true)
+            && 'indeterminate' === ($timeout_result['outcome'] ?? '')
+    );
+
+    // 簽章驗不過也是 indeterminate：我們收到一份看不懂的回應，綠界很可能已建單。
+    $GLOBALS['ys_next_body'] = '1|RtnCode=1&RtnMsg=OK&MerchantID=' . MID . '&AllPayLogisticsID=1&CheckMacValue=DEADBEEF';
+    $GLOBALS['ys_last_post'] = null;
+    $bad_sig = (new EcpayShippingRequester(new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat()))
+        ->create_order(base_order());
+    check(
+        '(TX-b) 簽章驗證失敗也是 indeterminate（不得當成明確失敗）',
+        false === ($bad_sig['success'] ?? true) && 'indeterminate' === ($bad_sig['outcome'] ?? '')
+    );
+
+    // 綠界明確說「沒建立」才是 provider_failed。
+    [, $rejected] = send('ys_ec_ecpay_ship_tcat', base_order(), [ 'RtnCode' => '10500040', 'RtnMsg' => '門市代號錯誤' ]);
+    check(
+        '(TX-c) 綠界明確拒絕才是 provider_failed（可以安全地開下一次）',
+        is_array($rejected) && 'provider_failed' === ($rejected['outcome'] ?? '')
     );
 
     // ── 取消：本版不實作，必須明確回 unsupported ──────────────────────────

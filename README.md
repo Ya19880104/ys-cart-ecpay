@@ -52,7 +52,11 @@ method ID:
 Submit the returned `action_url` and `fields` as a top-level browser form post
 or popup form post. Do not expose ECPay hash keys or callback verification logic
 to browser code.
-The bundled SDK exposes `YsCartEcpay.requestStoreMapForm(apiBase, shippingId)`
+Checkout must return the map callback's `selection_token` as `ecpay_store_token`
+(v0.2.12); the store id alone is no longer accepted. See `docs/headless.md`.
+
+The bundled SDK exposes
+`YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`
 for this request.
 
 ## Release

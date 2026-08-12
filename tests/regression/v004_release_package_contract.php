@@ -241,11 +241,13 @@ $assert(!in_array('CHANGELOG.md', $scan['files'], true), '(C3) CHANGELOG.md 不�
 // 到每一個安裝站點沒有任何好處。以 exact path 斷言而非前綴比對：docs/ 底下的
 // 其他文件（headless.md）仍應出貨。檔案必須留在 repo，只是不出貨。
 // v0.2.12（shipping-only）：本分支沒有內部 runbook——退款 sandbox gate 是金流線的
-// 文件，不在這個發佈範圍。機制保留（清單一有東西就會被驗），清單目前為空。
-$mustNotShip = array_values(array_filter(
-    ['docs/credit-refund-sandbox-gate.md'],
-    static fn (string $relative): bool => is_file($root . '/' . $relative)
-));
+// 文件，不在這個發佈範圍。
+//
+// 🔴 先前寫成 `array_filter(..., is_file)`，於是 C5「檔案仍在 repo」變成恆真
+// （不存在的檔案被過濾掉了，清單永遠是空的）——那不是通過，是沒有斷言。
+// 現在改為：清單就是政策清單（不過濾），C4 驗它不出貨，C5 只在該檔**確實存在**
+// 時才要求它留著，而政策本身另外以 C5b 直接驗（不依賴檔案存在）。
+$mustNotShip = ['docs/credit-refund-sandbox-gate.md'];
 $shipLeaks   = [];
 $missingDocs = [];
 foreach ($mustNotShip as $forbidden) {
@@ -257,7 +259,22 @@ foreach ($mustNotShip as $forbidden) {
     }
 }
 $assert([] === $shipLeaks, '(C4) 內部 release runbook 不隨包出貨（' . (implode(', ', $shipLeaks) ?: '無洩漏') . '）');
-$assert([] === $missingDocs, '(C5) 該 runbook 仍保留在 repo（排除 ≠ 刪除）');
+
+// C5 只在該檔真的存在於 repo 時才要求「排除 ≠ 刪除」；本分支沒有它，
+// 因此這一條會被明確標示為 not-applicable 而不是假裝通過。
+$presentRunbooks = array_values(array_filter($mustNotShip, static fn (string $r): bool => is_file($root . '/' . $r)));
+if ([] === $presentRunbooks) {
+    echo "  N/A   (C5) 本分支沒有內部 release runbook（清單：" . implode(', ', $mustNotShip) . "）\n";
+} else {
+    $assert([] === $missingDocs, '(C5) 該 runbook 仍保留在 repo（排除 ≠ 刪除）');
+}
+
+// 🔴 C5b：政策本身必須仍然認得 internal runbook 這個排除類別——這一條**不依賴
+// 任何檔案存在**，因此不會因為分支上沒有那份文件而變成恆真。
+$assert(
+    null !== ys_cart_ecpay_release_exclusion_reason('docs/credit-refund-sandbox-gate.md'),
+    '(C5b) 排除政策仍認得 internal release runbook（不依賴檔案是否存在）'
+);
 $assert(
     null === ys_cart_ecpay_release_exclusion_reason('docs/headless.md'),
     '(C6) 排除以 exact path 為準——docs/ 底下的其他文件仍應出貨'
