@@ -58,8 +58,13 @@ namespace {
 
     final class FakeWpdb {
         public string $prefix = 'wp_';
+        public string $last_error = '';
         public ?object $label = null;
         public ?object $order = null;
+        /** 讀 label 時要不要模擬資料庫失敗。 */
+        public bool $read_fails = false;
+        /** 寫 label 時要不要模擬資料庫失敗。 */
+        public bool $write_fails = false;
         /** @var array<int,array{table:string,data:array<string,mixed>,where:array<string,mixed>}> */
         public array $updates = [];
 
@@ -72,6 +77,15 @@ namespace {
 
         public function get_row(string $sql) {
             if (false !== strpos($sql, 'shipping_labels')) {
+                if ($this->read_fails) {
+                    $this->last_error = 'MySQL server has gone away';
+                    return null;
+                }
+                // sync_label() 的 readback：回傳最後一次寫進去的狀態。
+                if (false !== strpos($sql, 'SELECT status FROM')) {
+                    $last = end($this->updates);
+                    return $last ? (object) [ 'status' => $last['data']['status'] ?? '' ] : null;
+                }
                 return $this->label;
             }
             if (false !== strpos($sql, 'orders')) {
@@ -81,6 +95,10 @@ namespace {
         }
 
         public function update(string $table, array $data, array $where) {
+            if ($this->write_fails) {
+                $this->last_error = 'Lock wait timeout';
+                return false;
+            }
             $this->updates[] = [ 'table' => $table, 'data' => $data, 'where' => $where ];
             return 1;
         }
@@ -250,6 +268,29 @@ namespace {
     notify(base_notify([ 'CVSPaymentNo' => 'CP111' ]));
     check('(l) tracking_number 取託運單號，不取寄貨編號',
         'BN999' === ($wpdb->updates[0]['data']['tracking_number'] ?? null));
+
+    // 🔴 ACK 不可逆：回了 1|OK，綠界就不會再送這則通知。讀不動／寫不進去時
+    // 一律回非 2xx，讓對方重送——「收到了但沒存起來」在 ACK 之後無法補救。
+    $wpdb = seed_label();
+    $wpdb->read_fails = true;
+    check(
+        '(m) 讀取 label 失敗時回 503（不得 ACK 1|OK，否則那筆通知永遠遺失）',
+        503 === notify(base_notify()) && [] === $wpdb->updates
+    );
+
+    $wpdb = seed_label();
+    $wpdb->write_fails = true;
+    check(
+        '(n) 寫入失敗時回 503（全部 durable 之後才 ACK）',
+        503 === notify(base_notify())
+    );
+
+    $wpdb = seed_label();
+    $wpdb->order = null;
+    check(
+        '(o) label 在但訂單讀不到時回 503（那是我們這邊的問題，不是對方送錯）',
+        503 === notify(base_notify()) && [] === $wpdb->updates
+    );
 
     echo "\nREGRESSION v032_logistics_notify_binding PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {

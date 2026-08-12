@@ -130,11 +130,112 @@ final class EcpayStoreSelector {
 		return $method->supports_cod();
 	}
 
+	/** 門市選擇 token 的 transient 前綴。 */
+	private const SELECTION_PREFIX = 'ys_ec_ecpay_sel_';
+
+	/** 門市選擇的有效期（秒）。與地圖 session 一致。 */
+	private const SELECTION_TTL = 30 * MINUTE_IN_SECONDS;
+
+	/**
+	 * 發出一張不透明的門市選擇 token，並把**權威資料留在伺服器**。
+	 *
+	 * 🔴 前端拿到的只是一個沒有意義的字串。門市代號、subtype、代收前提、擁有者、
+	 * 購物車 scope 全部存在伺服器這一側——前端改不了，也偽造不出來。
+	 *
+	 * 舊做法是把整包門市資料丟進 localStorage 再由結帳送回來，於是
+	 * 「這個門市是在哪一種前提下選的」變成一個可竄改的欄位，等於沒有守門。
+	 *
+	 * @param array<string,mixed> $selection
+	 */
+	private static function issue_selection_token( array $selection ): string {
+		$token = wp_generate_password( 32, false, false );
+
+		set_transient( self::SELECTION_PREFIX . $token, [
+			'shipping_id'       => (string) ( $selection['shipping_id'] ?? '' ),
+			'logistics_subtype' => (string) ( $selection['cvs_type'] ?? '' ),
+			'store_id'          => (string) ( $selection['store_id'] ?? '' ),
+			'store_name'        => (string) ( $selection['store_name'] ?? '' ),
+			'store_address'     => (string) ( $selection['store_address'] ?? '' ),
+			'collection_mode'   => (string) ( $selection['collection_mode'] ?? 'N' ),
+			'payment_method'    => (string) ( $selection['payment_method'] ?? '' ),
+			'cart_scope'        => (string) ( $selection['cart_scope'] ?? 'default' ),
+			'user_id'           => get_current_user_id(),
+			'issued_at'         => current_time( 'timestamp' ),
+		], self::SELECTION_TTL );
+
+		return $token;
+	}
+
+	/**
+	 * 驗證並消耗一張門市選擇 token。
+	 *
+	 * 回 `null` 代表通過（並已消耗）；回字串代表拒絕的理由，呼叫端據此要求重選。
+	 *
+	 * 逐項比對：擁有者、購物車 scope、物流方式、subtype、門市代號，以及**最終的
+	 * 付款方式**是否與當初選店的代收前提一致。任何一項對不上就重選——包含 token
+	 * 不存在（過期或偽造）。
+	 *
+	 * @param array<string,mixed> $data 結帳送出的資料
+	 */
+	public static function consume_selection( array $data, string $shipping_id, string $payment_method ): ?string {
+		$token = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		if ( '' === $token ) {
+			return '請重新選擇取貨門市（缺少門市選擇憑證）。';
+		}
+
+		$record = get_transient( self::SELECTION_PREFIX . $token );
+		if ( ! is_array( $record ) ) {
+			return '取貨門市的選擇已逾時或無效，請重新選擇門市。';
+		}
+
+		$method = self::instantiate( $shipping_id );
+		if ( null === $method ) {
+			return '所選的物流方式無效，請重新選擇。';
+		}
+
+		// 擁有者：登入者的 token 不得被別人拿去用。訪客（0）無從綁定，
+		// 但其餘欄位仍逐項比對。
+		$owner = (int) ( $record['user_id'] ?? 0 );
+		if ( $owner > 0 && $owner !== get_current_user_id() ) {
+			return '取貨門市的選擇無效，請重新選擇門市。';
+		}
+
+		if ( (string) ( $record['shipping_id'] ?? '' ) !== $shipping_id ) {
+			return '取貨門市與所選的物流方式不符，請重新選擇門市。';
+		}
+
+		if ( (string) ( $record['logistics_subtype'] ?? '' ) !== $method->get_logistics_subtype() ) {
+			return '取貨門市與所選的物流方式不符，請重新選擇門市。';
+		}
+
+		$submitted_store = trim( (string) ( $data['cvs_store_id'] ?? '' ) );
+		if ( '' === $submitted_store || $submitted_store !== (string) ( $record['store_id'] ?? '' ) ) {
+			return '取貨門市資料已變更，請重新選擇門市。';
+		}
+
+		$scope = self::sanitize_cart_scope( (string) ( $data['cart_scope'] ?? 'default' ) );
+		if ( (string) ( $record['cart_scope'] ?? 'default' ) !== $scope ) {
+			return '取貨門市與目前的購物車不符，請重新選擇門市。';
+		}
+
+		// 🔴 這一條就是 N→Y／Y→N 的守門：門市是在某一種代收前提下被篩出來的。
+		$was = 'Y' === (string) ( $record['collection_mode'] ?? 'N' );
+		$now = self::resolve_collection_mode( $method, $payment_method );
+		if ( $was !== $now ) {
+			return '付款方式已變更，原先選擇的取貨門市可能不支援，請重新選擇門市。';
+		}
+
+		// 一次性：驗過就消耗掉，同一張 token 不能重複結帳。
+		delete_transient( self::SELECTION_PREFIX . $token );
+
+		return null;
+	}
+
 	/**
 	 * 既有的門市選擇，在付款方式變成 $payment_method 之後還算不算數。
 	 *
-	 * 🔴 不算數就必須重新選店。舊選擇是在另一種代收前提下由綠界篩出來的門市，
-	 * 沿用它會得到「顧客選得到、建單被拒」——而那時候顧客已經結完帳了。
+	 * 這是給**前端**用的提示述詞（讓使用者在按下結帳之前就看到要重選），
+	 * 不是守門本身——守門是 {@see self::consume_selection()}，在伺服器端。
 	 *
 	 * @param array<string,mixed> $selection 門市選擇（store callback 的 payload）。
 	 */
@@ -207,7 +308,10 @@ final class EcpayStoreSelector {
 			'selected_at'     => current_time( 'mysql' ),
 		];
 
-		set_transient( 'ys_ec_ecpay_store_' . $temp_id, $store_info, 30 * MINUTE_IN_SECONDS );
+		// 🔴 發 token，權威資料留伺服器。前端只帶這個字串回結帳。
+		$store_info['selection_token'] = self::issue_selection_token( $store_info );
+
+		set_transient( 'ys_ec_ecpay_store_' . $temp_id, $store_info, self::SELECTION_TTL );
 		delete_transient( 'ys_ec_ecpay_map_' . $temp_id );
 
 		self::render_callback_page( $store_info );

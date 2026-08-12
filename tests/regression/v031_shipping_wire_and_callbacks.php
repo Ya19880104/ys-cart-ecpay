@@ -196,7 +196,7 @@ namespace {
         $n = 0;
         foreach (EcpayShippingCatalog::all() as $method_id => $descriptor) {
             $settings[$descriptor['enabled_option']] = '1';
-            if ($descriptor['requires_return_store']) {
+            if ($descriptor['supports_return_store']) {
                 $settings[$descriptor['return_store_option']] = 'RS' . str_pad((string) (++$n), 4, '0', STR_PAD_LEFT);
             }
             if ($descriptor['requires_goods_weight']) {
@@ -260,6 +260,8 @@ namespace {
             'receiver_zipcode'  => '110',
             'receiver_address'  => '台北市信義區測試路2號',
             'payment_method'    => 'ys_ec_credit',
+            // v0.2.12：特店交易編號由核心的建單授權提供（送出前已落盤）。
+            'merchant_trade_no' => 'YSL0123456789ABCDEF0',
         ], $overrides);
     }
 
@@ -274,7 +276,7 @@ namespace {
         if ('HOME' === $descriptor['logistics_type']) {
             unset($order['receiver_store_id']);
         }
-        [$fields, $result] = send($method_id, $order, 'CVS' === $descriptor['logistics_type'] && $descriptor['requires_return_store']
+        [$fields, $result] = send($method_id, $order, 'CVS' === $descriptor['logistics_type'] && $descriptor['supports_return_store']
             ? [ 'CVSPaymentNo' => 'CP123456', 'CVSValidationNo' => '4551' ]
             : []);
 
@@ -338,6 +340,86 @@ namespace {
     );
     reset_settings();
 
+    // 🔴 重量的四種 fail-closed：讀取失敗、<=0、剛好 20、超過 20。
+    [, $post_null_weight] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => null ]));
+    check(
+        '(5f) 核心回報重量讀取失敗（null）時中止——不得退回後台預設值',
+        $post_null_weight instanceof \Throwable
+    );
+
+    [, $post_zero_weight] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => 0 ]));
+    check(
+        '(5g) 訂單重量為 0 時退回後台預設值（0 是「確定沒有」，不是讀取失敗）',
+        is_array($post_zero_weight) && true === ($post_zero_weight['success'] ?? false)
+    );
+
+    [$post_20] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => 20.0 ]));
+    check(
+        '(5h) 剛好 20 公斤（上限）可以送出，且值不被改動',
+        '20.000' === ($post_20['GoodsWeight'] ?? null)
+    );
+
+    [, $post_over] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => 20.001 ]));
+    check(
+        '(5i) 20.001 公斤超過上限 → 中止，**不 clamp 成 20**',
+        $post_over instanceof \Throwable
+    );
+
+    // ── 建單成功必須帶回 AllPayLogisticsID（所有方法） ────────────────────
+    $missing_id_ok = true;
+    foreach (EcpayShippingCatalog::all() as $method_id => $descriptor) {
+        $order = base_order();
+        if ('HOME' === $descriptor['logistics_type']) {
+            unset($order['receiver_store_id']);
+        }
+        // 回應把 AllPayLogisticsID 清空——其餘欄位齊全。
+        [, $result] = send($method_id, $order, [
+            'AllPayLogisticsID' => '',
+            'CVSPaymentNo'      => 'CP1',
+            'CVSValidationNo'   => '4551',
+        ]);
+        if (!is_array($result) || false !== ($result['success'] ?? null)) {
+            $missing_id_ok = false;
+        }
+    }
+    check(
+        '(ID-a) 11 個方法**每一個**在缺 AllPayLogisticsID 時都判為建單失敗',
+        $missing_id_ok
+    );
+
+    [, $ok_result] = send('ys_ec_ecpay_ship_tcat', base_order());
+    check(
+        '(ID-b) 成功時回傳的 provider_trade_no 就是 AllPayLogisticsID（不 fallback 到 MerchantTradeNo）',
+        is_array($ok_result) && '900000001' === ($ok_result['provider_trade_no'] ?? '')
+    );
+
+    // ── 取消：本版不實作，必須明確回 unsupported ──────────────────────────
+    //
+    // 🔴 回 `false`／`success => false` 是不夠的：核心的重新取單／換門市流程會把
+    // 「沒取消」讀成「可以重建」，而綠界那邊的舊單還活著——同一張訂單出兩次貨。
+    $cancel_ok = true;
+    foreach (EcpayShippingCatalog::all() as $method_id => $descriptor) {
+        /** @var EcpayShipping $method */
+        $method    = new $descriptor['class']();
+        $requester = new EcpayShippingRequester($method);
+        $outcome   = $requester->cancel_order([ 'provider_trade_no' => '900000001' ]);
+        if (!is_array($outcome) || 'unsupported' !== ($outcome['outcome'] ?? '')) {
+            $cancel_ok = false;
+        }
+    }
+    check(
+        '(CX-a) 11 個方法的 cancel_order() 都明確回 unsupported（不是 false）',
+        $cancel_ok
+    );
+
+    check(
+        '(CX-b) cancel_order() 接受陣列 context（與核心的 ABI 一致）',
+        is_array(
+            (new EcpayShippingRequester(new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingTcat()))
+                ->cancel_order([ 'label_id' => 1, 'provider_trade_no' => '900000001' ])
+        )
+    );
+
     // ── (7) 代收由訂單決定，不是由物流方式的能力決定 ──────────────────────
     [$cod_fields]  = send('ys_ec_ecpay_ship_tcat', base_order([ 'payment_method' => 'ys_ec_cod' ]));
     [$paid_fields] = send('ys_ec_ecpay_ship_tcat', base_order([ 'payment_method' => 'ys_ec_ecpay_credit' ]));
@@ -385,7 +467,7 @@ namespace {
     );
 
     check(
-        '(C2C-a) C2C 送出自己的 ReturnStoreID',
+        '(C2C-a) 7-ELEVEN 交貨便送出自己的 ReturnStoreID',
         ($c2c_fields['ReturnStoreID'] ?? '') === (string) YSEcommerce::$settings['ys_ec_ecpay_ship_unimart_c2c_return_store_id']
             && '' !== ($c2c_fields['ReturnStoreID'] ?? '')
     );
@@ -399,10 +481,30 @@ namespace {
             && 'UNIMARTC2C' === ($c2c_result['logistics_subtype'] ?? '')
     );
 
+    // 🔴 ReturnStoreID 的四組 wire 案例（官方：選填，且僅 UNIMARTC2C 適用）。
     YSEcommerce::$settings['ys_ec_ecpay_ship_unimart_c2c_return_store_id'] = '';
-    [, $c2c_no_return] = send('ys_ec_ecpay_ship_unimart_c2c', base_order(), [ 'CVSPaymentNo' => 'CP1', 'CVSValidationNo' => '1' ]);
-    check('(C2C-c) 缺退貨門市時中止建單（不猜一個門市）', $c2c_no_return instanceof \Throwable);
+    [$c2c_no_return, $c2c_no_return_result] = send('ys_ec_ecpay_ship_unimart_c2c', base_order(), [ 'CVSPaymentNo' => 'CP1', 'CVSValidationNo' => '1' ]);
+    check(
+        '(RS-1) 適用且已填 → 送出 ReturnStoreID（見 C2C-a）；適用但沒填 → **不送**該欄位且建單照常成功',
+        !isset($c2c_no_return['ReturnStoreID'])
+            && is_array($c2c_no_return_result)
+            && true === ($c2c_no_return_result['success'] ?? false)
+    );
     reset_settings();
+
+    [$fami_fields] = send('ys_ec_ecpay_ship_family_c2c', base_order(), [ 'CVSPaymentNo' => 'FM1' ]);
+    [$hilife_fields] = send('ys_ec_ecpay_ship_hilife_c2c', base_order(), [ 'CVSPaymentNo' => 'HL1' ]);
+    check(
+        '(RS-2) 不適用的 C2C（全家／萊爾富）一律不送 ReturnStoreID',
+        !isset($fami_fields['ReturnStoreID']) && !isset($hilife_fields['ReturnStoreID'])
+    );
+
+    [$b2c_fields] = send('ys_ec_ecpay_ship_family', base_order());
+    [$home_fields] = send('ys_ec_ecpay_ship_tcat', base_order());
+    check(
+        '(RS-3) B2C 與宅配一律不送 ReturnStoreID',
+        !isset($b2c_fields['ReturnStoreID']) && !isset($home_fields['ReturnStoreID'])
+    );
 
     // 7-ELEVEN 交貨便少了驗證碼＝賣家寄不出去，必須當建單失敗。
     [, $c2c_missing_validation] = send('ys_ec_ecpay_ship_unimart_c2c', base_order(), [ 'CVSPaymentNo' => 'CP1' ]);
@@ -424,27 +526,30 @@ namespace {
     [, $no_store_result] = send('ys_ec_ecpay_ship_family', $no_store);
     check('(CVS-a) 缺收件門市代號時中止建單', $no_store_result instanceof \Throwable);
 
-    // ── MerchantTradeNo 必須穩定（不含時間） ─────────────────────────────
+    // ── MerchantTradeNo：由核心的建單授權提供，requester 不得自己編 ──────
     [$f1] = send('ys_ec_ecpay_ship_tcat', base_order());
-    [$f2] = send('ys_ec_ecpay_ship_tcat', base_order());
-    [$f3] = send('ys_ec_ecpay_ship_tcat', base_order([ 'label_attempt' => 2 ]));
-    [$f4] = send('ys_ec_ecpay_ship_tcat_frozen', base_order());
+    [$f2] = send('ys_ec_ecpay_ship_tcat', base_order([ 'merchant_trade_no' => 'YSLOTHERVALUE000001' ]));
 
     check(
-        '(TN-a) 同一張訂單 × 同一方式 × 同一次建單 → MerchantTradeNo 完全相同（重試不會變成第二張單）',
-        ($f1['MerchantTradeNo'] ?? 'a') === ($f2['MerchantTradeNo'] ?? 'b')
+        '(TN-a) 送出的 MerchantTradeNo 就是核心給的那一個（原封不動）',
+        'YSL0123456789ABCDEF0' === ($f1['MerchantTradeNo'] ?? '')
+            && 'YSLOTHERVALUE000001' === ($f2['MerchantTradeNo'] ?? '')
     );
+
+    $no_trade = base_order();
+    unset($no_trade['merchant_trade_no']);
+    [, $no_trade_result] = send('ys_ec_ecpay_ship_tcat', $no_trade);
     check(
-        '(TN-b) 刻意重開一張（label_attempt 加一）才會換編號',
-        ($f1['MerchantTradeNo'] ?? 'a') !== ($f3['MerchantTradeNo'] ?? 'a')
+        '(TN-b) 核心沒提供 MerchantTradeNo 時中止（不得自己編一個，否則本地對不到那張單）',
+        $no_trade_result instanceof \Throwable
     );
+
+    [, $long_trade] = send('ys_ec_ecpay_ship_tcat', base_order([ 'merchant_trade_no' => str_repeat('X', 21) ]));
+    check('(TN-c) 超過綠界 20 字元上限時中止', $long_trade instanceof \Throwable);
+
     check(
-        '(TN-c) 不同物流方式各自有自己的編號',
-        ($f1['MerchantTradeNo'] ?? 'a') !== ($f4['MerchantTradeNo'] ?? 'a')
-    );
-    check(
-        '(TN-d) MerchantTradeNo 長度不超過綠界上限 20',
-        strlen((string) ($f1['MerchantTradeNo'] ?? '')) <= 20
+        '(TN-d) 送出的編號不含時間（同一份輸入送兩次完全相同）',
+        ($f1['MerchantTradeNo'] ?? 'a') === (send('ys_ec_ecpay_ship_tcat', base_order())[0]['MerchantTradeNo'] ?? 'b')
     );
 
     // ── (8) 付款方式切換會讓舊的門市選擇失效 ──────────────────────────────
@@ -472,10 +577,10 @@ namespace {
         )
     );
 
-    // C2C 沒填退貨門市時，連地圖都不該開。
-    YSEcommerce::$settings['ys_ec_ecpay_ship_hilife_c2c_return_store_id'] = '';
+    // 未啟用的方式不得簽發電子地圖表單。
+    YSEcommerce::$settings['ys_ec_ecpay_ship_hilife_c2c_enabled'] = '0';
     check(
-        '(8d) 未設定退貨門市的 C2C 不簽發電子地圖表單',
+        '(8d) 未啟用的物流方式不簽發電子地圖表單',
         false === EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_hilife_c2c', 'checkout', 0, 'default', '', 'ys_ec_credit')
     );
     reset_settings();

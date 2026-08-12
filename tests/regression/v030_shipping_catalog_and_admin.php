@@ -8,7 +8,7 @@
  * 涵蓋 CODEX #2I Section 4 的：
  *   (1) 每個方式都能獨立啟用／停用，method_id 不重複
  *   (2) 後台 save → DB 設定 → reload 往返
- *   (3) 各 C2C 的退貨門市完全獨立，不會跨通路取值
+ *   (3) ReturnStoreID 僅 UNIMARTC2C 適用且為選填（官方規格）
  *   (6) 7-ELEVEN 冷凍與常溫是各自獨立的方式（不同 subtype、不同開關）
  *   ＋型錄與 manifest／Settings／admin 清單的一致性（單一 SOT 的實際證明）
  *
@@ -177,9 +177,86 @@ namespace {
     // subtype 只有 FAMIC2C／UNIMARTC2C／HILIFEC2C／OKMARTC2C——沒有冷凍 C2C。
     // 自創一個 subtype 的後果是送單被綠界拒絕，而錯誤訊息與「B2C/C2C 用錯」一模一樣。
     check(
-        '(6b) 不得出現官方未載明的冷凍 C2C subtype',
+        '(6b) 型錄不得出現官方未載明的冷凍 C2C subtype',
         !in_array('UNIMARTFREEZEC2C', $subtypes, true)
     );
+
+    // 🔴 全 repo 掃描：型錄乾淨還不夠，只要任何一個檔案裡還留著這個字串，
+    // 就代表某處仍可能把它送上 wire（或有人照著它再加回來）。
+    // 掃 src/ + templates/ + manifest + sdk + skills；tests/ 本身除外（就是這一行）。
+    $offenders = [];
+    $scan_dirs = [ $root . '/src', $root . '/templates', $root . '/sdk', $root . '/skills' ];
+    $scan_files = [ $root . '/manifest.php', $root . '/ys-cart-ecpay.php' ];
+    foreach ($scan_dirs as $dir) {
+        if (!is_dir($dir)) {
+            continue;
+        }
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+        foreach ($it as $file) {
+            if ($file->isFile()) {
+                $scan_files[] = $file->getPathname();
+            }
+        }
+    }
+    // 🔴 只掃**程式碼行**。註解裡寫「官方沒有這個 subtype，所以我們不收」是
+    // 這個決定唯一的說明，刪掉它下一個人就會再加回來一次。負向斷言掃到註解
+    // 只會逼人刪掉最該留的東西。
+    foreach ($scan_files as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+        $lines = explode("\n", str_replace([ "\r\n", "\r" ], "\n", (string) file_get_contents($file)));
+        foreach ($lines as $line) {
+            $trimmed = ltrim($line);
+            if ('' === $trimmed
+                || 0 === strpos($trimmed, '//')
+                || 0 === strpos($trimmed, '*')
+                || 0 === strpos($trimmed, '/*')
+                || 0 === strpos($trimmed, '#')) {
+                continue;
+            }
+            if (false !== strpos($line, 'UNIMARTFREEZEC2C')) {
+                $offenders[] = str_replace($root . '/', '', $file);
+                break;
+            }
+        }
+    }
+    check(
+        '(6c) 全 repo（src／templates／sdk／skills／manifest）都不存在 UNIMARTFREEZEC2C：'
+            . ([] === $offenders ? '無' : implode(', ', $offenders)),
+        [] === $offenders
+    );
+
+    // ── 11 方法逐一驗完整 descriptor（exhaustive matrix） ──────────────────
+    $expected_matrix = [
+        'ys_ec_ecpay_ship_family'         => [ 'b2c',  '0001', 'CVS',  'FAMI',          true,  false ],
+        'ys_ec_ecpay_ship_family_c2c'     => [ 'c2c',  '0001', 'CVS',  'FAMIC2C',       true,  false ],
+        'ys_ec_ecpay_ship_unimart'        => [ 'b2c',  '0001', 'CVS',  'UNIMART',       true,  false ],
+        'ys_ec_ecpay_ship_unimart_c2c'    => [ 'c2c',  '0001', 'CVS',  'UNIMARTC2C',    true,  true  ],
+        'ys_ec_ecpay_ship_hilife'         => [ 'b2c',  '0001', 'CVS',  'HILIFE',        true,  false ],
+        'ys_ec_ecpay_ship_hilife_c2c'     => [ 'c2c',  '0001', 'CVS',  'HILIFEC2C',     true,  false ],
+        'ys_ec_ecpay_ship_unimart_freeze' => [ 'b2c',  '0003', 'CVS',  'UNIMARTFREEZE', false, false ],
+        'ys_ec_ecpay_ship_tcat'           => [ 'home', '0001', 'HOME', 'TCAT',          true,  false ],
+        'ys_ec_ecpay_ship_tcat_chilled'   => [ 'home', '0002', 'HOME', 'TCAT',          true,  false ],
+        'ys_ec_ecpay_ship_tcat_frozen'    => [ 'home', '0003', 'HOME', 'TCAT',          true,  false ],
+        'ys_ec_ecpay_ship_post'           => [ 'home', '0001', 'HOME', 'POST',          false, false ],
+    ];
+
+    $matrix_ok = array_keys($expected_matrix) === $ids;
+    foreach ($expected_matrix as $method_id => [$channel, $temp, $type, $subtype, $cod, $return_store]) {
+        $d = EcpayShippingCatalog::get($method_id);
+        if (null === $d
+            || $channel !== $d['channel']
+            || $temp !== $d['temperature']
+            || $type !== $d['logistics_type']
+            || $subtype !== $d['logistics_subtype']
+            || $cod !== $d['cod_capable']
+            || $return_store !== $d['supports_return_store']
+            || !in_array('AllPayLogisticsID', $d['required_response_fields'], true)) {
+            $matrix_ok = false;
+        }
+    }
+    check('(6d) 11 個方法的完整矩陣逐項相符（含順序），且每個都要求 AllPayLogisticsID', $matrix_ok);
 
     // ── 單一 SOT：manifest／admin 清單／Settings 都要從型錄長出來 ──────────
     $manifest_ids = array_column(EcpayShippingCatalog::manifest_methods(), 'id');
@@ -222,7 +299,7 @@ namespace {
     $opened  = [];
     foreach ($catalog as $method_id => $descriptor) {
         $on = '1' === (string) YSEcommerce::$settings[$descriptor['enabled_option']];
-        if ($descriptor['requires_return_store'] || $descriptor['requires_goods_weight']) {
+        if ($descriptor['requires_goods_weight']) {
             if ($on) {
                 $blocked[] = $method_id;
             }
@@ -232,7 +309,7 @@ namespace {
     }
 
     check(
-        '(2a) 缺退貨門市的 C2C／缺重量的郵局：勾了也不會被啟用（fail-closed）',
+        '(2a) 缺重量的郵局：勾了也不會被啟用（fail-closed）；退貨門市是選填故不擋',
         [] === $blocked
     );
     check('(2b) 設定完整的方式照勾選啟用', [] === $opened);
@@ -245,7 +322,7 @@ namespace {
     $expected_return_stores = [];
     $i = 0;
     foreach ($catalog as $method_id => $descriptor) {
-        if ($descriptor['requires_return_store']) {
+        if ($descriptor['supports_return_store']) {
             $value = 'RS' . str_pad((string) (++$i), 4, '0', STR_PAD_LEFT);
             $post['ys_ec_ecpay_' . $descriptor['alias'] . '_return_store_id'] = $value;
             $expected_return_stores[$method_id] = $value;
@@ -272,7 +349,7 @@ namespace {
     $reload_ok = true;
     foreach ($catalog as $method_id => $descriptor) {
         $row = $rendered['shipping_methods'][$descriptor['alias']] ?? [];
-        if ($descriptor['requires_return_store']
+        if ($descriptor['supports_return_store']
             && ($row['return_store_id'] ?? null) !== $expected_return_stores[$method_id]) {
             $reload_ok = false;
         }
@@ -298,47 +375,49 @@ namespace {
             && '1' === (string) YSEcommerce::$settings['ys_ec_ecpay_ship_hilife_c2c_enabled']
     );
 
-    // ── (3) 各 C2C 的退貨門市完全獨立 ─────────────────────────────────────
+    // ── (3) 退貨門市：官方規格是**僅 UNIMARTC2C 適用，且選填** ────────────
     admin_save($post);
 
-    $isolation_ok = true;
-    $seen_values  = [];
-    foreach ($catalog as $method_id => $descriptor) {
-        if (!$descriptor['requires_return_store']) {
-            continue;
-        }
-        /** @var EcpayShipping $method */
-        $method = new $descriptor['class']();
-        $value  = $method->get_return_store_id();
-        if ($value !== $expected_return_stores[$method_id]) {
-            $isolation_ok = false;
-        }
-        $seen_values[] = $value;
-    }
-    check(
-        '(3a) 每個 C2C 方式讀到的是自己那一把退貨門市，且互不相同',
-        $isolation_ok && count($seen_values) === count(array_unique($seen_values))
-    );
-
-    // 只清掉全家的退貨門市——7-ELEVEN 與萊爾富必須完全不受影響。
-    YSEcommerce::$settings['ys_ec_ecpay_ship_family_c2c_return_store_id'] = '';
-
-    $family = new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamilyC2C();
     $seven  = new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingUnimartC2C();
+    $family = new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingFamilyC2C();
     $hilife = new \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingHilifeC2C();
 
+    $applicable = [];
+    foreach ($catalog as $method_id => $descriptor) {
+        if ($descriptor['supports_return_store']) {
+            $applicable[] = $method_id;
+        }
+    }
     check(
-        '(3b) 清掉全家的退貨門市，只有全家失效；7-ELEVEN／萊爾富仍可用',
-        '' === $family->get_return_store_id()
-            && false === $family->is_configured()
-            && '' !== $seven->get_return_store_id()
-            && true === $seven->is_configured()
-            && true === $hilife->is_configured()
+        '(3a) 只有 7-ELEVEN 交貨便適用 ReturnStoreID（官方規格）',
+        ['ys_ec_ecpay_ship_unimart_c2c'] === $applicable
     );
 
     check(
-        '(3c) 退貨門市缺值時該方式直接停用（不是等到送單才失敗）',
-        false === $family->is_enabled()
+        '(3b) 不適用的 C2C 沒有專屬 option，也讀不到任何退貨門市',
+        '' === $family->get_return_store_option()
+            && '' === $family->get_return_store_id()
+            && '' === $hilife->get_return_store_option()
+            && '' === $hilife->get_return_store_id()
+    );
+
+    check(
+        '(3c) 7-ELEVEN 交貨便讀得到自己那一把退貨門市',
+        $expected_return_stores['ys_ec_ecpay_ship_unimart_c2c'] === $seven->get_return_store_id()
+    );
+
+    // 🔴 官方規格：未設定時退回原寄件門市。因此**沒填不是錯誤**，方式照樣可用。
+    // （`is_enabled()` 另外還要求物流憑證，那是別的關卡，不在這一條的範圍。）
+    YSEcommerce::$settings['ys_ec_ecpay_ship_unimart_c2c_return_store_id'] = '';
+    $post_no_return = $post;
+    unset($post_no_return['ys_ec_ecpay_ship_unimart_c2c_return_store_id']);
+    admin_save($post_no_return);
+
+    check(
+        '(3d) 退貨門市沒填仍是合法設定（官方：未設定時退回原寄件門市），方式照樣可啟用',
+        '' === $seven->get_return_store_id()
+            && true === $seven->is_configured()
+            && '1' === (string) YSEcommerce::$settings['ys_ec_ecpay_ship_unimart_c2c_enabled']
     );
 
     // ── 能力 vs. 這張訂單：supports_cod() 只回答「這個通路能不能代收」 ─────

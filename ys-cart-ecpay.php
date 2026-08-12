@@ -39,11 +39,35 @@ spl_autoload_register(
 	}
 );
 
+/** 本外掛要求的 YS CART 核心最低版本（物流落盤契約與建單授權都在 2.56.5）。 */
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.5' );
+
 add_action(
 	'plugins_loaded',
 	static function (): void {
 		if ( ! class_exists( \YangSheep\Ecommerce\Gateways\YSGatewayRegistry::class )
 			&& ! class_exists( \YangSheep\Ecommerce\Shipping\YSShippingRegistry::class ) ) {
+			return;
+		}
+
+		// 🔴 核心版本／能力不符時：**一個 hook 都不掛**，只顯示後台提示。
+		//
+		// 「先發核心再發本外掛」是流程約定，不能取代 runtime gate：降版、部分部署、
+		// 安裝順序錯誤都會讓本外掛在缺少物流落盤契約的核心上跑起來——而那個組合的
+		// 後果是綠界那邊建好了單、本地寫不進去（孤兒單）。
+		$ys_cart_ecpay_gate = \YangSheep\YSCartEcpay\Plugin::core_requirements();
+		if ( ! $ys_cart_ecpay_gate['met'] ) {
+			add_action(
+				'admin_notices',
+				static function () use ( $ys_cart_ecpay_gate ): void {
+					if ( ! current_user_can( 'activate_plugins' ) ) {
+						return;
+					}
+					echo '<div class="notice notice-error"><p><strong>YS CART - ECPay</strong>：'
+						. esc_html( $ys_cart_ecpay_gate['message'] )
+						. '</p></div>';
+				}
+			);
 			return;
 		}
 

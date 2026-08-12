@@ -46,6 +46,75 @@ final class Plugin {
 		return EcpayShippingCatalog::ids();
 	}
 
+	/**
+	 * 核心是否具備本外掛需要的版本與能力
+	 *
+	 * 三件事都要成立才放行：
+	 *   1. 核心版本 >= YS_CART_ECPAY_REQUIRES_CORE
+	 *   2. 物流落盤契約與建單授權的類別存在（能力）
+	 *   3. 物流 schema 真的就位（欄位、索引、建單嘗試表的唯一鍵）
+	 *
+	 * 🔴 第 3 點是實查資料庫，成本不低，因此以核心版本為 key 做快取——核心一升版
+	 * key 就換，不會拿著舊答案放行。
+	 *
+	 * @return array{met:bool,reason:string,message:string}
+	 */
+	public static function core_requirements(): array {
+		if ( ! defined( 'YS_ECOMMERCE_VERSION' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'core_missing',
+				'message' => '找不到 YS CART 核心，綠界的金流與物流功能未載入。',
+			];
+		}
+
+		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.5';
+		if ( version_compare( (string) YS_ECOMMERCE_VERSION, $required, '<' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'core_too_old',
+				'message' => sprintf(
+					'需要 YS CART %s 以上（目前 %s）。請先更新核心；在那之前綠界的物流方式不會註冊，'
+					. '以免建立無法落盤的物流單。',
+					$required,
+					(string) YS_ECOMMERCE_VERSION
+				),
+			];
+		}
+
+		if ( ! class_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Database\YSMigration' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Database\YSMigration', 'shipping_label_dispatch_schema_ready' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Shipping\YSShippingRegistry', 'is_method_allowed_for_cart' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'core_capability_missing',
+				'message' => '核心缺少物流建單授權或商品物流守門的 API，綠界物流方式未註冊。',
+			];
+		}
+
+		$cache_key = 'ys_ec_ecpay_core_gate_' . md5( (string) YS_ECOMMERCE_VERSION );
+		$cached    = function_exists( 'get_transient' ) ? get_transient( $cache_key ) : false;
+		if ( 'ok' === $cached ) {
+			return [ 'met' => true, 'reason' => 'ok', 'message' => '' ];
+		}
+
+		if ( ! \YangSheep\Ecommerce\Database\YSMigration::shipping_label_dispatch_schema_ready() ) {
+			return [
+				'met'     => false,
+				'reason'  => 'core_schema_not_ready',
+				'message' => 'YS CART 的物流資料表尚未完成 v2.56.5 升級（欄位或索引缺失），'
+					. '綠界物流方式未註冊。請重新啟用 YS CART 以完成升級。',
+			];
+		}
+
+		if ( function_exists( 'set_transient' ) ) {
+			set_transient( $cache_key, 'ok', HOUR_IN_SECONDS );
+		}
+
+		return [ 'met' => true, 'reason' => 'ok', 'message' => '' ];
+	}
+
 	public static function instance(): self {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -68,6 +137,39 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_requester', [ $this, 'register_shipping_requester' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
+		add_filter( 'ys_ec_validate_store_selection', [ $this, 'validate_store_selection' ], 10, 4 );
+	}
+
+	/**
+	 * 結帳送出時驗證門市選擇（伺服器端）
+	 *
+	 * 🔴 只驗**我們自己的**物流方式。其他供應商的方式一個字都不碰。
+	 *
+	 * @param array<int,string>   $errors
+	 * @param array<string,mixed> $data
+	 * @return array<int,string>
+	 */
+	public function validate_store_selection( $errors, $data, string $shipping_method, string $payment_method ) {
+		if ( ! is_array( $errors ) ) {
+			$errors = [];
+		}
+
+		$descriptor = EcpayShippingCatalog::get( $shipping_method );
+		if ( null === $descriptor || 'CVS' !== $descriptor['logistics_type'] ) {
+			return $errors;
+		}
+
+		$rejection = EcpayStoreSelector::consume_selection(
+			is_array( $data ) ? $data : [],
+			$shipping_method,
+			$payment_method
+		);
+
+		if ( null !== $rejection ) {
+			$errors[] = $rejection;
+		}
+
+		return $errors;
 	}
 
 	public function sync_print_route(): void {

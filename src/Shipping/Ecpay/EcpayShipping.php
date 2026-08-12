@@ -98,24 +98,33 @@ abstract class EcpayShipping implements YSShippingInterface {
 		return EcpayShippingCatalog::CHANNEL_C2C === $this->get_channel();
 	}
 
-	public function requires_return_store(): bool {
+	/**
+	 * 這個 subtype 吃不吃 `ReturnStoreID`。
+	 *
+	 * 🔴 官方規格：**選填**，且**僅 7-ELEVEN C2C（UNIMARTC2C）適用**，未設定時
+	 * 退回原寄件門市。所以它既不是「C2C 都有」，也不是必填。
+	 *
+	 * 先前兩者都搞錯：對全家／萊爾富送出一個它們不吃的欄位，又因為沒填就不讓
+	 * 方式啟用——業主明明照官方規格可以不填。
+	 */
+	public function supports_return_store(): bool {
 		$descriptor = $this->descriptor();
-		return (bool) ( $descriptor['requires_return_store'] ?? false );
+		return (bool) ( $descriptor['supports_return_store'] ?? false );
 	}
 
-	/** 本方式**專屬**的退貨門市設定 key（非 C2C 為空字串）。 */
+	/** 本方式**專屬**的退貨門市設定 key（不適用者為空字串）。 */
 	public function get_return_store_option(): string {
 		$descriptor = $this->descriptor();
-		return (string) ( $descriptor['return_store_option'] ?? '' );
+		return $this->supports_return_store() ? (string) ( $descriptor['return_store_option'] ?? '' ) : '';
 	}
 
 	/**
-	 * C2C 退貨門市代號。
+	 * 退貨門市代號（選填）。
 	 *
-	 * 🔴 每個 C2C 方式讀**自己的** option。共用一把 key 的後果是：業主填了全家的
-	 * 退貨門市，7-ELEVEN 的退貨就寄到全家去——而且送單當下不會有任何錯誤訊息。
+	 * 🔴 讀**自己的** option。共用一把 key 的後果是：業主填了一個通路的退貨門市，
+	 * 另一個通路的退貨就寄到別人家去——而且送單當下不會有任何錯誤訊息。
 	 *
-	 * 缺值時回空字串，由 requester fail-closed（不猜一個門市）。
+	 * 空字串＝業主沒填，這是合法狀態（綠界會退回原寄件門市），送單時不帶這個欄位。
 	 */
 	public function get_return_store_id(): string {
 		$option = $this->get_return_store_option();
@@ -188,9 +197,8 @@ abstract class EcpayShipping implements YSShippingInterface {
 	 * 選得到、結帳後才失敗，不如一開始就不要出現。
 	 */
 	public function is_configured(): bool {
-		if ( $this->requires_return_store() && '' === $this->get_return_store_id() ) {
-			return false;
-		}
+		// 🔴 退貨門市**不在這裡**：官方規格是選填，沒填時綠界退回原寄件門市。
+		// 把它當必填會讓一個完全合法的設定被判定成「未設定完成」。
 
 		// 郵局的重量是綠界必填欄位。訂單本身算得出重量時優先用訂單的，但
 		// 商品沒填重量的站台算出來會是 0——所以後台的預設重量必須先有值，

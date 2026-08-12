@@ -84,23 +84,22 @@ final class EcpayShippingRequester {
 		$cvs_payment_no    = trim( (string) ( $params['CVSPaymentNo'] ?? '' ) );
 		$cvs_validation_no = trim( (string) ( $params['CVSValidationNo'] ?? '' ) );
 
-		// 追蹤碼與寄件代碼是兩件事：託運單號（BookingNote）才是顧客查得到的那個，
-		// 寄貨編號是賣家交貨用的。沒有託運單號時退而求其次，但兩者仍分開存。
+		// 🔴 追蹤碼**只**取託運單號（BookingNote）。
+		//
+		// 舊版沒有它時退回寄貨編號、再退回物流編號——三個語意完全不同的值被塞進
+		// 同一個欄位：顧客拿去物流商網站查會查不到，而客服看到「有追蹤碼」就不會
+		// 去查為什麼還沒出貨。沒有就是沒有（回單通知會補上）。
 		$tracking = trim( (string) ( $params['BookingNote'] ?? '' ) );
-		if ( '' === $tracking ) {
-			$tracking = $cvs_payment_no;
-		}
-		if ( '' === $tracking ) {
-			$tracking = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
-		}
 
 		return [
 			'success'           => true,
-			'label_id'          => (string) ( $params['AllPayLogisticsID'] ?? $fields['MerchantTradeNo'] ),
 			'tracking_no'       => $tracking,
 			'tracking_number'   => $tracking,
 			'merchant_trade_no' => $fields['MerchantTradeNo'],
-			'provider_trade_no' => (string) ( $params['AllPayLogisticsID'] ?? '' ),
+			// 🔴 只認明確的 AllPayLogisticsID。上面的 required_response_fields 已經
+			// 保證它非空——不得 fallback 到 MerchantTradeNo，那會讓後續的查詢、
+			// 取消、回呼比對全部指向一張不存在的單。
+			'provider_trade_no' => trim( (string) $params['AllPayLogisticsID'] ),
 			// 寄件代碼分開存：它們是「賣家怎麼把貨交出去」的依據，不是追蹤碼。
 			'cvs_payment_no'    => $cvs_payment_no,
 			'cvs_validation_no' => $cvs_validation_no,
@@ -264,22 +263,16 @@ final class EcpayShippingRequester {
 
 		$fields = [ 'ReceiverStoreID' => $store_id ];
 
-		// 🔴 C2C（店到店）必填**退貨門市**，而且每個方式讀**自己的**設定。
+		// 🔴 `ReturnStoreID` 是**選填**，而且**只有 7-ELEVEN C2C（UNIMARTC2C）吃**
+		// ——官方規格明載「未設定時退回原寄件門市」。
 		//
-		// 綠界規定 C2C 建立訂單時必須指定退貨門市；沒有它，送單直接被拒。
-		// 缺值時 fail-closed——不猜一個門市，那會讓退貨寄到別人家。
-		if ( $this->method->requires_return_store() ) {
+		// 因此：不適用的 subtype 一個字都不送（送了是把別人的合約塞給它），
+		// 適用但業主沒填也不是錯誤（綠界有預設行為），只在真的有值時才帶上去。
+		if ( $this->method->supports_return_store() ) {
 			$return_store = $this->method->get_return_store_id();
-			if ( '' === $return_store ) {
-				throw new \RuntimeException(
-					sprintf(
-						'物流方式 %s 尚未設定退貨門市代號（綠界規定 C2C 必填），已中止建立物流訂單。',
-						$this->method->get_id()
-					)
-				);
+			if ( '' !== $return_store ) {
+				$fields['ReturnStoreID'] = $return_store;
 			}
-
-			$fields['ReturnStoreID'] = $return_store;
 		}
 
 		return $fields;
@@ -330,6 +323,14 @@ final class EcpayShippingRequester {
 	 * @param array<string,mixed> $order_data
 	 */
 	private function resolve_goods_weight( array $order_data ): string {
+		// 🔴 null＝核心讀取失敗（SQL error），不是「這張訂單沒有重量」。
+		// 把它退回後台預設值，等於拿一個猜來的重量送單。
+		if ( array_key_exists( 'goods_weight', $order_data ) && null === $order_data['goods_weight'] ) {
+			throw new \RuntimeException(
+				'無法讀取訂單的商品重量（資料庫查詢失敗），中華郵政必填此欄位，已中止建立物流訂單。'
+			);
+		}
+
 		$weight = (float) ( $order_data['goods_weight'] ?? 0 );
 		if ( $weight <= 0.0 ) {
 			$weight = $this->method->get_default_goods_weight();
@@ -344,44 +345,74 @@ final class EcpayShippingRequester {
 			);
 		}
 
-		return number_format( min( 20.0, $weight ), 3, '.', '' );
+		// 🔴 超過上限一律中止，**不 clamp**。
+		//
+		// 把 25 公斤悄悄改成 20 公斤送出去，綠界收下的是一張錯的單：運費算錯、
+		// 到了門市才發現超重被退，而系統這邊看起來一切正常。
+		if ( $weight > 20.0 ) {
+			throw new \RuntimeException(
+				sprintf(
+					'包裹重量 %s 公斤超過中華郵政上限 20 公斤，已中止建立物流訂單（請改用其他物流方式或分批出貨）。',
+					number_format( $weight, 3, '.', '' )
+				)
+			);
+		}
+
+		return number_format( $weight, 3, '.', '' );
 	}
 
 	/**
 	 * 特店交易編號。
 	 *
-	 * 🔴 **不含時間**。舊版用 `substr(time(), -6)` 當尾碼，於是同一張訂單每重試
-	 * 一次就產生一個新的 `MerchantTradeNo`——綠界那邊就是一張新的物流單。回應
-	 * 遺失後的重試會變成「同一筆訂單出兩次貨」，而本地只看得到最後那一張。
+	 * 🔴 **由核心的建單授權提供**，不是在這裡編的。
 	 *
-	 * 改由（訂單編號 × 物流方式 × 第幾次建單）決定，穩定可重現：重試打到綠界會
-	 * 被同編號擋下來，而不是默默再出一單。要刻意重開一張時，由呼叫端把
-	 * `label_attempt` 加一。
+	 * 授權在打給綠界**之前**就把這個編號落盤了，因此「本地那一列」與「綠界那張單」
+	 * 必然對得起來。供應商自己另外編一個的話，回應遺失時本地就查不到那張單——
+	 * 而查不到的下一步通常是再送一次，也就是同一張訂單出兩次貨。
 	 *
 	 * @param array<string,mixed> $order_data
 	 */
 	private function make_trade_no( array $order_data ): string {
-		$order_number = trim( (string) ( $order_data['order_number'] ?? '' ) );
-		if ( '' === $order_number ) {
+		$trade_no = trim( (string) ( $order_data['merchant_trade_no'] ?? '' ) );
+		if ( '' === $trade_no ) {
 			throw new \RuntimeException(
-				'建立綠界物流單時缺少訂單編號，無法產生可對帳的特店交易編號，已中止。'
+				'建立綠界物流單時缺少核心提供的特店交易編號（merchant_trade_no），'
+				. '無法保證與本地建單紀錄對得起來，已中止。'
 			);
 		}
 
-		$attempt = max( 1, (int) ( $order_data['label_attempt'] ?? 1 ) );
-		$prefix  = strtoupper( (string) preg_replace( '/[^A-Za-z0-9]/', '', $order_number ) );
-		$prefix  = substr( $prefix, 0, 8 );
-		$digest  = strtoupper( hash( 'sha256', $order_number . '|' . $this->method->get_id() . '|' . $attempt ) );
+		if ( strlen( $trade_no ) > 20 ) {
+			throw new \RuntimeException(
+				sprintf( '特店交易編號 %s 超過綠界上限 20 字元，已中止。', $trade_no )
+			);
+		}
 
-		return substr( $prefix . 'L' . $digest, 0, 20 );
+		return $trade_no;
 	}
 
 	/**
+	 * 取消物流訂單
+	 *
+	 * 🔴 本版**不實作**綠界的取消 API，因此明確回 `unsupported`——而不是 `false`。
+	 *
+	 * 差別在呼叫端：`false` 會被讀成「取消失敗」或「沒取消」，而重新取單／換門市
+	 * 的流程在那之後照樣把本機標成已取消再建一張新的；綠界那邊的舊單還活著，
+	 * 結果是同一張訂單出兩次貨。`unsupported` 讓核心把整條路擋掉。
+	 *
+	 * 綠界的取消是逐通路的獨立端點（C2C 7-ELEVEN 走 `/Express/CancelC2COrder`，
+	 * B2C 走異動 API），且需要各自的參數與實測，不在本批範圍。
+	 *
+	 * @param array<string,mixed> $context
 	 * @return array<string,mixed>
 	 */
 	public function cancel_order( array $context = [] ): array {
 		unset( $context );
-		return [ 'success' => false, 'message' => 'ECPay logistics cancellation is not implemented.' ];
+
+		return [
+			'success' => false,
+			'outcome' => 'unsupported',
+			'message' => '本版尚未實作綠界物流單取消，請於綠界後台操作後再回系統處理。',
+		];
 	}
 
 	/**

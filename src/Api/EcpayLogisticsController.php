@@ -41,12 +41,22 @@ final class EcpayLogisticsController {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
 
-		$label = $this->find_label( $params );
-		if ( null === $label ) {
-			// 找不到對應的物流單就不要動任何訂單。回 1|OK 是為了讓綠界停止重送
-			// （這不是我們的單），但**什麼都不寫**。
+		$lookup = $this->find_label( $params );
+
+		// 🔴 「查不到」與「查不動」是兩件事。
+		//
+		// ACK 不可逆——回了 `1|OK`，綠界就不會再送這則通知。資料庫暫時讀不到時
+		// 若也回 OK，那筆狀態就永遠遺失了。不確定時一律回非 2xx，讓對方重送。
+		if ( 'error' === $lookup['status'] ) {
+			$this->respond_text( '0|Storage unavailable', 503 );
+		}
+
+		if ( 'not_found' === $lookup['status'] ) {
+			// 確定不是我們的單：回 1|OK 讓對方停止重送，但**什麼都不寫**。
 			$this->respond_text( '1|OK' );
 		}
+
+		$label = $lookup['label'];
 
 		// 🔴 綁定必須逐項相符，缺欄位也拒絕。
 		//
@@ -58,8 +68,15 @@ final class EcpayLogisticsController {
 		}
 
 		$order = $this->find_order_by_label( $label );
-		if ( $order ) {
-			$this->update_order_shipping( $order, $params, $label );
+		if ( null === $order ) {
+			// label 在、訂單讀不到＝我們這邊出了狀況，不是對方送錯。回非 2xx。
+			$this->respond_text( '0|Storage unavailable', 503 );
+		}
+
+		// 🔴 全部寫入都 durable 之後才 ACK。任何一步失敗都回非 2xx——
+		// 「收到了但沒存起來」在 ACK 之後是無法補救的。
+		if ( ! $this->update_order_shipping( $order, $params, $label ) ) {
+			$this->respond_text( '0|Persistence failed', 503 );
 		}
 
 		$this->respond_text( '1|OK' );
@@ -68,12 +85,17 @@ final class EcpayLogisticsController {
 	/**
 	 * 依物流編號找出本站的物流單列。
 	 *
+	 * 🔴 回 typed 結果，把「確定不是我們的單」與「資料庫讀不動」分開。
+	 * 兩者壓成同一個 `null` 的話，暫時性的 SQL 失敗會走到「回 1|OK」——
+	 * 而 ACK 之後那筆通知就永遠不會再來了。
+	 *
 	 * @param array<string,string> $params
+	 * @return array{status:string,label:?object}
 	 */
-	private function find_label( array $params ): ?object {
+	private function find_label( array $params ): array {
 		$logistics_id = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
 		if ( '' === $logistics_id ) {
-			return null;
+			return [ 'status' => 'not_found', 'label' => null ];
 		}
 
 		global $wpdb;
@@ -84,7 +106,14 @@ final class EcpayLogisticsController {
 			$logistics_id
 		) );
 
-		return $label ?: null;
+		if ( null === $label ) {
+			// get_row() 對「查無資料」與「查詢失敗」都回 null；用 last_error 分辨。
+			return '' !== (string) $wpdb->last_error
+				? [ 'status' => 'error', 'label' => null ]
+				: [ 'status' => 'not_found', 'label' => null ];
+		}
+
+		return [ 'status' => 'found', 'label' => $label ];
 	}
 
 	/**
@@ -166,7 +195,7 @@ final class EcpayLogisticsController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function update_order_shipping( object $order, array $params, object $label ): void {
+	private function update_order_shipping( object $order, array $params, object $label ): bool {
 		// 追蹤碼優先取託運單號；沒有時才退回物流編號。
 		// 🔴 寄貨編號（CVSPaymentNo）**不是**追蹤碼，不要混進來——它是賣家交貨用的
 		// 憑據，另外落盤。
@@ -198,9 +227,15 @@ final class EcpayLogisticsController {
 			$order_update['shipping_status'] = $this->map_status( $status );
 		}
 
-		YSOrder::update( (int) $order->id, $order_update );
+		// 🔴 每一個寫入都要確認成功。`YSOrder::update()` 回 true 不代表寫進去了，
+		// 但回 false 一定是失敗——先擋掉明確失敗的那一半。
+		if ( false === YSOrder::update( (int) $order->id, $order_update ) ) {
+			return false;
+		}
 
-		$this->sync_label( $label, $params, $tracking, $status );
+		if ( ! $this->sync_label( $label, $params, $tracking, $status ) ) {
+			return false;
+		}
 
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
 			YSShippingPipelineService::advance_from_carrier_status(
@@ -209,6 +244,8 @@ final class EcpayLogisticsController {
 				'webhook_ecpay'
 			);
 		}
+
+		return true;
 	}
 
 	private function map_status( string $status ): string {
@@ -229,7 +266,7 @@ final class EcpayLogisticsController {
 	 *
 	 * @param array<string,string> $params
 	 */
-	private function sync_label( object $label, array $params, string $tracking, string $status ): void {
+	private function sync_label( object $label, array $params, string $tracking, string $status ): bool {
 		global $wpdb;
 		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
 
@@ -256,7 +293,17 @@ final class EcpayLogisticsController {
 			}
 		}
 
-		$wpdb->update( $table, $update, [ 'id' => (int) $label->id ] );
+		if ( false === $wpdb->update( $table, $update, [ 'id' => (int) $label->id ] ) ) {
+			return false;
+		}
+
+		// affected=0 也回 0（不是 false），因此要讀回來確認狀態真的落盤了。
+		$persisted = $wpdb->get_row( $wpdb->prepare(
+			"SELECT status FROM {$table} WHERE id = %d",
+			(int) $label->id
+		) );
+
+		return null !== $persisted && (string) $persisted->status === (string) $update['status'];
 	}
 
 	private function respond_text( string $body, int $status = 200 ): void {

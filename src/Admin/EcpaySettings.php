@@ -144,7 +144,7 @@ final class EcpaySettings {
 		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
 			$alias = (string) $descriptor['alias'];
 
-			if ( true === $descriptor['requires_return_store'] ) {
+			if ( true === $descriptor['supports_return_store'] ) {
 				$option = (string) $descriptor['return_store_option'];
 				if ( '' !== $option ) {
 					Settings::update(
@@ -156,8 +156,17 @@ final class EcpaySettings {
 
 			if ( true === $descriptor['requires_goods_weight'] ) {
 				$raw    = (string) wp_unslash( $_POST[ 'ys_ec_ecpay_' . $alias . '_goods_weight' ] ?? '' );
-				$weight = max( 0.0, min( 20.0, (float) $raw ) );
-				Settings::update( 'shipping_' . $method_id . '_goods_weight', $weight > 0 ? number_format( $weight, 3, '.', '' ) : '' );
+				$weight = (float) $raw;
+
+				// 🔴 超過上限**不 clamp**。悄悄把 25 公斤存成 20 公斤，業主看到的是
+				// 一個他沒填的數字，而送出去的是一張運費算錯、到門市才被退的單。
+				// 超出範圍就當沒填（該方式因此無法啟用，錯誤是看得見的）。
+				$valid = $weight > 0.0 && $weight <= 20.0;
+
+				Settings::update(
+					'shipping_' . $method_id . '_goods_weight',
+					$valid ? number_format( $weight, 3, '.', '' ) : ''
+				);
 			}
 		}
 	}
@@ -165,8 +174,11 @@ final class EcpaySettings {
 	/**
 	 * 勾選了、而且**設定完整**因此真的可以啟用的 alias。
 	 *
-	 * 缺退貨門市的 C2C、沒填重量的郵局一律擋下來：讓它「開著但送不出」是最糟的
-	 * 狀態——後台看起來是好的，顧客選得到，錯誤要到出貨那天才出現。
+	 * 沒填重量的郵局擋下來：讓它「開著但送不出」是最糟的狀態——後台看起來是好的，
+	 * 顧客選得到，錯誤要到出貨那天才出現。
+	 *
+	 * 🔴 退貨門市**不在這裡**。官方規格是選填（未設定時退回原寄件門市），把它當
+	 * 必填會讓一個完全合法的設定被判定成「未設定完成」而無法啟用。
 	 *
 	 * @param array<int,string> $aliases
 	 * @return array<int,string>
@@ -180,11 +192,6 @@ final class EcpaySettings {
 
 			$descriptor = EcpayShippingCatalog::get_by_alias( $alias );
 			if ( null === $descriptor ) {
-				continue;
-			}
-
-			if ( true === $descriptor['requires_return_store']
-				&& '' === trim( (string) Settings::get( (string) $descriptor['return_store_option'], '' ) ) ) {
 				continue;
 			}
 
@@ -333,7 +340,7 @@ final class EcpaySettings {
 		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
 			$alias = (string) $descriptor['alias'];
 
-			if ( true === $descriptor['requires_return_store'] ) {
+			if ( true === $descriptor['supports_return_store'] ) {
 				$out['shipping_methods'][ $alias ]['return_store_id'] =
 					(string) Settings::get( (string) $descriptor['return_store_option'], '' );
 			}

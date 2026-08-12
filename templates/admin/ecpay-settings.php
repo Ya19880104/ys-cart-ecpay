@@ -165,16 +165,16 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 								</span>
 							</label>
 
-							<?php if ( ! empty( $method['requires_return_store'] ) ) : ?>
+							<?php if ( ! empty( $method['supports_return_store'] ) ) : ?>
 								<label class="ysca-field ysca-mt-sm">
-									<span class="ysca-field__label"><?php esc_html_e( '退貨門市代號（必填）', 'ys-cart-ecpay' ); ?></span>
+									<span class="ysca-field__label"><?php esc_html_e( '退貨門市代號（選填）', 'ys-cart-ecpay' ); ?></span>
 									<input class="ysca-input ysca-field--compact"
 									       type="text"
 									       name="ys_ec_ecpay_<?php echo esc_attr( (string) $key ); ?>_return_store_id"
 									       value="<?php echo esc_attr( (string) ( $method['return_store_id'] ?? '' ) ); ?>"
 									       autocomplete="off">
 									<span class="description">
-										<?php esc_html_e( '綠界規定 C2C 店到店必須指定退貨門市；未填寫時這個方式無法啟用，也不會建立物流訂單。每個通路各自填寫，不共用。', 'ys-cart-ecpay' ); ?>
+										<?php esc_html_e( '綠界規定僅 7-ELEVEN 交貨便適用此欄位，且為選填——未填寫時退貨會退回原寄件門市。', 'ys-cart-ecpay' ); ?>
 									</span>
 								</label>
 							<?php endif; ?>

@@ -79,9 +79,14 @@ final class EcpayShippingCatalog {
 	 * - `logistics_subtype`          綠界 `LogisticsSubType`；電子地圖與送單必須送同一個。
 	 * - `cod_capable`                這個通路**能不能**代收貨款。是能力，不是「這張訂單要代收」。
 	 * - `requires_store`             送單前必須有收件門市代號（超商皆是）。
-	 * - `requires_return_store`      送單前必須有退貨門市代號（C2C 皆是，綠界規定必填）。
+	 * - `supports_return_store`      這個 subtype 吃不吃 `ReturnStoreID`。
+	 *                                🔴 官方規格：**選填**，且**僅 7-ELEVEN C2C
+	 *                                （UNIMARTC2C）適用**，未設定時退回原寄件門市。
+	 *                                因此它既不是「C2C 都有」，也不是必填——先前兩者都搞錯了：
+	 *                                對全家／萊爾富送出一個它們不吃的欄位，又因為沒填就
+	 *                                不讓方式啟用。
 	 * - `return_store_option`        該方式**專屬**的退貨門市設定 key；共用一個 key 會讓
-	 *                                全家的退貨寄到 7-11。B2C／宅配為空字串。
+	 *                                全家的退貨寄到 7-11。不適用者為空字串。
 	 * - `requires_collection_amount` 綠界載明這些 subtype 需一併傳 `CollectionAmount`。
 	 * - `requires_goods_weight`      綠界載明 `POST`（中華郵政）必填 `GoodsWeight`。
 	 * - `sends_home_conditions`      是否送宅配專屬條件（溫層／距離／規格／指定時段）。
@@ -109,7 +114,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'FAMI',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
@@ -127,12 +132,13 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'FAMIC2C',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => true,
-			'return_store_option'        => 'ys_ec_ecpay_ship_family_c2c_return_store_id',
+			// 官方規格：ReturnStoreID **僅 7-ELEVEN C2C 適用**。全家店到店不吃這個欄位。
+			'supports_return_store'      => false,
+			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
 			'sends_home_conditions'      => false,
-			'required_response_fields'   => [ 'CVSPaymentNo' ],
+			'required_response_fields'   => [ 'AllPayLogisticsID', 'CVSPaymentNo' ],
 			'enabled_option'             => 'ys_ec_ecpay_ship_family_c2c_enabled',
 			'class'                      => EcpayShippingFamilyC2C::class,
 		],
@@ -147,7 +153,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'UNIMART',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			// 綠界載明：UNIMART／UNIMARTC2C／UNIMARTFREEZE 需一併傳 CollectionAmount
 			// （值等於 GoodsAmount），否則建單失敗。
@@ -167,14 +173,17 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'UNIMARTC2C',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => true,
+			// 🔴 官方規格：`ReturnStoreID` String(6)，**否**（選填），
+			// 「僅 7-ELEVEN C2C（UNIMARTC2C）適用；未設定時退回原寄件門市」。
+			// 因此只有這一個方式提供這個欄位，而且**沒填不是錯誤**。
+			'supports_return_store'      => true,
 			'return_store_option'        => 'ys_ec_ecpay_ship_unimart_c2c_return_store_id',
 			'requires_collection_amount' => true,
 			'requires_goods_weight'      => false,
 			'sends_home_conditions'      => false,
 			// 🔴 7-ELEVEN 交貨便要**兩段**：寄貨編號＋驗證碼（官方載明驗證碼為
 			// 統一超商專用）。少了驗證碼，賣家到門市機台輸不進去，貨就是出不去。
-			'required_response_fields'   => [ 'CVSPaymentNo', 'CVSValidationNo' ],
+			'required_response_fields'   => [ 'AllPayLogisticsID', 'CVSPaymentNo', 'CVSValidationNo' ],
 			'enabled_option'             => 'ys_ec_ecpay_ship_unimart_c2c_enabled',
 			'class'                      => EcpayShippingUnimartC2C::class,
 		],
@@ -189,7 +198,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'HILIFE',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
@@ -207,12 +216,13 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'HILIFEC2C',
 			'cod_capable'                => true,
 			'requires_store'             => true,
-			'requires_return_store'      => true,
-			'return_store_option'        => 'ys_ec_ecpay_ship_hilife_c2c_return_store_id',
+			// 官方規格：ReturnStoreID 僅 7-ELEVEN C2C 適用。萊爾富店到店不吃這個欄位。
+			'supports_return_store'      => false,
+			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
 			'sends_home_conditions'      => false,
-			'required_response_fields'   => [ 'CVSPaymentNo' ],
+			'required_response_fields'   => [ 'AllPayLogisticsID', 'CVSPaymentNo' ],
 			'enabled_option'             => 'ys_ec_ecpay_ship_hilife_c2c_enabled',
 			'class'                      => EcpayShippingHilifeC2C::class,
 		],
@@ -227,7 +237,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'UNIMARTFREEZE',
 			'cod_capable'                => false,
 			'requires_store'             => true,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => true,
 			'requires_goods_weight'      => false,
@@ -247,7 +257,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'TCAT',
 			'cod_capable'                => true,
 			'requires_store'             => false,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
@@ -265,7 +275,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'TCAT',
 			'cod_capable'                => true,
 			'requires_store'             => false,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
@@ -283,7 +293,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'TCAT',
 			'cod_capable'                => true,
 			'requires_store'             => false,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			'requires_goods_weight'      => false,
@@ -303,7 +313,7 @@ final class EcpayShippingCatalog {
 			'logistics_subtype'          => 'POST',
 			'cod_capable'                => false,
 			'requires_store'             => false,
-			'requires_return_store'      => false,
+			'supports_return_store'      => false,
 			'return_store_option'        => '',
 			'requires_collection_amount' => false,
 			// 🔴 綠界官方明載：LogisticsSubType=POST 時 GoodsWeight 必填（上限 20 公斤）。
@@ -478,7 +488,7 @@ final class EcpayShippingCatalog {
 	public static function return_store_options(): array {
 		$out = [];
 		foreach ( self::METHODS as $method_id => $descriptor ) {
-			if ( true === $descriptor['requires_return_store'] ) {
+			if ( true === $descriptor['supports_return_store'] ) {
 				$out[ $method_id ] = (string) $descriptor['return_store_option'];
 			}
 		}
@@ -527,7 +537,7 @@ final class EcpayShippingCatalog {
 				'temperature'           => (string) $descriptor['temperature'],
 				'logistics_subtype'     => (string) $descriptor['logistics_subtype'],
 				'cod_capable'           => (bool) $descriptor['cod_capable'],
-				'requires_return_store' => (bool) $descriptor['requires_return_store'],
+				'supports_return_store' => (bool) $descriptor['supports_return_store'],
 				'return_store_option'   => (string) $descriptor['return_store_option'],
 				'requires_goods_weight' => (bool) $descriptor['requires_goods_weight'],
 			];
