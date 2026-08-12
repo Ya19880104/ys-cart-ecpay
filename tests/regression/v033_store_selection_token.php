@@ -131,6 +131,9 @@ namespace {
     foreach (glob($root . '/src/Shipping/Ecpay/EcpayShipping*.php') ?: [] as $file) {
         require_once $file;
     }
+    // 🔴 載入**核心正式的** YSRestAuth：headless 訪客的身分來源是它定義的
+    // `X-YS-Guest-Token`。自己在測試裡另寫一份，就永遠測不出兩邊漂移。
+    require_once dirname(__DIR__, 3) . '/ys-cart/src/Api/Storefront/YSRestAuth.php';
     require_once $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
     require_once $root . '/src/Support/Settings.php';
 
@@ -186,19 +189,41 @@ namespace {
         ];
         $params['CheckMacValue'] = CheckMacValue::generate($params, HASH_KEY, HASH_IV, 'md5');
 
+        // 🔴 綠界的選店回呼是**跨站 POST**：購物車 cookie（SameSite=Lax）不會帶。
+        // 每一次選店都如實模擬這件事，否則整份測試都跑在一個現實中不存在的前提上。
+        $cookies = $_COOKIE;
+        $user    = $GLOBALS['ys_user_id'] ?? 0;
+        $_COOKIE = [];
+        $GLOBALS['ys_user_id'] = 0;
+
         try {
             EcpayStoreSelector::handle_store_callback(new WP_REST_Request($params));
         } catch (Responded $e) {
             // 200＝走到輸出頁，選店成功。
         } catch (WpDie $e) {
+            $_COOKIE = $cookies;
+            $GLOBALS['ys_user_id'] = $user;
             return '';
         }
+
+        $_COOKIE = $cookies;
+        $GLOBALS['ys_user_id'] = $user;
 
         return (string) ($GLOBALS['ys_transients']['ys_ec_ecpay_store_' . $temp]['selection_token'] ?? '');
     }
 
+    /** 結帳欄位驗證那一關：**只讀不消耗**。 */
+    function verify(string $token, string $method_id, string $payment_method, string $store_id = '001234', string $scope = 'default'): ?string {
+        return EcpayStoreSelector::verify_selection(
+            [ 'ecpay_store_token' => $token, 'cvs_store_id' => $store_id, 'cart_scope' => $scope ],
+            $method_id,
+            $payment_method
+        );
+    }
+
+    /** 訂單成立那一刻的認領：原子、一次性。 */
     function checkout(string $token, string $method_id, string $payment_method, string $store_id = '001234', string $scope = 'default'): ?string {
-        return EcpayStoreSelector::consume_selection(
+        return EcpayStoreSelector::claim_selection(
             [ 'ecpay_store_token' => $token, 'cvs_store_id' => $store_id, 'cart_scope' => $scope ],
             $method_id,
             $payment_method
@@ -316,6 +341,57 @@ namespace {
             && false !== strpos($sdk, "selectionTokenField: 'ecpay_store_token'")
     );
 
+    // 🔴 缺付款方式時 SDK 自己就要擋，不要送一個空字串出去——那只是把一次必然
+    // 失敗的往返推給伺服器，使用者看到的是一個沒頭沒尾的錯誤。
+    check(
+        '(q2) SDK 缺付款方式時就地 reject，不得送空字串',
+        1 === preg_match('/paymentMethod\s*!==\s*.string.\s*\|\|\s*paymentMethod\s*===\s*..\s*\)\s*\{\s*return Promise\.reject/', $sdk)
+            && 0 === preg_match("/payment_method:\s*typeof paymentMethod/", $sdk)
+    );
+
+    // headless 前端在另一個 origin 時沒有我方 cookie，訪客身分只能靠這個 header。
+    check(
+        '(q3) SDK 支援核心既有的 X-YS-Guest-Token 訪客身分',
+        false !== strpos($sdk, 'X-YS-Guest-Token')
+            && false !== strpos($sdk, 'setGuestToken')
+    );
+
+    // 🔴 headless 訪客的身分**只有** X-YS-Guest-Token。跑真的流程：拿掉購物車
+    // cookie、改用 header，地圖要開得起來、憑證要能用；換一個 token 就不能用。
+    $cookie_backup = $_COOKIE;
+    $_COOKIE       = [];
+    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guest-token-aaa';
+
+    $headless_token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $headless_ok    = verify($headless_token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+
+    $_SERVER['HTTP_X_YS_GUEST_TOKEN'] = 'guest-token-bbb';
+    $headless_other = verify($headless_token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+
+    unset($_SERVER['HTTP_X_YS_GUEST_TOKEN']);
+    $headless_none = EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_family', 'checkout', 0, 'default', '', 'ys_ec_credit');
+
+    $_COOKIE = $cookie_backup;
+
+    check(
+        '(q4) headless 訪客以 X-YS-Guest-Token 開得了地圖、憑證可用，換 token 即失效',
+        '' !== $headless_token
+            && null === $headless_ok
+            && null !== $headless_other
+            && false === $headless_none
+    );
+
+    // 文件必須跟著契約走：payload、SDK 簽名、訪客身分、兩階段消耗。
+    $doc = (string) file_get_contents(dirname(__DIR__, 2) . '/docs/headless.md');
+    check(
+        '(q5) headless 文件已更新（payment_method、guest token、SDK 簽名、消耗時機）',
+        false !== strpos($doc, '"payment_method"')
+            && false !== strpos($doc, 'X-YS-Guest-Token')
+            && false !== strpos($doc, 'requestStoreMapForm(apiBase, shippingId, paymentMethod, options?)')
+            && 1 === preg_match('/at the moment the order is created\*\*\s*—\s*not during\s+field validation/', $doc)
+            && false !== strpos($doc, 'logistics-notify')
+    );
+
     // 🔴 併發：兩次結帳同時通過驗證、同時走到消耗那一步。
     // 「先 get 再 delete」的寫法會讓兩邊都過；以 delete 的回傳值認領才擋得住。
     $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
@@ -336,6 +412,76 @@ namespace {
         '(r) 結帳表單有 ecpay_store_token 欄位（沒有它，伺服器永遠收不到憑證）',
         false !== strpos($template, 'name="ecpay_store_token"')
             && false !== strpos($template, 'id="ys-ec-store-selection-token"')
+    );
+
+    // ══ #3V：actor provenance 與兩階段消耗 ═══════════════════════════════
+
+    // 🔴 回呼不帶 cookie（跨站 POST）是**正常流程**，不是攻擊。
+    // 憑證的擁有者必須是開地圖那一刻算好的那一個，不能在回呼裡重算。
+    $token  = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $record = $GLOBALS['ys_transients']['ys_ec_ecpay_sel_' . $token] ?? [];
+    check(
+        '(t) 不帶 cookie 的回呼仍簽出有擁有者的憑證，且回站後結帳通過',
+        '' !== $token
+            && 's:' . hash('sha256', 'guest-session-aaa') === (string) ($record['principal'] ?? '')
+            && null === verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit')
+    );
+
+    // map session 沒有 actor（不是本版寫的）＝拒絕，不要簽出不能用的憑證。
+    $GLOBALS['ys_transients'] = [];
+    $form = EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_family', 'checkout', 0, 'default', '', 'ys_ec_credit');
+    $temp = (string) $form['temp_id'];
+    unset($GLOBALS['ys_transients']['ys_ec_ecpay_map_' . $temp]['actor']);
+    $session = $GLOBALS['ys_transients']['ys_ec_ecpay_map_' . $temp];
+    $params  = [
+        'MerchantID'       => MID,
+        'MerchantTradeNo'  => $session['merchant_trade_no'],
+        'LogisticsSubType' => $session['logistics_subtype'],
+        'CVSStoreID'       => '001234',
+        'CVSStoreName'     => '測試門市',
+        'CVSAddress'       => '台北市中正區測試路 1 號',
+        'ExtraData'        => $temp,
+    ];
+    $params['CheckMacValue'] = CheckMacValue::generate($params, HASH_KEY, HASH_IV, 'md5');
+    $rejected = false;
+    try {
+        EcpayStoreSelector::handle_store_callback(new WP_REST_Request($params));
+    } catch (WpDie $e) {
+        $rejected = true;
+    } catch (Responded $e) {
+        $rejected = false;
+    }
+    check('(u) map session 沒有 actor 時回呼被拒絕（不簽出不能用的憑證）', $rejected);
+
+    // 算不出身分時連地圖都不開。
+    $saved_cookie = $_COOKIE['ys_ec_session'] ?? '';
+    unset($_COOKIE['ys_ec_session']);
+    check(
+        '(v) 算不出顧客身分時不開電子地圖',
+        false === EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_family', 'checkout', 0, 'default', '', 'ys_ec_credit')
+    );
+    $_COOKIE['ys_ec_session'] = $saved_cookie;
+
+    // 🔴 兩階段：驗證只讀不刪，認領才是一次性。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $v1 = verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $v2 = verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    $v3 = verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    check(
+        '(w) 驗證可以重複進行而不消耗憑證（其他欄位錯誤時顧客不該被沒收門市）',
+        null === $v1 && null === $v2 && null === $v3
+    );
+
+    check('(x) 認領一次成功', null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+    check('(y) 認領之後驗證也失效', null !== verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit'));
+
+    // 認領時會再驗一次：驗證通過之後才改付款方式，一樣要被擋。
+    $token = select_store('ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    verify($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit');
+    check(
+        '(z) 認領前再驗一次：驗證後才換付款方式仍被擋，且憑證沒被用掉',
+        null !== checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_cod')
+            && null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit')
     );
 
     echo "\nREGRESSION v033_store_selection_token PASS={$pass} FAIL={$fail}\n";

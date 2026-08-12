@@ -44,6 +44,37 @@ namespace YangSheep\Ecommerce\Models {
     }
 }
 
+namespace YangSheep\Ecommerce\Api\Storefront {
+    /** 只需要能分辨 success／error 兩種回應。 */
+    final class YSRestResponder {
+        public static function error(string $code, string $message = '', int $status = 400): \WP_REST_Response {
+            return new \WP_REST_Response([ 'success' => false, 'code' => $code, 'message' => $message ], $status);
+        }
+
+        public static function success(string $code, string $message = '', array $data = []): \WP_REST_Response {
+            return new \WP_REST_Response([ 'success' => true, 'code' => $code, 'data' => $data ], 200);
+        }
+    }
+}
+
+namespace YangSheep\Ecommerce\Gateways {
+    /**
+     * 金流註冊表的替身：只回答「這個 id 有沒有註冊」。
+     * map-url 端點以它判斷付款方式是否有效——認不出來的字串不得被靜默當成非代收。
+     */
+    final class YSGatewayRegistry {
+        /** @var array<string,bool> */
+        public static array $registered = [
+            'ys_ec_cod'         => true,
+            'ys_ec_ecpay_credit' => true,
+        ];
+
+        public static function get(string $id): ?object {
+            return isset(self::$registered[$id]) ? (object) [ 'id' => $id ] : null;
+        }
+    }
+}
+
 namespace YangSheep\Ecommerce\Handlers {
     final class YSCartHandler {
         /** null＝核心回報讀取失敗（SQL 錯誤／items 壞 JSON）。 */
@@ -113,6 +144,12 @@ namespace {
     $GLOBALS['ys_logged_in'] = false;
     function is_user_logged_in(): bool {
         return (bool) $GLOBALS['ys_logged_in'];
+    }
+
+    if (! class_exists('WP_REST_Response')) {
+        class WP_REST_Response {
+            public function __construct(public $data = null, public int $status = 200) {}
+        }
     }
 
     require_once dirname(__DIR__, 3) . '/ys-cart/src/Shipping/YSShippingRegistry.php';
@@ -291,6 +328,53 @@ namespace {
         && 1 === preg_match('/->\s*try_get_items_raw\(\s*\)/', $read_fn)
         && 0 === preg_match('/->\s*(?<!try_)get_items_raw\(\s*\)/', $read_fn),
         '(i) 核心述詞缺席 → return false；typed 讀取 API 缺席 → return null；不得再使用舊 get_items_raw()'
+    );
+
+    // ══ #3V：付款方式守門 ═══════════════════════════════════════════════
+    //
+    // 🔴 「有帶 payment_method 這個 key」不等於「帶了一個有效的付款方式」。
+    // 只檢查 key 存在的話，空字串、不存在的金流、以及「貨到付款 × 不支援代收的
+    // 方式」三種都會過，而且全部被靜默當成 IsCollection=N——顧客選得到一個
+    // 不支援代收的門市，結完帳，送單那天才被綠界拒絕。
+    require_once dirname(__DIR__, 2) . '/src/Shipping/Ecpay/EcpayShippingCatalog.php';
+    require_once dirname(__DIR__, 2) . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
+    $reject = $plugin_rc->getMethod('reject_invalid_payment_method');
+
+    $error_code = static function ($response): string {
+        if (! is_object($response)) {
+            return '';
+        }
+        $data = (array) ($response->data ?? []);
+        return (string) ($data['code'] ?? $data['error'] ?? '');
+    };
+
+    $assert(
+        null !== $reject->invoke($plugin, '', 'ys_ec_ecpay_ship_family'),
+        '(j) 空字串的付款方式被拒絕（空值不是「不代收」，是無法證明）'
+    );
+
+    $assert(
+        null !== $reject->invoke($plugin, 'totally_unknown_gateway', 'ys_ec_ecpay_ship_family'),
+        '(k) 未註冊的付款方式被拒絕（不得靜默當成非代收）'
+    );
+
+    $assert(
+        null !== $reject->invoke($plugin, 'ys_ec_cod', 'ys_ec_ecpay_ship_unimart_freeze'),
+        '(l) 貨到付款 × 不支援代收的物流方式被拒絕（不要開一張以「不代收」篩出來的地圖）'
+    );
+
+    $assert(
+        null === $reject->invoke($plugin, 'ys_ec_ecpay_credit', 'ys_ec_ecpay_ship_family')
+        && null === $reject->invoke($plugin, 'ys_ec_cod', 'ys_ec_ecpay_ship_family'),
+        '(m) 合法組合放行（線上金流；以及貨到付款 × 支援代收的方式）'
+    );
+
+    // 核心註冊表缺席時 fail-closed：守門靜默消失比擋錯一次糟得多。
+    $registry_missing = str_contains($src, "gateway_registry_unavailable");
+    $assert(
+        $registry_missing
+        && 1 === preg_match('/method_exists\(\s*YSGatewayRegistry::class/', $src),
+        '(n) 核心金流註冊表缺席時拒絕（不得因為驗不了就放行）'
     );
 
     echo "\nmap-url cart allowed intersection: {$pass} PASS / {$fail} FAIL\n";

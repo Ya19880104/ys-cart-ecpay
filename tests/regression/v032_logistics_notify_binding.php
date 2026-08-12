@@ -78,6 +78,14 @@ namespace {
         public bool $read_fails = false;
         /** 寫 label 時要不要模擬資料庫失敗。 */
         public bool $write_fails = false;
+        /** 授權表裡有沒有這個 MerchantTradeNo（＝這一單是不是我們送出去的）。 */
+        public bool $dispatch_attempt_exists = false;
+        /** 讀授權表時要不要模擬資料庫失敗。 */
+        public bool $attempt_read_fails = false;
+        /** 授權表存不存在（舊核心）。 */
+        public bool $attempts_table_exists = true;
+        /** readback 時 label 的追蹤碼（sync_label 會比對）。 */
+        public string $readback_tracking = '';
         /** @var array<int,array{table:string,data:array<string,mixed>,where:array<string,mixed>}> */
         public array $updates = [];
 
@@ -88,16 +96,45 @@ namespace {
             return $sql;
         }
 
+        public function get_var(string $sql) {
+            $this->last_error = '';
+
+            if (false !== strpos($sql, 'SHOW TABLES LIKE')) {
+                preg_match("/LIKE '([^']*)'/", $sql, $m);
+                $table = $m[1] ?? '';
+                if (false !== strpos($table, 'shipping_label_attempts') && !$this->attempts_table_exists) {
+                    return null;
+                }
+                return $table;
+            }
+
+            if (false !== strpos($sql, 'shipping_label_attempts')) {
+                if ($this->attempt_read_fails) {
+                    $this->last_error = 'MySQL server has gone away';
+                    return null;
+                }
+                return $this->dispatch_attempt_exists ? '1' : null;
+            }
+
+            return null;
+        }
+
         public function get_row(string $sql) {
             if (false !== strpos($sql, 'shipping_labels')) {
                 if ($this->read_fails) {
                     $this->last_error = 'MySQL server has gone away';
                     return null;
                 }
-                // sync_label() 的 readback：回傳最後一次寫進去的狀態。
-                if (false !== strpos($sql, 'SELECT status FROM')) {
+                // sync_label() 的 readback：回傳最後一次寫進去的狀態與追蹤碼。
+                if (false !== strpos($sql, 'SELECT status')) {
                     $last = end($this->updates);
-                    return $last ? (object) [ 'status' => $last['data']['status'] ?? '' ] : null;
+                    if (!$last) {
+                        return null;
+                    }
+                    return (object) [
+                        'status'          => $last['data']['status'] ?? '',
+                        'tracking_number' => $last['data']['tracking_number'] ?? $this->readback_tracking,
+                    ];
                 }
                 return $this->label;
             }
@@ -202,6 +239,28 @@ namespace {
             'BookingNote'       => 'BN999',
         ], $overrides);
     }
+
+    /**
+     * pipeline 的替身。核心真的有這個類別時，狀態由它決定；因此「拒絕轉換」與
+     * 「寫不進去」兩種失敗必須測得到——它們的正確反應完全不同。
+     */
+    if (!class_exists('YangSheep\\Ecommerce\\Services\\Shipping\\YSShippingPipelineService')) {
+        eval('namespace YangSheep\\Ecommerce\\Services\\Shipping; final class YSShippingPipelineService {
+            public static array $result = [ "success" => true, "persisted" => true ];
+            public static int $calls = 0;
+            public static function advance_from_carrier_status(int $o, string $s, string $r = ""): array {
+                self::$calls++;
+                return self::$result;
+            }
+        }');
+    }
+
+    function pipeline_reset(array $result = [ 'success' => true, 'persisted' => true ]): void {
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$result = $result;
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$calls  = 0;
+    }
+
+    pipeline_reset();
 
     echo "## v032 物流狀態通知的綁定（v0.2.12）\n";
 
@@ -331,6 +390,59 @@ namespace {
         '900000001' !== $order_tracking
             && '900000001' !== ($wpdb->updates[0]['data']['tracking_number'] ?? null)
     );
+
+    // ══ #3V：早到的通知、狀態單調性 ═════════════════════════════════════
+
+    // 🔴 建單的順序是「送出 → 收到回應 → 才 INSERT label」。通知完全可能在那個
+    // INSERT 之前抵達，而 ACK 不可逆——回了 1|OK，那則通知就永遠不會再來。
+    $wpdb = seed_label();
+    $wpdb->label = null;
+    $wpdb->dispatch_attempt_exists = true;
+    check(
+        '(r) label 還沒落盤但授權表有這筆＝我們送出去的，回 503 請對方重送',
+        503 === notify(base_notify()) && [] === $wpdb->updates
+    );
+
+    $wpdb = seed_label();
+    $wpdb->label = null;
+    $wpdb->dispatch_attempt_exists = false;
+    check(
+        '(s) label 與授權表都沒有＝真的不是我們的單，回 1|OK 停止重送且不寫入',
+        200 === notify(base_notify()) && [] === $wpdb->updates
+    );
+
+    $wpdb = seed_label();
+    $wpdb->label = null;
+    $wpdb->attempt_read_fails = true;
+    check(
+        '(t) 授權表讀不動時回 503（讀不到不等於不是我們的）',
+        503 === notify(base_notify())
+    );
+
+    // pipeline 拒絕轉換（遲到／亂序的通知）：ACK 沒問題，但**不得**把 label 的
+    // 狀態寫回一個更早的值——那會讓訂單與 label 各說各話。
+    $wpdb = seed_label();
+    pipeline_reset([ 'success' => false, 'persisted' => true, 'message' => '不允許的轉換' ]);
+    $code   = notify(base_notify([ 'LogisticsStatus' => '2030' ]));
+    $update = $wpdb->updates[0]['data'] ?? [];
+    check(
+        '(u) pipeline 拒絕轉換時照樣 ACK，但不寫 label 狀態（不倒退）',
+        200 === $code
+            && ! array_key_exists('status', $update)
+            && ! array_key_exists('status_code', $update)
+            && 'BN999' === ($update['tracking_number'] ?? '')
+    );
+
+    // pipeline 寫不進去＝retryable，而且必須在**動任何東西之前**就擋下來。
+    $wpdb = seed_label();
+    pipeline_reset([ 'success' => true, 'persisted' => false ]);
+    $code = notify(base_notify());
+    check(
+        '(v) pipeline 未落盤時回 503，且訂單與 label 都還沒被改過',
+        503 === $code && [] === $wpdb->updates && [] === YSOrder::$updates
+    );
+
+    pipeline_reset();
 
     echo "\nREGRESSION v032_logistics_notify_binding PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {

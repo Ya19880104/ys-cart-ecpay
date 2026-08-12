@@ -277,6 +277,10 @@ namespace {
     }
 
     echo "## v031 送單 wire × 電子地圖 × 回呼綁定（v0.2.12）\n";
+
+    // 開電子地圖需要算得出顧客身分（憑證的擁有者要在同源這一側決定）。
+    // 這裡模擬一個訪客的購物車 session。
+    $_COOKIE['ys_ec_session'] = 'v031-guest-session';
     reset_settings();
 
     // ── (4) 每個超商方式的 subtype：地圖與送單必須是同一個 ─────────────────

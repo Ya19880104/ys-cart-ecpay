@@ -52,6 +52,26 @@ final class EcpayLogisticsController {
 		}
 
 		if ( 'not_found' === $lookup['status'] ) {
+			// 🔴 「label 表裡沒有」不等於「不是我們的單」。
+			//
+			// 建單的順序是：送出 → 收到回應 → 才 INSERT label。綠界的狀態通知
+			// 完全可能在那個 INSERT 之前就到（尤其是回應遺失、本地落盤失敗的
+			// 那些單——正是最需要後續通知的情況）。這時候回 1|OK，那則通知就
+			// 永遠不會再來了。
+			//
+			// 分辨的依據是建單授權：`MerchantTradeNo` 是我們**送出之前**就落盤的
+			// 值，查得到就代表這一單確實是我們發出去的，只是 label 還沒寫進來 →
+			// 回 503 請對方重送。查不到才是真的不干我們的事 → 1|OK 停止重送。
+			$dispatched = $this->dispatch_attempt_exists( $params );
+
+			if ( 'error' === $dispatched ) {
+				$this->respond_text( '0|Storage unavailable', 503 );
+			}
+
+			if ( 'found' === $dispatched ) {
+				$this->respond_text( '0|Label not persisted yet', 503 );
+			}
+
 			// 確定不是我們的單：回 1|OK 讓對方停止重送，但**什麼都不寫**。
 			$this->respond_text( '1|OK' );
 		}
@@ -114,6 +134,44 @@ final class EcpayLogisticsController {
 		}
 
 		return [ 'status' => 'found', 'label' => $label ];
+	}
+
+	/**
+	 * 這個 `MerchantTradeNo` 是不是我們送出去過的建單
+	 *
+	 * 授權表在**送出之前**就落盤，因此它是「這一單是不是我們發的」唯一可靠的
+	 * 依據——label 表要等回應回來才寫得進去。
+	 *
+	 * @param array<string,string> $params
+	 * @return string 'found'|'not_found'|'error'
+	 */
+	private function dispatch_attempt_exists( array $params ): string {
+		$trade_no = trim( (string) ( $params['MerchantTradeNo'] ?? '' ) );
+		if ( '' === $trade_no ) {
+			return 'not_found';
+		}
+
+		global $wpdb;
+		$attempts = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_label_attempts';
+
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $attempts ) ) !== $attempts ) {
+			// 表不存在（核心未升級）＝證明不了，但也不該無限重送。交給既有的
+			// 核心版本 gate 處理，這裡當成「不是我們的」。
+			return 'not_found';
+		}
+
+		$found = $wpdb->get_var( $wpdb->prepare(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			"SELECT id FROM {$attempts} WHERE merchant_trade_no = %s AND provider = %s LIMIT 1",
+			$trade_no,
+			'ecpay'
+		) );
+
+		if ( null === $found ) {
+			return '' !== (string) $wpdb->last_error ? 'error' : 'not_found';
+		}
+
+		return 'found';
 	}
 
 	/**
@@ -205,6 +263,33 @@ final class EcpayLogisticsController {
 		$tracking = trim( (string) ( $params['BookingNote'] ?? '' ) );
 		$status   = (string) ( $params['LogisticsStatus'] ?? $params['RtnCode'] ?? '' );
 
+		// 🔴 pipeline 先決定，狀態才寫得下去。
+		//
+		// 順序反過來的話（先寫 order/label 的狀態、再問 pipeline），遇到一則
+		// **遲到或亂序**的通知就會這樣：label 已經被改成「配送中」，pipeline 才
+		// 說「已取貨不能倒退回配送中」而拒絕——結果 order 說已取貨、label 說
+		// 配送中，兩邊各說各話，而我們還回了 1|OK 讓對方不要再送。
+		//
+		// 三種結果分開處理：
+		//   persisted=false  寫不進去＝retryable，回非 2xx，**什麼都還沒寫**。
+		//   success=false    不允許的轉換＝已知且重送也不會變 → 不寫狀態、照樣 ACK。
+		//   success=true     正常前進 → 狀態可以寫。
+		$status_advance_allowed = true;
+		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
+			$advanced = YSShippingPipelineService::advance_from_carrier_status(
+				(int) $order->id,
+				$status,
+				'webhook_ecpay'
+			);
+
+			if ( is_array( $advanced ) ) {
+				if ( false === ( $advanced['persisted'] ?? true ) ) {
+					return false;
+				}
+				$status_advance_allowed = ! empty( $advanced['success'] );
+			}
+		}
+
 		$payment_detail = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
 		if ( ! is_array( $payment_detail ) ) {
 			$payment_detail = [];
@@ -223,7 +308,8 @@ final class EcpayLogisticsController {
 			'tracking_number' => $tracking ?: (string) ( $order->tracking_number ?? '' ),
 		];
 
-		if ( ! class_exists( YSShippingPipelineService::class ) ) {
+		// 沒有 pipeline 時由這裡直接對映；有 pipeline 時狀態由它負責，這裡不碰。
+		if ( ! class_exists( YSShippingPipelineService::class ) && $status_advance_allowed ) {
 			$order_update['shipping_status'] = $this->map_status( $status );
 		}
 
@@ -237,26 +323,7 @@ final class EcpayLogisticsController {
 			return false;
 		}
 
-		if ( ! $this->sync_label( $label, $params, $tracking, $status ) ) {
-			return false;
-		}
-
-		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
-			$advanced = YSShippingPipelineService::advance_from_carrier_status(
-				(int) $order->id,
-				$status,
-				'webhook_ecpay'
-			);
-
-			// 🔴 分辨兩種 `success => false`：
-			//   - 不允許的狀態轉換＝**已知**且重送也不會變，不擋 ACK；
-			//   - `persisted => false`＝寫不進去，是 retryable，必須回非 2xx。
-			if ( is_array( $advanced ) && false === ( $advanced['persisted'] ?? true ) ) {
-				return false;
-			}
-		}
-
-		return true;
+		return $this->sync_label( $label, $params, $tracking, $status, $status_advance_allowed );
 	}
 
 	/**
@@ -306,17 +373,24 @@ final class EcpayLogisticsController {
 	 * 時可能一次改到不只一列。綁定既然已經驗到具體那一列，就直接以主鍵更新。
 	 *
 	 * @param array<string,string> $params
+	 * @param bool                 $write_status pipeline 允許前進時才寫狀態欄位
 	 */
-	private function sync_label( object $label, array $params, string $tracking, string $status ): bool {
+	private function sync_label( object $label, array $params, string $tracking, string $status, bool $write_status = true ): bool {
 		global $wpdb;
 		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
 
 		$update = [
-			'status'            => $this->map_status( $status ),
-			'status_code'       => $status,
-			'status_updated_at' => current_time( 'mysql' ),
-			'updated_at'        => current_time( 'mysql' ),
+			'updated_at' => current_time( 'mysql' ),
 		];
+
+		// 🔴 pipeline 說這個轉換不允許（遲到／亂序的通知）時就不要寫狀態。
+		// 寫下去的話 label 會被改回一個比訂單更早的狀態——同一件事兩邊各說各話。
+		// 憑據類欄位（追蹤碼、寄貨編號）不受影響：它們是補齊，不是倒退。
+		if ( $write_status ) {
+			$update['status']            = $this->map_status( $status );
+			$update['status_code']       = $status;
+			$update['status_updated_at'] = current_time( 'mysql' );
+		}
 
 		if ( '' !== $tracking ) {
 			$update['tracking_number'] = $tracking;
@@ -340,11 +414,23 @@ final class EcpayLogisticsController {
 
 		// affected=0 也回 0（不是 false），因此要讀回來確認狀態真的落盤了。
 		$persisted = $wpdb->get_row( $wpdb->prepare(
-			"SELECT status FROM {$table} WHERE id = %d",
+			"SELECT status, tracking_number FROM {$table} WHERE id = %d",
 			(int) $label->id
 		) );
 
-		return null !== $persisted && (string) $persisted->status === (string) $update['status'];
+		if ( null === $persisted ) {
+			return false;
+		}
+
+		if ( $write_status && (string) $persisted->status !== (string) $update['status'] ) {
+			return false;
+		}
+
+		if ( '' !== $tracking && (string) ( $persisted->tracking_number ?? '' ) !== $tracking ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	private function respond_text( string $body, int $status = 200 ): void {

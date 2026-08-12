@@ -138,10 +138,11 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_carrier_adapter', [ $this, 'register_carrier_adapter' ], 10, 2 );
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
 		add_filter( 'ys_ec_validate_store_selection', [ $this, 'validate_store_selection' ], 10, 4 );
+		add_filter( 'ys_ec_claim_store_selection', [ $this, 'claim_store_selection' ], 10, 4 );
 	}
 
 	/**
-	 * 結帳送出時驗證門市選擇（伺服器端）
+	 * 結帳送出時驗證門市選擇（伺服器端，**只驗不消耗**）
 	 *
 	 * 🔴 只驗**我們自己的**物流方式。其他供應商的方式一個字都不碰。
 	 *
@@ -154,12 +155,11 @@ final class Plugin {
 			$errors = [];
 		}
 
-		$descriptor = EcpayShippingCatalog::get( $shipping_method );
-		if ( null === $descriptor || 'CVS' !== $descriptor['logistics_type'] ) {
+		if ( ! $this->is_cvs_method( $shipping_method ) ) {
 			return $errors;
 		}
 
-		$rejection = EcpayStoreSelector::consume_selection(
+		$rejection = EcpayStoreSelector::verify_selection(
 			is_array( $data ) ? $data : [],
 			$shipping_method,
 			$payment_method
@@ -170,6 +170,40 @@ final class Plugin {
 		}
 
 		return $errors;
+	}
+
+	/**
+	 * 訂單成立那一刻認領（消耗）門市選擇
+	 *
+	 * 🔴 與驗證分開的理由：驗證會因為**其他欄位**失敗，那時候把憑證用掉，
+	 * 顧客補好欄位再送出就會被告知「請重新選擇門市」——而他沒動過門市。
+	 * 一次性與原子性由 `claim_selection()` 保證，兩個併發的結帳仍只有一個過得去。
+	 *
+	 * @param string|null         $error
+	 * @param array<string,mixed> $data
+	 * @return string|null
+	 */
+	public function claim_store_selection( $error, $data, string $shipping_method, string $payment_method ) {
+		// 前面已經有人擋下來了就不要覆蓋。
+		if ( is_string( $error ) && '' !== $error ) {
+			return $error;
+		}
+
+		if ( ! $this->is_cvs_method( $shipping_method ) ) {
+			return $error;
+		}
+
+		return EcpayStoreSelector::claim_selection(
+			is_array( $data ) ? $data : [],
+			$shipping_method,
+			$payment_method
+		);
+	}
+
+	private function is_cvs_method( string $shipping_method ): bool {
+		$descriptor = EcpayShippingCatalog::get( $shipping_method );
+
+		return null !== $descriptor && 'CVS' === $descriptor['logistics_type'];
 	}
 
 	public function sync_print_route(): void {
@@ -331,6 +365,21 @@ final class Plugin {
 
 		$payment_method = sanitize_text_field( (string) $params['payment_method'] );
 
+		// 🔴 「有帶這個欄位」不等於「帶了一個有效的付款方式」。
+		//
+		// 只檢查 key 存在的話，這三種都會過，而且全部被靜默當成不代收：
+		//   payment_method=""            → IsCollection=N
+		//   payment_method="不存在的金流" → IsCollection=N
+		//   payment_method=ys_ec_cod + 不支援代收的方式 → IsCollection=N
+		//
+		// 最後那一種最傷：顧客選了貨到付款，地圖卻用「不代收」去篩門市，他選得到
+		// 一個不支援代收的門市，結完帳，然後送單那一天綠界才拒絕。缺值與錯值都是
+		// **無法證明**，不是「預設不代收」。
+		$payment_rejection = $this->reject_invalid_payment_method( $payment_method, $shipping_id );
+		if ( null !== $payment_rejection ) {
+			return $payment_rejection;
+		}
+
 		if ( ! $this->is_method_enabled( 'shipping', $shipping_id ) ) {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
@@ -356,6 +405,56 @@ final class Plugin {
 		}
 
 		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
+	}
+
+	/**
+	 * 電子地圖的付款方式守門
+	 *
+	 * 回 `null` 代表通過；回 response 代表拒絕。
+	 *
+	 * 三道：
+	 *   1. 不得為空字串（空值不是「不代收」，是無法證明）。
+	 *   2. 必須是**已註冊**的金流；認不出來的字串不得被靜默當成非代收。
+	 *   3. 貨到付款 × 不支援代收的物流方式 → 直接拒絕，不要開一張以「不代收」
+	 *      篩出來的地圖給顧客選。
+	 */
+	private function reject_invalid_payment_method( string $payment_method, string $shipping_id ): ?\WP_REST_Response {
+		if ( '' === $payment_method ) {
+			return YSRestResponder::error(
+				'missing_payment_method',
+				'缺少付款方式，無法決定電子地圖的代收模式。'
+			);
+		}
+
+		// 核心不在（或版本太舊）時 fail-closed。守門靜默消失比擋錯一次糟得多。
+		if ( ! class_exists( YSGatewayRegistry::class )
+			|| ! method_exists( YSGatewayRegistry::class, 'get' ) ) {
+			return YSRestResponder::error(
+				'gateway_registry_unavailable',
+				'無法驗證付款方式，請稍後再試。'
+			);
+		}
+
+		if ( null === YSGatewayRegistry::get( $payment_method ) ) {
+			return YSRestResponder::error(
+				'unknown_payment_method',
+				'付款方式無效，無法決定電子地圖的代收模式。'
+			);
+		}
+
+		if ( EcpayStoreSelector::COD_GATEWAY_ID !== $payment_method ) {
+			return null;
+		}
+
+		$descriptor = EcpayShippingCatalog::get( $shipping_id );
+		if ( null === $descriptor || empty( $descriptor['cod_capable'] ) ) {
+			return YSRestResponder::error(
+				'cod_not_supported_by_method',
+				'此物流方式不支援貨到付款，請更換付款方式或運送方式。'
+			);
+		}
+
+		return null;
 	}
 
 	private static function sanitize_cart_scope( string $scope ): string {

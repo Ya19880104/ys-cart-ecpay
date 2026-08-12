@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
 use YangSheep\Ecommerce\Services\Setup\YSPageResolver;
 
 final class EcpayStoreSelector {
@@ -64,9 +65,26 @@ final class EcpayStoreSelector {
 
 		$is_collection = self::resolve_collection_mode( $method, $payment_method );
 		$cart_scope    = self::sanitize_cart_scope( $cart_scope );
-		$return_url    = self::sanitize_return_url( $return_url, $cart_scope );
-		$credentials   = Settings::logistics_credentials();
-		$temp_id       = wp_generate_uuid4();
+
+		// 🔴 身分要在**這裡**算，不能等到回呼。
+		//
+		// 這個請求是顧客的瀏覽器打給我們自己的（同源），cookie 一定在。
+		// 選店回呼則是綠界從**它們的**伺服器 POST 過來的跨站請求，而購物車
+		// cookie 是 SameSite=Lax——跨站 POST 不會帶。在回呼那一刻重算身分，
+		// 訪客一律算出空字串，於是簽出一張「無法識別擁有者」的憑證：顧客帶著
+		// 它回到結帳頁，反而被自己的守門擋下來（正常流程 100% 失敗）。
+		//
+		// 因此身分在同源這一側算好、存進 map session，回呼只能**複製**它。
+		$actor = self::current_principal( $cart_scope );
+		if ( '' === $actor ) {
+			// 算不出身分就不要開地圖。讓顧客在選完門市之後才失敗，比在這裡
+			// 直接說「請重新整理」糟得多。
+			return false;
+		}
+
+		$return_url  = self::sanitize_return_url( $return_url, $cart_scope );
+		$credentials = Settings::logistics_credentials();
+		$temp_id     = wp_generate_uuid4();
 		// 地圖用的交易編號只用於這一次選店的來回比對，與送單的 MerchantTradeNo
 		// 無關，因此可以是隨機值；重點是回呼必須**帶回同一個**。
 		$merchant_trade_no = substr(
@@ -79,6 +97,8 @@ final class EcpayStoreSelector {
 			'shipping_id'       => $shipping_id,
 			'logistics_subtype' => $subtypes[ $shipping_id ],
 			'user_id'           => get_current_user_id(),
+			// 🔴 憑證的擁有者。在這個同源請求裡算好，回呼只准複製、不准重算。
+			'actor'             => $actor,
 			'context'           => $context,
 			'order_id'          => $order_id,
 			'cart_scope'        => $cart_scope,
@@ -146,8 +166,9 @@ final class EcpayStoreSelector {
 	 * 「這個門市是在哪一種前提下選的」變成一個可竄改的欄位，等於沒有守門。
 	 *
 	 * @param array<string,mixed> $selection
+	 * @param string              $principal 由 map session **複製**而來的擁有者識別
 	 */
-	private static function issue_selection_token( array $selection ): string {
+	private static function issue_selection_token( array $selection, string $principal ): string {
 		$token = wp_generate_password( 32, false, false );
 
 		set_transient( self::SELECTION_PREFIX . $token, [
@@ -164,7 +185,11 @@ final class EcpayStoreSelector {
 			'cart_scope'        => (string) ( $selection['cart_scope'] ?? 'default' ),
 			// 🔴 訪客也要綁。登入者綁 user id；訪客綁購物車 session——沒有它，
 			// 一張 token 誰撿到都能用。
-			'principal'         => self::current_principal( (string) ( $selection['cart_scope'] ?? 'default' ) ),
+			//
+			// 這個值是**傳進來的**，不是在這裡重算的：這支函式跑在綠界的跨站
+			// 回呼裡，SameSite=Lax 的購物車 cookie 根本不會出現。重算的結果是
+			// 每一次正常的訪客選店都簽出一張擁有者為空的憑證。
+			'principal'         => $principal,
 			'issued_at'         => current_time( 'timestamp' ),
 		], self::SELECTION_TTL );
 
@@ -185,25 +210,40 @@ final class EcpayStoreSelector {
 
 		$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
 		$value  = isset( $_COOKIE[ $cookie ] ) ? (string) $_COOKIE[ $cookie ] : '';
-		if ( '' === $value ) {
-			return '';
+		if ( '' !== $value ) {
+			return 's:' . hash( 'sha256', $value );
 		}
 
-		return 's:' . hash( 'sha256', $value );
+		// headless 的訪客沒有我方 cookie（前端可能在另一個 origin），身分來自
+		// 核心既有的 `X-YS-Guest-Token`。少了這一條，headless 站的訪客一律算不出
+		// 身分——地圖根本開不起來。
+		if ( class_exists( YSRestAuth::class ) && method_exists( YSRestAuth::class, 'get_guest_token' ) ) {
+			$guest = (string) ( YSRestAuth::get_guest_token() ?? '' );
+			if ( '' !== $guest ) {
+				return 'g:' . hash( 'sha256', $guest );
+			}
+		}
+
+		return '';
 	}
 
 	/**
-	 * 驗證並消耗一張門市選擇 token。
+	 * 驗證一張門市選擇 token（**只讀，不消耗**）。
 	 *
-	 * 回 `null` 代表通過（並已消耗）；回字串代表拒絕的理由，呼叫端據此要求重選。
+	 * 回 `null` 代表通過；回字串代表拒絕的理由，呼叫端據此要求重選。
 	 *
 	 * 逐項比對：擁有者、購物車 scope、物流方式、subtype、門市代號，以及**最終的
 	 * 付款方式**是否與當初選店的代收前提一致。任何一項對不上就重選——包含 token
 	 * 不存在（過期或偽造）。
 	 *
+	 * 🔴 這裡刻意不刪。結帳驗證會因為**其他欄位**（電話格式、地址沒填）整批失敗，
+	 * 而顧客會照著訊息補好再送一次——上一版在這裡就把憑證刪掉了，於是那第二次
+	 * 送出必然收到「請重新選擇門市」，而他從頭到尾沒動過門市。
+	 * 真正的一次性消耗在 {@see self::claim_selection()}，時機是訂單成立那一刻。
+	 *
 	 * @param array<string,mixed> $data 結帳送出的資料
 	 */
-	public static function consume_selection( array $data, string $shipping_id, string $payment_method ): ?string {
+	public static function verify_selection( array $data, string $shipping_id, string $payment_method ): ?string {
 		$token = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
 		if ( '' === $token ) {
 			return '請重新選擇取貨門市（缺少門市選擇憑證）。';
@@ -263,12 +303,39 @@ final class EcpayStoreSelector {
 			return '付款方式已變更，原先選擇的取貨門市可能不支援，請重新選擇門市。';
 		}
 
+		return null;
+	}
+
+	/**
+	 * 認領（消耗）一張門市選擇 token。
+	 *
+	 * 回 `null` 代表認領成功；回字串代表拒絕的理由。
+	 *
+	 * 呼叫時機是**訂單成立那一刻**，不是欄位驗證的時候——驗證會因為別的欄位失敗，
+	 * 那時候把憑證用掉等於懲罰一個什麼都沒做錯的顧客。
+	 *
+	 * 認領前會再驗一次：從驗證到成立之間，付款方式可能被改、設定可能被動過。
+	 *
+	 * @param array<string,mixed> $data 結帳送出的資料
+	 */
+	public static function claim_selection( array $data, string $shipping_id, string $payment_method ): ?string {
+		$rejection = self::verify_selection( $data, $shipping_id, $payment_method );
+		if ( null !== $rejection ) {
+			return $rejection;
+		}
+
+		$token = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+
 		// 🔴 一次性消耗必須是**原子的**。
 		//
 		// 先 `get_transient()` 驗、再 `delete_transient()` 刪的話，兩個併發的結帳
 		// 會同時通過驗證、同時刪除，兩張訂單共用一次選店。
 		// `delete_transient()` 只有在真的刪掉一列時才回 true——把它當成「認領」，
 		// 搶不到的那一個就是慢的那一個。
+		//
+		// 這一條在真實的 object cache（Redis／Memcached）與多 process 之下同樣成立：
+		// WordPress 的 `delete_transient()` 最終走到 `wp_cache_delete()` 或
+		// `delete_option()`，兩者對「那一列本來就不在」都回 false。
 		if ( ! delete_transient( self::SELECTION_PREFIX . $token ) ) {
 			return '這次的取貨門市選擇已被使用，請重新選擇門市。';
 		}
@@ -315,6 +382,15 @@ final class EcpayStoreSelector {
 			wp_die( 'Invalid map session owner.', 'ECPay Store Callback', [ 'response' => 403 ] );
 		}
 
+		// 🔴 擁有者只能從 map session **複製**。這個請求是綠界跨站 POST 過來的，
+		// 沒有我方 cookie；在這裡重算的話訪客一律算出空字串。
+		// map session 一定有它（開圖時就 gate 掉了），沒有代表這份 session 不是
+		// 本版寫的——拒絕比簽出一張不能用的憑證好。
+		$actor = (string) ( $map_data['actor'] ?? '' );
+		if ( '' === $actor ) {
+			wp_die( 'Map session missing actor.', 'ECPay Store Callback', [ 'response' => 400 ] );
+		}
+
 		$shipping_id = (string) ( $map_data['shipping_id'] ?? '' );
 		if ( '' === $shipping_id || ! isset( self::subtypes()[ $shipping_id ] ) || ! self::is_method_enabled( $shipping_id ) ) {
 			wp_die( 'Shipping method disabled.', 'ECPay Store Callback', [ 'response' => 403 ] );
@@ -354,7 +430,8 @@ final class EcpayStoreSelector {
 		];
 
 		// 🔴 發 token，權威資料留伺服器。前端只帶這個字串回結帳。
-		$store_info['selection_token'] = self::issue_selection_token( $store_info );
+		// 擁有者識別不放進 $store_info——那份資料會被 JSON 印進回呼頁面。
+		$store_info['selection_token'] = self::issue_selection_token( $store_info, $actor );
 
 		set_transient( 'ys_ec_ecpay_store_' . $temp_id, $store_info, self::SELECTION_TTL );
 		delete_transient( 'ys_ec_ecpay_map_' . $temp_id );

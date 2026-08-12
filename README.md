@@ -41,13 +41,20 @@ form route when the customer needs convenience-store selection.
 ## Headless Logistics
 
 For ECPay CVS shipping, request the store-map form with the selected shipping
-method ID:
+method ID **and the customer's currently selected payment method**:
 
 ```json
 {
-  "shipping_id": "ys_ec_ecpay_ship_unimart"
+  "shipping_id": "ys_ec_ecpay_ship_unimart",
+  "payment_method": "ys_ec_ecpay_credit"
 }
 ```
+
+`payment_method` is validated, not merely required — ECPay filters the store
+list by cash-on-delivery mode, so an empty string or an unregistered gateway id
+is *cannot prove*, not "assume no collection". Guests on another origin must
+also identify themselves with the core `X-YS-Guest-Token` header; the token
+issued for a store selection is bound to that owner.
 
 Submit the returned `action_url` and `fields` as a top-level browser form post
 or popup form post. Do not expose ECPay hash keys or callback verification logic
@@ -56,6 +63,7 @@ Checkout must return the map callback's `selection_token` as `ecpay_store_token`
 (v0.2.12); the store id alone is no longer accepted. See `docs/headless.md`.
 
 The bundled SDK exposes
+`YsCartEcpay.setGuestToken(token)` and
 `YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`
 for this request.
 
