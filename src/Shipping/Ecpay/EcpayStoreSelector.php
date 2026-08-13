@@ -84,7 +84,13 @@ final class EcpayStoreSelector {
 
 		$return_url  = self::sanitize_return_url( $return_url, $cart_scope );
 		$credentials = Settings::logistics_credentials();
-		$temp_id     = wp_generate_uuid4();
+		// 🔴 `ExtraData` 是**一次性 nonce**，長度 20 個英數字（CODEX #3W C6）。
+		//
+		// 舊版放的是 `wp_generate_uuid4()`——36 個字元，超過官方對 `ExtraData` 的
+		// 20 字上限。綠界端是拒絕還是截斷未經實測，但截斷之後回呼帶回來的值
+		// 就對不上任何一份 map session，選店結果直接掉在地上。
+		// 20 個英數字 = 62^20，撞不到，也不需要更長。
+		$temp_id = self::generate_nonce();
 		// 地圖用的交易編號只用於這一次選店的來回比對，與送單的 MerchantTradeNo
 		// 無關，因此可以是隨機值；重點是回呼必須**帶回同一個**。
 		$merchant_trade_no = substr(
@@ -151,6 +157,12 @@ final class EcpayStoreSelector {
 	}
 
 	/** 門市選擇 token 的 transient 前綴。 */
+	/** 一次性提領證（headless 跨 origin 取回選店結果）。 */
+	private const RESULT_PREFIX = 'ys_ec_ecpay_result_';
+
+	/** 綠界 `ExtraData` 的長度上限。 */
+	public const NONCE_LENGTH = 20;
+
 	private const SELECTION_PREFIX = 'ys_ec_ecpay_sel_';
 
 	/** 門市選擇的有效期（秒）。與地圖 session 一致。 */
@@ -391,12 +403,21 @@ final class EcpayStoreSelector {
 	}
 
 	public static function handle_store_callback( \WP_REST_Request $request ): void {
-		$params   = self::params( $request );
-		$temp_id  = (string) ( $params['ExtraData'] ?? $params['TempId'] ?? '' );
-		$map_data = '' !== $temp_id ? get_transient( 'ys_ec_ecpay_map_' . $temp_id ) : false;
+		$params  = self::params( $request );
+		$temp_id = (string) ( $params['ExtraData'] ?? $params['TempId'] ?? '' );
 
+		// 🔴 nonce 是**一次性**的，而且它就是這個回呼的認證本身（見
+		// {@see self::verify_map_payload()} 為什麼不能靠 CheckMacValue）。
+		//
+		// 因此必須**原子地消耗**：`delete_transient()` 只有真的刪掉才回 true。
+		// 先讀再刪的話，兩個同時進來的回呼會**都**讀到同一份 map session，
+		// 兩邊各簽出一張憑證——顧客最後用哪一張是賽跑的結果。
+		$map_data = '' !== $temp_id ? get_transient( 'ys_ec_ecpay_map_' . $temp_id ) : false;
 		if ( ! is_array( $map_data ) ) {
 			wp_die( 'Invalid map session.', 'ECPay Store Callback', [ 'response' => 400 ] );
+		}
+		if ( ! delete_transient( 'ys_ec_ecpay_map_' . $temp_id ) ) {
+			wp_die( 'Map session already consumed.', 'ECPay Store Callback', [ 'response' => 409 ] );
 		}
 
 		if ( ! self::validate_map_owner( $map_data ) ) {
@@ -418,7 +439,7 @@ final class EcpayStoreSelector {
 		}
 
 		if ( ! self::verify_map_payload( $params, $map_data ) ) {
-			wp_die( 'Invalid CheckMacValue.', 'ECPay Store Callback', [ 'response' => 400 ] );
+			wp_die( 'Invalid map callback payload.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
 
 		$store_id = trim( (string) ( $params['CVSStoreID'] ?? '' ) );
@@ -426,15 +447,35 @@ final class EcpayStoreSelector {
 			wp_die( 'Missing store id.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
 
+		// 🔴 門市**名稱與地址**是瀏覽器帶回來的，不可信（CODEX #3W）。
+		//
+		// 上 wire 的只有 `CVSStoreID`（建單的 `ReceiverStoreID`），它由一次性 nonce
+		// 綁定；名稱與地址只用於顯示與紀錄。因此改成：能從綠界的門市清單查到
+		// canonical 就用 canonical 並標 `store_verified=1`；查不到就把瀏覽器帶回來的
+		// 值存成**明確標示未驗證**的 hint，絕不冒充已驗證資料。
+		$canonical = EcpayStoreDirectory::lookup(
+			(string) ( $map_data['logistics_subtype'] ?? '' ),
+			$store_id
+		);
+		$verified  = [] !== $canonical;
+
+		$store_name = $verified
+			? (string) ( $canonical['name'] ?? '' )
+			: (string) ( $params['CVSStoreName'] ?? '' );
+		$store_addr = $verified
+			? (string) ( $canonical['address'] ?? '' )
+			: (string) ( $params['CVSAddress'] ?? '' );
+
 		$store_info = [
 			'store_id'        => $store_id,
-			'store_name'      => (string) ( $params['CVSStoreName'] ?? '' ),
-			'store_address'   => (string) ( $params['CVSAddress'] ?? '' ),
-			'store_phone'     => (string) ( $params['CVSTelephone'] ?? '' ),
+			'store_name'      => $store_name,
+			'store_address'   => $store_addr,
+			'store_phone'     => $verified ? (string) ( $canonical['phone'] ?? '' ) : (string) ( $params['CVSTelephone'] ?? '' ),
+			'store_verified'  => $verified ? 1 : 0,
 			'cvs_type'        => (string) ( $map_data['logistics_subtype'] ?? '' ),
 			'cvs_store_id'    => $store_id,
-			'cvs_store_name'  => (string) ( $params['CVSStoreName'] ?? '' ),
-			'cvs_store_addr'  => (string) ( $params['CVSAddress'] ?? '' ),
+			'cvs_store_name'  => $store_name,
+			'cvs_store_addr'  => $store_addr,
 			'shipping_id'     => $shipping_id,
 			// 🔴 這次選店的前提跟著結果一起回去。前端據此判斷「顧客改了付款方式
 			// 之後這個門市還能不能用」（見 selection_requires_reselect()）。
@@ -454,10 +495,18 @@ final class EcpayStoreSelector {
 		// 擁有者識別不放進 $store_info——那份資料會被 JSON 印進回呼頁面。
 		$store_info['selection_token'] = self::issue_selection_token( $store_info, $actor );
 
-		set_transient( 'ys_ec_ecpay_store_' . $temp_id, $store_info, self::SELECTION_TTL );
-		delete_transient( 'ys_ec_ecpay_map_' . $temp_id );
+		// 🔴 結果留在伺服器，用一次性 result code 交換（CODEX #3W C8）。
+		//
+		// 舊版把結果寫進**WordPress origin** 的 localStorage 再 redirect，而
+		// `sanitize_return_url()` 又用 `wp_validate_redirect()` 把外部 return URL
+		// 換成本站的 `/checkout/`——另一個 origin 的 headless app 既讀不到那份
+		// storage、也回不到自己的頁面。文件寫得出來的流程，實際上跑不起來。
+		//
+		// 現在：結果存在伺服器，前端拿 code 到 `/ecpay/store-result` 換，
+		// 而且要用**同一個 principal** 才換得到、且只能換一次。
+		$result_code = self::issue_result_code( $store_info, $actor );
 
-		self::render_callback_page( $store_info );
+		self::render_callback_page( $store_info, $result_code );
 	}
 
 	/**
@@ -533,8 +582,7 @@ final class EcpayStoreSelector {
 		$credentials = Settings::logistics_credentials();
 		if ( '' === $credentials['merchant_id']
 			|| '' === $credentials['hash_key']
-			|| '' === $credentials['hash_iv']
-			|| empty( $params['CheckMacValue'] ) ) {
+			|| '' === $credentials['hash_iv'] ) {
 			return false;
 		}
 
@@ -556,7 +604,104 @@ final class EcpayStoreSelector {
 			}
 		}
 
-		return CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+		// 🔴🔴 **不得要求 `CheckMacValue`**（CODEX #3W C5）。
+		//
+		// 綠界的電子地圖回呼**不送簽章**：官方 SDK 的 map response 範例用的是
+		// 不驗簽的 `ArrayResponse`，而且它的 `Factory` 連 hashKey／hashIv 都沒帶
+		// （`SDK_PHP/example/Logistics/Domestic/GetMapResponse.php:8-11`）；
+		// 對照組——物流狀態通知的範例用的是 `VerifiedArrayResponse`
+		// （`GetLogisticStatueResponse.php:4,8-15`）。官方鏡像列出的 map 回應欄位表
+		// 也沒有 `CheckMacValue`（`guides/21-webhook-events-reference.md:849-857`），
+		// 而狀態通知與逆物流的欄位表都有（`:720`、`:822`）。
+		//
+		// 舊版強制要求它，於是**合法的官方回呼一律被打成 400**——選店在正式環境
+		// 根本走不完。而測試看不出來，因為 v033 自己替回呼簽了一個 CMV。
+		//
+		// 那這個回呼靠什麼認證？靠**一次性 nonce**：`ExtraData` 對得上一份還沒被
+		// 消耗的 map session，而那份 session 是我們自己在同源請求裡建立並
+		// 綁好身分的，且在 handle_store_callback() 進來時就被原子地消耗掉。
+		//
+		// 若對方**確實帶了**簽章，那就驗它（帶錯＝拒絕）——多一層不會有壞處，
+		// 但**缺席不得成為拒絕的理由**。
+		if ( ! empty( $params['CheckMacValue'] ) ) {
+			return CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+		}
+
+		return true;
+	}
+
+	/**
+	 * 一次性 nonce：20 個英數字
+	 *
+	 * 綠界 `ExtraData` 的長度上限是 20，所以這個值不能更長；
+	 * `wp_generate_password( 20, false, false )` 產出的就是 [A-Za-z0-9]。
+	 */
+	public static function generate_nonce(): string {
+		$nonce = (string) preg_replace( '/[^A-Za-z0-9]/', '', wp_generate_password( 32, false, false ) );
+
+		// 極端情況下濾完不足 20 字就補到滿，長度必須是穩定的。
+		while ( strlen( $nonce ) < self::NONCE_LENGTH ) {
+			$nonce .= (string) preg_replace( '/[^A-Za-z0-9]/', '', wp_generate_password( 32, false, false ) );
+		}
+
+		return substr( $nonce, 0, self::NONCE_LENGTH );
+	}
+
+	/**
+	 * 發一張一次性的「選店結果提領證」
+	 *
+	 * 🔴 為什麼需要它（CODEX #3W C8）：headless 的 SPA 在**另一個 origin**。
+	 * 回呼頁面是我們這個 origin 輸出的，它寫的 localStorage 對方讀不到；
+	 * 而 `sanitize_return_url()` 又會把外部 return URL 換掉，連跳回去都做不到。
+	 *
+	 * 所以結果**留在伺服器**，只把一個短字串交出去。前端拿它到
+	 * `/ecpay/store-result` 換，而且必須是**同一個 principal**、**只能換一次**。
+	 *
+	 * @param array<string,mixed> $store_info
+	 */
+	public static function issue_result_code( array $store_info, string $principal ): string {
+		$code = self::generate_nonce();
+
+		set_transient(
+			self::RESULT_PREFIX . $code,
+			[
+				'principal' => $principal,
+				'store'     => $store_info,
+				'issued_at' => current_time( 'timestamp' ),
+			],
+			self::SELECTION_TTL
+		);
+
+		return $code;
+	}
+
+	/**
+	 * 提領選店結果（一次性、綁 principal）
+	 *
+	 * @return array{error:?string,store:array<string,mixed>}
+	 */
+	public static function claim_result_code( string $code, string $principal ): array {
+		$code = trim( $code );
+		if ( '' === $code || '' === $principal ) {
+			return [ 'error' => '缺少提領碼或無法辨識身分。', 'store' => [] ];
+		}
+
+		$record = get_transient( self::RESULT_PREFIX . $code );
+		if ( ! is_array( $record ) ) {
+			return [ 'error' => '這張提領碼不存在或已經過期，請重新選擇門市。', 'store' => [] ];
+		}
+
+		// 🔴 先比身分再消耗。反過來的話，別人拿著 code 猜一次就能把它燒掉
+		// （即使他拿不到內容），顧客那一邊就得重選。
+		if ( ! hash_equals( (string) ( $record['principal'] ?? '' ), $principal ) ) {
+			return [ 'error' => '這張提領碼不屬於目前的購物階段。', 'store' => [] ];
+		}
+
+		if ( ! delete_transient( self::RESULT_PREFIX . $code ) ) {
+			return [ 'error' => '這張提領碼已經被使用過了。', 'store' => [] ];
+		}
+
+		return [ 'error' => null, 'store' => (array) ( $record['store'] ?? [] ) ];
 	}
 
 	private static function sanitize_cart_scope( string $scope ): string {
@@ -598,11 +743,18 @@ final class EcpayStoreSelector {
 	/**
 	 * @param array<string,mixed> $store_info
 	 */
-	private static function render_callback_page( array $store_info ): void {
+	private static function render_callback_page( array $store_info, string $result_code = '' ): void {
+		// 🔴 提領碼要交給前端，但**不能**混進 `$store_info`——那份資料會被
+		// JSON 印進頁面，也會被 postMessage 送出去，而提領碼是憑證。
+		// 這裡分開帶，並且只放在 headless 用得到的地方。
 		$json_data    = wp_json_encode( $store_info );
 		$origin       = esc_url( home_url() );
 		$checkout_url = esc_url( $store_info['return_url'] ?? self::checkout_url() );
 		$context      = (string) ( $store_info['context'] ?? 'checkout' );
+
+		if ( '' !== $result_code ) {
+			$checkout_url = add_query_arg( 'ys_ec_store_result', rawurlencode( $result_code ), $checkout_url );
+		}
 
 		while ( ob_get_level() > 0 ) {
 			ob_end_clean();

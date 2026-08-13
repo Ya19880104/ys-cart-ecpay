@@ -146,6 +146,29 @@ abstract class EcpayShipping implements YSShippingInterface {
 	}
 
 	/**
+	 * 這個方式送得出去的金額上限（null = 官方未設上限）
+	 *
+	 * 🔴 這是**契約**，不是可以裁切的參數。超過上限時正確的行為是「送不出去」，
+	 * 不是「幫它改成上限」——舊版對所有方式一律 `min( 20000, $amount )`，
+	 * 一張 25,000 元的黑貓代收訂單因此送出 20,000，貨照出、錢少收 5,000。
+	 *
+	 * 官方規則（`guides/06-logistics-domestic.md:403`、`:407`）：
+	 *   - CVS 超商全系列：1 ~ 20,000
+	 *   - 宅配（HOME）：無上限
+	 *   - **但只要是貨到付款（`IsCollection=Y`），一律 20,000**
+	 *
+	 * 上限依「通路 × 是否代收」導出，不逐一寫進 11 個 descriptor：那 11 份值
+	 * 只會是同兩個數字的複製，而複製出來的常數遲早會有一份沒跟著改。
+	 */
+	public function amount_max( bool $is_collection ): ?int {
+		if ( $is_collection ) {
+			return 20000;
+		}
+
+		return 'CVS' === $this->get_logistics_type() ? 20000 : null;
+	}
+
+	/**
 	 * 綠界載明本 subtype 必填 `GoodsWeight`（目前只有中華郵政）。
 	 */
 	public function requires_goods_weight(): bool {

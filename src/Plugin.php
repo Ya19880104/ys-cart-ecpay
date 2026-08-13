@@ -69,7 +69,7 @@ final class Plugin {
 			];
 		}
 
-		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.6';
+		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.7';
 		if ( version_compare( (string) YS_ECOMMERCE_VERSION, $required, '<' ) ) {
 			return [
 				'met'     => false,
@@ -104,7 +104,7 @@ final class Plugin {
 			return [
 				'met'     => false,
 				'reason'  => 'core_schema_not_ready',
-				'message' => 'YS CART 的物流資料表尚未完成 v2.56.6 升級（欄位或索引缺失），'
+				'message' => 'YS CART 的物流資料表尚未完成 v2.56.7 升級（欄位或索引缺失），'
 					. '綠界物流方式未註冊。請重新啟用 YS CART 以完成升級。',
 			];
 		}

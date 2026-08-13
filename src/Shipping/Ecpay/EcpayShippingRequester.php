@@ -49,6 +49,25 @@ final class EcpayShippingRequester {
 
 		$params = $result['params'];
 
+		// 🔴 官方的同步失敗回應是 `0|ErrorMessage`——**沒有簽章**，因為它根本沒有
+		// key=value 可簽（官方 SDK 收建單回應用的是不驗簽的 `StrResponse`）。
+		//
+		// 舊版把它丟給 `verify_create_response()`，缺 `CheckMacValue` 就驗不過 →
+		// 判成 `indeterminate` → 那張訂單從此卡住，要人去綠界後台確認一張
+		// **根本沒建立**的單。但這不是第三方送來的訊息，是我們自己這一次 HTTP
+		// 的直接回應，前綴 `0` 就是綠界明說「沒建立」。
+		//
+		// 因此：前綴為 `0` ＝ 明確拒絕（可以安全地開下一次）。
+		if ( '0' === (string) ( $params['_status_prefix'] ?? '' ) ) {
+			return [
+				'success'           => false,
+				'outcome'           => 'provider_failed',
+				'message'           => (string) ( $params['RtnMsg'] ?? 'ECPay logistics create failed.' ),
+				'merchant_trade_no' => $fields['MerchantTradeNo'],
+				'raw_response'      => $result['body'],
+			];
+		}
+
 		// 🔴 驗不過簽章 ≠ 沒建單。我們收到了一份看不懂的回應，而綠界那邊很可能
 		// 已經成立了一張單。當成明確失敗會放行下一次建單。
 		if ( ! $this->verify_create_response( $params, $credentials ) ) {
@@ -179,9 +198,9 @@ final class EcpayShippingRequester {
 	 * @return array<string,string>
 	 */
 	private function build_create_fields( array $order_data, array $credentials ): array {
-		$amount         = max( 1, min( 20000, (int) round( (float) ( $order_data['product_amount'] ?? $order_data['total'] ?? 1 ) ) ) );
 		$logistics_type = $this->method->get_logistics_type();
 		$is_collection  = $this->resolve_is_collection( $order_data );
+		$amount         = $this->resolve_goods_amount( $order_data, $is_collection );
 
 		$fields = [
 			'MerchantID'        => $credentials['merchant_id'],
@@ -216,6 +235,71 @@ final class EcpayShippingRequester {
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 
 		return array_map( 'strval', $fields );
+	}
+
+	/**
+	 * 送出去的金額
+	 *
+	 * 🔴 **金額不得改寫。**（CODEX #3W Critical）
+	 *
+	 * 舊版是 `max( 1, min( 20000, $amount ) )`——對**所有**方式無條件夾住。
+	 * 於是一張 25,000 元的黑貓貨到付款訂單，送出去的是
+	 * `GoodsAmount=20000, CollectionAmount=20000`：貨照出，錢**少收 5,000**。
+	 * 而且本地紀錄與訂單金額還是 25,000，對帳時看不出來。
+	 *
+	 * 上限是**契約**，不是可以裁切的參數。超過就是這個通路送不了，
+	 * 必須在送出之前失敗，讓人去改運送方式或拆單。
+	 *
+	 * 上限來自型錄 descriptor（官方 guide：CVS 全系列 1~20,000；宅配無上限，
+	 * 但 `IsCollection=Y` 一律 20,000）。
+	 *
+	 * @param array<string,mixed> $order_data
+	 */
+	private function resolve_goods_amount( array $order_data, bool $is_collection ): int {
+		if ( ! array_key_exists( 'product_amount', $order_data ) && ! array_key_exists( 'total', $order_data ) ) {
+			throw new \RuntimeException( '建立綠界物流單時缺少訂單金額，已中止。' );
+		}
+
+		$raw    = (float) ( $order_data['product_amount'] ?? $order_data['total'] ?? 0 );
+		$amount = (int) round( $raw );
+
+		if ( $amount < 1 ) {
+			throw new \RuntimeException(
+				sprintf( '訂單金額為 %s，綠界物流單的金額必須至少 1 元，已中止。', (string) $amount )
+			);
+		}
+
+		$max = $this->method->amount_max( $is_collection );
+		if ( null !== $max && $amount > $max ) {
+			throw new \RuntimeException(
+				sprintf(
+					'訂單金額 %1$s 元超過「%2$s」的上限 %3$s 元%4$s，已中止建立物流訂單（金額不會被改寫）。'
+					. '請改用其他運送方式或拆單。',
+					(string) $amount,
+					$this->method->get_title(),
+					(string) $max,
+					$is_collection ? '（貨到付款）' : ''
+				)
+			);
+		}
+
+		return $amount;
+	}
+
+	/**
+	 * 本機前置驗證：把所有「不用送出去就知道不行」的檢查跑一次
+	 *
+	 * 🔴 核心會在 `mark_submitted()` **之前**呼叫這一支。
+	 *
+	 * 這些檢查本來就都在 `build_create_fields()` 裡（以例外表達），但那時候
+	 * 授權列已經是 `submitted` 了，於是「一個 byte 都沒送出去」被記成
+	 * 「送出後失去結果」——只能靠人工裁決才放得開。同一份檢查，早跑一次就好。
+	 *
+	 * @param array<string,mixed> $order_data
+	 * @throws \RuntimeException 任何一項不合格
+	 */
+	public function preflight( array $order_data ): void {
+		$this->build_create_fields( $order_data, Settings::logistics_credentials() );
 	}
 
 	/**
@@ -313,9 +397,13 @@ final class EcpayShippingRequester {
 		// 而那個 key 全 repo 只出現在讀取的那一行、沒有任何寫入點——因此宅配永遠
 		// 送常溫（0001）。賣冷藏／冷凍商品時，貨到就已經退冰了。
 		if ( $this->method->sends_home_conditions() ) {
-			$fields['Temperature']           = $this->method->get_temperature_code();
-			$fields['Distance']              = '00';
-			$fields['Specification']         = '0001';
+			$fields['Temperature']   = $this->method->get_temperature_code();
+			$fields['Distance']      = '00';
+			$fields['Specification'] = '0001';
+			// 🔴 取件與送達**兩個**時段都要送。官方 TCAT 範例
+			// （`SDK_PHP/example/Logistics/Domestic/CreateHome.php:33-34`）兩個都在，
+			// 舊版只送了 `ScheduledDeliveryTime`。`4` = 不限時。
+			$fields['ScheduledPickupTime']   = '4';
 			$fields['ScheduledDeliveryTime'] = '4';
 		}
 
