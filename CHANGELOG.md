@@ -3,7 +3,7 @@
 ## [0.2.12] - 2026-08-13
 
 物流專用版（shipping-only），自 `v0.2.10` 重新實作。**不含**信用卡退刷、退款授權、
-CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.56.7 即可。
+CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.56.8 即可。
 
 （`0.2.11` 已被 map-only 分支占用，故版號直接進到 `0.2.12`。）
 
@@ -31,7 +31,8 @@ CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.
   於是走到「不是我們的單」→ ACK，而 ACK 不可逆。
 - **pipeline 拒絕遲到／亂序的通知時，`payment_detail` 的狀態投影也不再被覆寫**
   （先前只擋了物流單那一側）。憑據類欄位仍然補上——它們是補齊，不是倒退。
-- **headless 訪客的購物車讀 `X-YS-Guest-Token`**（搭配核心 2.56.7）。前端在另一個
+- **headless 訪客的購物車讀 `X-YS-Guest-Token`**（能力自核心 2.56.7 引入；本版最低
+  核心因物流 authority 的 2.56.8 修復而提升至 2.56.8）。前端在另一個
   origin 時沒有我方 cookie，先前會被當成空車，於是所有物流方式都「不受商品限制」。
 - **門市選擇憑證的擁有者改由電子地圖那一刻決定**（回呼只能複製，不得重算）。
   綠界選店頁以跨站 browser POST 回到 callback，而購物車 cookie 是
@@ -103,7 +104,7 @@ CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.
   要求重選。先前整包資料放在 localStorage 由前端送回，「這次選店的代收前提」是一個
   可竄改的欄位，等於沒有守門。headless SDK 的 `requestStoreMapForm()` 也改為必須帶
   付款方式，並提供 `selectionToken()` 與 `selectionTokenField`。
-- **bootstrap 加上核心版本與能力／schema gate**：核心低於 2.56.6、缺少建單授權 API、
+- **bootstrap 加上核心版本與能力／schema gate**：核心低於 2.56.8、缺少建單授權 API、
   或物流 schema 未就位時**一個 hook 都不掛**，只顯示後台提示。「先發核心再發本外掛」
   是流程約定，不能取代 runtime gate。
 - **貨到付款不再由後台開關決定**。`IsCollection` 改由**訂單實際的付款方式**決定
