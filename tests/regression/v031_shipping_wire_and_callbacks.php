@@ -280,7 +280,9 @@ namespace {
         /** @var EcpayShipping $method */
         $method = new $descriptor['class']();
 
-        $GLOBALS['ys_next_body'] = canned_response($response_extra);
+        $GLOBALS['ys_next_body'] = canned_response(array_merge([
+            'MerchantTradeNo' => (string) ($order_data['merchant_trade_no'] ?? ''),
+        ], $response_extra));
         $GLOBALS['ys_last_post'] = null;
 
         $requester = new EcpayShippingRequester($method);
@@ -486,6 +488,31 @@ namespace {
     check(
         '(TX-c) 綠界明確拒絕才是 provider_failed（可以安全地開下一次）',
         is_array($rejected) && 'provider_failed' === ($rejected['outcome'] ?? '')
+    );
+
+    [, $swapped_response] = send(
+        'ys_ec_ecpay_ship_tcat',
+        base_order(),
+        [ 'MerchantTradeNo' => 'YSLOTHERVALUE000001' ]
+    );
+    check(
+        '(TX-d) 合法簽章但屬另一筆 MerchantTradeNo 的回應為 indeterminate',
+        is_array($swapped_response)
+            && false === ($swapped_response['success'] ?? true)
+            && 'indeterminate' === ($swapped_response['outcome'] ?? '')
+            && !array_key_exists('provider_trade_no', $swapped_response)
+    );
+
+    [, $missing_response_identity] = send(
+        'ys_ec_ecpay_ship_tcat',
+        base_order(),
+        [ 'MerchantTradeNo' => '' ]
+    );
+    check(
+        '(TX-e) 已簽章回應缺 MerchantTradeNo 仍為 indeterminate',
+        is_array($missing_response_identity)
+            && false === ($missing_response_identity['success'] ?? true)
+            && 'indeterminate' === ($missing_response_identity['outcome'] ?? '')
     );
 
     // ── 取消：本版不實作，必須明確回 unsupported ──────────────────────────

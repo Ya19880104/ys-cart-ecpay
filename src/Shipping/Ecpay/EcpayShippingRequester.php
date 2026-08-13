@@ -79,6 +79,18 @@ final class EcpayShippingRequester {
 			];
 		}
 
+		// A valid signature proves who signed the response, not which concurrent request
+		// it belongs to. Bind the returned logistics ID to the exact durable trade number.
+		$returned_trade_no = trim( (string) ( $params['MerchantTradeNo'] ?? '' ) );
+		if ( '' === $returned_trade_no || ! hash_equals( (string) $fields['MerchantTradeNo'], $returned_trade_no ) ) {
+			return [
+				'success'      => false,
+				'outcome'      => 'indeterminate',
+				'message'      => 'ECPay logistics response identity does not match this request.',
+				'raw_response' => $params,
+			];
+		}
+
 		// 這一條才是**明確拒絕**：簽章驗過、綠界明白說「沒建立」。
 		$rtn_code = (string) ( $params['RtnCode'] ?? '' );
 		if ( ! in_array( $rtn_code, [ '1', '300' ], true ) ) {
