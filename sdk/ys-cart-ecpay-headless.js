@@ -3,6 +3,8 @@
 
   var ROUTES = {
     storeMapUrl: '/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url',
+    storeResult: '/wp-json/ys-ecommerce-headless/v1/ecpay/store-result',
+    checkout: '/wp-json/ys-ecommerce-headless/v1/checkout/process',
     storeCallback: '/wp-json/ys-ecommerce/v1/ecpay/store-callback'
   };
 
@@ -10,6 +12,7 @@
   var GUEST_TOKEN_HEADER = 'X-YS-Guest-Token';
 
   var guestToken = '';
+  var wpNonce = '';
 
   /**
    * 設定訪客身分。
@@ -24,16 +27,37 @@
     guestToken = typeof token === 'string' ? token : '';
   }
 
-  function postJson(url, payload) {
-    var headers = { 'Content-Type': 'application/json' };
+  /** Same-origin/cookie authenticated clients must send the core REST nonce on writes. */
+  function setWpNonce(nonce) {
+    wpNonce = typeof nonce === 'string' ? nonce : '';
+  }
+
+  function apiUrl(apiBase, route) {
+    if (typeof apiBase !== 'string' || apiBase === '') {
+      throw new Error('apiBase is required. Use the absolute YS CART API origin.');
+    }
+    return apiBase.replace(/\/$/, '') + route;
+  }
+
+  function authHeaders(hasJsonBody) {
+    var headers = {};
+    if (hasJsonBody) {
+      headers['Content-Type'] = 'application/json';
+    }
     if (guestToken) {
       headers[GUEST_TOKEN_HEADER] = guestToken;
     }
+    if (wpNonce) {
+      headers['X-WP-Nonce'] = wpNonce;
+    }
+    return headers;
+  }
 
+  function postJson(url, payload) {
     return fetch(url, {
       method: 'POST',
-      credentials: 'same-origin',
-      headers: headers,
+      credentials: 'include',
+      headers: authHeaders(true),
       body: JSON.stringify(payload || {})
     }).then(function (res) {
       return res.json();
@@ -78,7 +102,46 @@
       payload.return_url = options.return_url;
     }
 
-    return postJson(apiBase.replace(/\/$/, '') + ROUTES.storeMapUrl, payload);
+    return postJson(apiUrl(apiBase, ROUTES.storeMapUrl), payload);
+  }
+
+  /**
+   * Read the one-time result code appended by the ECPay callback redirect.
+   * The code is not the selection token; it must be exchanged under the same principal.
+   */
+  function resultCodeFromLocation(locationLike) {
+    var href = typeof locationLike === 'string'
+      ? locationLike
+      : ((locationLike && locationLike.href) || (global.location && global.location.href) || '');
+    try {
+      return new URL(href, global.location && global.location.origin).searchParams.get('ys_ec_store_result') || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /** Exchange the callback result code exactly once using the same guest/login identity. */
+  function claimStoreResult(apiBase, code, options) {
+    if (typeof code !== 'string' || !/^[A-Za-z0-9]{32}$/.test(code)) {
+      return Promise.reject(new Error('claimStoreResult() requires a 32-character result code.'));
+    }
+    var query = '?code=' + encodeURIComponent(code);
+    if (options && options.cart_scope) {
+      query += '&cart_scope=' + encodeURIComponent(options.cart_scope);
+    }
+    return fetch(apiUrl(apiBase, ROUTES.storeResult) + query, {
+      method: 'GET',
+      credentials: 'include',
+      headers: authHeaders(false),
+      cache: 'no-store'
+    }).then(function (res) {
+      return res.json();
+    });
+  }
+
+  /** Submit checkout to the absolute YS CART API origin with the same identity. */
+  function checkout(apiBase, payload) {
+    return postJson(apiUrl(apiBase, ROUTES.checkout), payload || {});
   }
 
   function submitForm(actionUrl, fields, target) {
@@ -120,7 +183,11 @@
     /** 訪客身分 header 名稱（與核心一致）。 */
     guestTokenHeader: GUEST_TOKEN_HEADER,
     setGuestToken: setGuestToken,
+    setWpNonce: setWpNonce,
     requestStoreMapForm: requestStoreMapForm,
+    resultCodeFromLocation: resultCodeFromLocation,
+    claimStoreResult: claimStoreResult,
+    checkout: checkout,
     requestMapForm: postJson,
     selectionToken: selectionToken,
     submitForm: submitForm

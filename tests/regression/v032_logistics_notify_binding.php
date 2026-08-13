@@ -80,6 +80,8 @@ namespace {
         public bool $write_fails = false;
         /** 授權表裡有沒有這個 MerchantTradeNo（＝這一單是不是我們送出去的）。 */
         public bool $dispatch_attempt_exists = false;
+        /** 建單授權所屬訂單。 */
+        public int $attempt_order_id = 42;
         /** 讀授權表時要不要模擬資料庫失敗。 */
         public bool $attempt_read_fails = false;
         /** 授權表存不存在（舊核心）。 */
@@ -88,6 +90,8 @@ namespace {
         public bool $show_tables_fails = false;
         /** readback 時 label 的追蹤碼（sync_label 會比對）。 */
         public string $readback_tracking = '';
+        /** 模擬 update 回成功、但指定欄位沒有真的寫進 label。 */
+        public array $readback_omit = [];
         /** @var array<int,array{table:string,data:array<string,mixed>,where:array<string,mixed>}> */
         public array $updates = [];
 
@@ -119,28 +123,50 @@ namespace {
                     $this->last_error = 'MySQL server has gone away';
                     return null;
                 }
-                return $this->dispatch_attempt_exists ? '1' : null;
+                return $this->dispatch_attempt_exists ? (string) $this->attempt_order_id : null;
+            }
+
+            if (false !== strpos($sql, 'shipping_labels') && false !== strpos($sql, 'SELECT id')) {
+                preg_match("/provider_trade_no = '([^']+)'/", $sql, $m);
+                return $this->label && (string) ($this->label->provider_trade_no ?? '') === (string) ($m[1] ?? '')
+                    ? (string) ($this->label->id ?? 0)
+                    : null;
             }
 
             return null;
         }
 
         public function get_row(string $sql) {
+            $this->last_error = '';
             if (false !== strpos($sql, 'shipping_labels')) {
                 if ($this->read_fails) {
                     $this->last_error = 'MySQL server has gone away';
                     return null;
                 }
-                // sync_label() 的 readback：回傳最後一次寫進去的狀態與追蹤碼。
-                if (false !== strpos($sql, 'SELECT status')) {
+                // sync_label() 的 readback：回傳最後一次真正寫進去的所有欄位。
+                if (false === strpos($sql, 'SELECT *')) {
                     $last = end($this->updates);
                     if (!$last) {
                         return null;
                     }
-                    return (object) [
-                        'status'          => $last['data']['status'] ?? '',
-                        'tracking_number' => $last['data']['tracking_number'] ?? $this->readback_tracking,
-                    ];
+                    $row = (array) ($this->label ?? (object) []);
+                    foreach ((array) $last['data'] as $column => $value) {
+                        if (!in_array($column, $this->readback_omit, true)) {
+                            $row[$column] = $value;
+                        }
+                    }
+                    $row['tracking_number'] = $row['tracking_number'] ?? $this->readback_tracking;
+                    return (object) $row;
+                }
+
+                preg_match("/provider_trade_no = '([^']+)'/", $sql, $provider_match);
+                preg_match('/order_id = (\d+)/', $sql, $order_match);
+                preg_match("/merchant_trade_no = '([^']+)'/", $sql, $merchant_match);
+                if (!$this->label
+                    || (string) ($this->label->provider_trade_no ?? '') !== (string) ($provider_match[1] ?? '')
+                    || (int) ($this->label->order_id ?? 0) !== (int) ($order_match[1] ?? 0)
+                    || (string) ($this->label->merchant_trade_no ?? '') !== (string) ($merchant_match[1] ?? '')) {
+                    return null;
                 }
                 return $this->label;
             }
@@ -219,6 +245,8 @@ namespace {
             'validation_no'     => '',
         ], $overrides);
         $wpdb->order = (object) [ 'id' => 42, 'payment_detail' => '{}', 'tracking_number' => '' ];
+        $wpdb->dispatch_attempt_exists = true;
+        $wpdb->attempt_order_id = 42;
         $GLOBALS['wpdb'] = $wpdb;
         YSOrder::$updates = [];
         return $wpdb;
@@ -294,10 +322,11 @@ namespace {
     check('(e) MerchantTradeNo 不符的通知被拒絕',
         400 === notify(base_notify([ 'MerchantTradeNo' => 'TAMPERED' ])) && [] === $wpdb->updates);
 
-    // 升級前建立的舊單沒有落盤 subtype／trade no，但它的 shipping_method 一定在型錄裡，
-    // 因此仍然驗得出來——不能因為舊單就整道守門失效。
+    // Callback identity must come from the pre-send attempt and exact label tuple. A legacy
+    // label with no merchant identity cannot be authenticated and must fail closed.
     $wpdb = seed_label([ 'logistics_subtype' => '', 'merchant_trade_no' => '' ]);
-    check('(f) 升級前的舊單仍以型錄的 subtype 驗證（相符則接受）', 200 === notify(base_notify()));
+    check('(f) 缺 merchant identity 的 legacy label 不得略過三元綁定',
+        400 === notify(base_notify()) && [] === $wpdb->updates && [] === YSOrder::$updates);
 
     $wpdb = seed_label([ 'logistics_subtype' => '', 'merchant_trade_no' => '' ]);
     check('(g) 升級前的舊單遇到不符的 subtype 一樣拒絕',
@@ -326,7 +355,26 @@ namespace {
     // 找不到單就什麼都不做（回 1|OK 只是讓供應商停止重送）。
     $wpdb = seed_label();
     $wpdb->label = null;
+    $wpdb->dispatch_attempt_exists = false;
     check('(i) 找不到對應物流單時不寫入任何資料', 200 === notify(base_notify()) && [] === $wpdb->updates);
+
+    // X7: a signed callback may not combine order A's MerchantTradeNo with order B's
+    // AllPayLogisticsID. The exact tuple must be checked before pipeline/order writes.
+    $wpdb = seed_label([
+        'id' => 8,
+        'order_id' => 43,
+        'merchant_trade_no' => 'YS-ORDER-B',
+        'provider_trade_no' => '900000002',
+    ]);
+    $wpdb->attempt_order_id = 42;
+    pipeline_reset();
+    check(
+        '(X7) swapped MerchantTradeNo/AllPayLogisticsID is rejected before any projection',
+        400 === notify(base_notify([ 'AllPayLogisticsID' => '900000002' ]))
+            && [] === $wpdb->updates
+            && [] === YSOrder::$updates
+            && 0 === \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$calls
+    );
 
     // 通知帶回寄件憑據時補上，但不覆蓋建單當下拿到的權威值。
     $wpdb = seed_label();
@@ -340,6 +388,20 @@ namespace {
     check('(k) 已有的寄件憑據不被通知覆蓋（建單當下那一份才是權威）',
         !isset($wpdb->updates[0]['data']['cvs_payment_no'])
             && !isset($wpdb->updates[0]['data']['validation_no']));
+
+    $wpdb = seed_label();
+    $wpdb->readback_omit = [ 'cvs_payment_no' ];
+    check(
+        '(j2) CVSPaymentNo update 回成功但讀回未落盤時回 503',
+        503 === notify(base_notify([ 'CVSPaymentNo' => 'CP111', 'CVSValidationNo' => '2222' ]))
+    );
+
+    $wpdb = seed_label();
+    $wpdb->readback_omit = [ 'validation_no' ];
+    check(
+        '(j3) CVSValidationNo update 回成功但讀回未落盤時回 503',
+        503 === notify(base_notify([ 'CVSPaymentNo' => 'CP111', 'CVSValidationNo' => '2222' ]))
+    );
 
     // 寄貨編號不是追蹤碼，不得混進 tracking_number。
     $wpdb = seed_label();
@@ -395,6 +457,24 @@ namespace {
         '(q) 沒有託運單號時不得把 AllPayLogisticsID 當成追蹤碼',
         '900000001' !== $order_tracking
             && '900000001' !== ($wpdb->updates[0]['data']['tracking_number'] ?? null)
+    );
+
+    $wpdb = seed_label([ 'tracking_number' => 'OLD-BN' ]);
+    $wpdb->order = (object) [
+        'id' => 42,
+        'payment_detail' => json_encode([ 'shipping' => [ 'tracking_number' => 'OLD-BN' ] ]),
+        'tracking_number' => 'OLD-BN',
+    ];
+    $no_booking = base_notify();
+    unset($no_booking['BookingNote']);
+    $preserve_code = notify($no_booking);
+    $stored_projection = json_decode((string) ($wpdb->order->payment_detail ?? '{}'), true);
+    check(
+        '(X27) 空 BookingNote 保留 top-level、payment_detail 與 label 既有 tracking',
+        200 === $preserve_code
+            && 'OLD-BN' === (string) ($wpdb->order->tracking_number ?? '')
+            && 'OLD-BN' === (string) ($stored_projection['shipping']['tracking_number'] ?? '')
+            && !array_key_exists('tracking_number', (array) ($wpdb->updates[0]['data'] ?? []))
     );
 
     // ══ #3V：早到的通知、狀態單調性 ═════════════════════════════════════

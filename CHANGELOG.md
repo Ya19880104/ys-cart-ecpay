@@ -3,7 +3,7 @@
 ## [0.2.12] - 2026-08-13
 
 物流專用版（shipping-only），自 `v0.2.10` 重新實作。**不含**信用卡退刷、退款授權、
-CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.56.6 即可。
+CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.56.7 即可。
 
 （`0.2.11` 已被 map-only 分支占用，故版號直接進到 `0.2.12`。）
 
@@ -23,24 +23,29 @@ CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.
 
 ### Fixed
 
-- **認領門市選擇時以伺服器保存的門市名稱與地址覆寫訂單**。驗證只比得了門市代號
-  （那是唯一有權威副本可比的欄位）；名稱與地址是前端從 localStorage 送上來的，
-  代號對得上也照樣可以被改成任何字串——而那兩個欄位會原樣出現在出貨單、通知信
-  與客服畫面上。
+- **認領門市選擇時以伺服器保存的 tuple 覆寫訂單，並讀回確認**。結帳請求不能再
+  改寫 token 內的門市名稱與地址；寫入回 false 或 silent no-op 都會讓結帳失敗。
+  官方 map response 本身沒有簽章，所以查不到 canonical directory 時名稱／地址只
+  標成 `store_verified=0` 的顯示 hint，不宣稱是供應商驗證資料；建單 wire 使用店號。
 - **物流通知在 `SHOW TABLES` 查不動時回 503**。先前把查詢失敗讀成「表不存在」，
   於是走到「不是我們的單」→ ACK，而 ACK 不可逆。
 - **pipeline 拒絕遲到／亂序的通知時，`payment_detail` 的狀態投影也不再被覆寫**
   （先前只擋了物流單那一側）。憑據類欄位仍然補上——它們是補齊，不是倒退。
-- **headless 訪客的購物車讀 `X-YS-Guest-Token`**（搭配核心 2.56.6）。前端在另一個
+- **headless 訪客的購物車讀 `X-YS-Guest-Token`**（搭配核心 2.56.7）。前端在另一個
   origin 時沒有我方 cookie，先前會被當成空車，於是所有物流方式都「不受商品限制」。
 - **門市選擇憑證的擁有者改由電子地圖那一刻決定**（回呼只能複製，不得重算）。
-  綠界的選店回呼是從**它們的伺服器**發出的跨站 POST，而購物車 cookie 是
+  綠界選店頁以跨站 browser POST 回到 callback，而購物車 cookie 是
   `SameSite=Lax`——跨站 POST 不會帶。在回呼裡重算身分，訪客一律算出空字串，
   於是簽出一張「無法識別擁有者」的憑證：顧客帶著它回到結帳頁，反而被自己的守門
   擋下來。這不是攻擊情境，是**正常流程 100% 失敗**。身分現在在同源的地圖請求裡
   算好、存進 map session；算不出身分時直接不開地圖（讓顧客選完門市才失敗，
   善後成本高得多）。headless 前端在另一個 origin 時沒有我方 cookie，訪客身分
   改以核心既有的 `X-YS-Guest-Token` 判定。
+- **跨 origin headless 選店改成一次性 result-code exchange**。callback 不再要求另一個
+  origin 去讀 WordPress origin 的 localStorage；它只向 allowlisted `return_url` 帶一個
+  32 字元 code，前端用同一 principal 到 `/ecpay/store-result` 提領一次。SDK 同時改用
+  absolute `apiBase`、`credentials: include`，並提供 guest token／WP nonce、result claim
+  與 checkout helpers。
 - **結帳驗證只驗不消耗，憑證在訂單成立那一刻才認領**。先前在欄位驗證裡就把憑證
   刪掉了——而驗證會因為**其他欄位**（電話格式、地址沒填）整批失敗，顧客照著錯誤
   訊息補好再送出，卻被告知「請重新選擇門市」，而他從頭到尾沒動過門市。

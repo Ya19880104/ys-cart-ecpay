@@ -11,6 +11,7 @@ use YangSheep\Ecommerce\Api\Storefront\YSRestResponder;
 use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
+use YangSheep\Ecommerce\Security\YSRateLimiter;
 use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
 use YangSheep\YSCartEcpay\Api\EcpayLogisticsController;
@@ -209,7 +210,9 @@ final class Plugin {
 		// 驗證只比得了門市代號（那是唯一有權威副本可比的欄位）；名稱與地址是
 		// 前端從 localStorage 送上來的，代號對得上也照樣可以被改成任何字串——
 		// 而那兩個欄位會原樣出現在出貨單、通知信與客服畫面上。
-		$this->apply_authoritative_store( (int) $order_id, $claim['store'] );
+		if ( ! $this->apply_authoritative_store( (int) $order_id, $claim['store'] ) ) {
+			return '無法儲存已驗證的取貨門市，訂單已停止處理；請重新選擇門市後再試。';
+		}
 
 		return null;
 	}
@@ -217,16 +220,30 @@ final class Plugin {
 	/**
 	 * @param array<string,string> $store
 	 */
-	private function apply_authoritative_store( int $order_id, array $store ): void {
+	private function apply_authoritative_store( int $order_id, array $store ): bool {
 		if ( $order_id <= 0 || [] === $store || '' === ( $store['cvs_store_id'] ?? '' ) ) {
-			return;
+			return false;
 		}
 
 		if ( ! class_exists( YSOrder::class ) || ! method_exists( YSOrder::class, 'update' ) ) {
-			return;
+			return false;
 		}
 
-		YSOrder::update( $order_id, $store );
+		if ( false === YSOrder::update( $order_id, $store ) ) {
+			return false;
+		}
+
+		$persisted = YSOrder::find( $order_id );
+		if ( ! $persisted ) {
+			return false;
+		}
+		foreach ( [ 'cvs_store_id', 'cvs_store_name', 'cvs_store_addr' ] as $column ) {
+			if ( (string) ( $persisted->{$column} ?? '' ) !== (string) ( $store[ $column ] ?? '' ) ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	private function is_cvs_method( string $shipping_method ): bool {
@@ -328,6 +345,16 @@ final class Plugin {
 				'permission_callback' => [ YSRestAuth::class, 'permission_customer_or_guest_write' ],
 			]
 		);
+
+		register_rest_route(
+			$namespace,
+			'/ecpay/store-result',
+			[
+				'methods'             => 'GET',
+				'callback'            => [ $this, 'ecpay_store_result' ],
+				'permission_callback' => [ YSRestAuth::class, 'permission_customer_or_guest' ],
+			]
+		);
 	}
 
 	public function register_public_routes(): void {
@@ -377,6 +404,17 @@ final class Plugin {
 		$order_id    = absint( $params['order_id'] ?? 0 );
 		$cart_scope  = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
 		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
+		$principal   = EcpayStoreSelector::current_principal( $cart_scope );
+		if ( '' === $principal ) {
+			return YSRestResponder::error( 'identity_unavailable', '無法辨識目前購物階段，請重新整理後再試。', 401 );
+		}
+		if ( class_exists( YSRateLimiter::class ) ) {
+			$actor_allowed = YSRateLimiter::check( 'ecpay_map_actor_' . substr( hash( 'sha256', $principal ), 0, 24 ), 12, 60 );
+			$ip_allowed    = YSRateLimiter::check( 'ecpay_map_ip', 60, 60 );
+			if ( ! $actor_allowed || ! $ip_allowed ) {
+				return YSRestResponder::error( 'rate_limited', '選店請求過於頻繁，請稍後再試。', 429 );
+			}
+		}
 
 		if ( '' === $shipping_id ) {
 			return YSRestResponder::error( 'missing_shipping_id', '缺少物流方式 ID。' );
@@ -434,6 +472,22 @@ final class Plugin {
 		}
 
 		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
+	}
+
+	public function ecpay_store_result( \WP_REST_Request $request ): \WP_REST_Response {
+		$params     = YSRequestParser::params( $request );
+		$scope      = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
+		$principal  = EcpayStoreSelector::current_principal( $scope );
+		$code       = sanitize_text_field( (string) ( $params['code'] ?? '' ) );
+		$claimed    = EcpayStoreSelector::claim_result_code( $code, $principal );
+
+		if ( null !== $claimed['error'] ) {
+			$response = YSRestResponder::error( 'store_result_invalid', (string) $claimed['error'], 400 );
+		} else {
+			$response = YSRestResponder::success( 'store_result_ready', '', $claimed['store'] );
+		}
+		$response->header( 'Cache-Control', 'no-store, private' );
+		return $response;
 	}
 
 	/**

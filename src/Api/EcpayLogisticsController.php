@@ -51,27 +51,15 @@ final class EcpayLogisticsController {
 			$this->respond_text( '0|Storage unavailable', 503 );
 		}
 
+		if ( 'mismatch' === $lookup['status'] ) {
+			$this->respond_text( '0|Logistics binding mismatch', 400 );
+		}
+
+		if ( 'pending' === $lookup['status'] ) {
+			$this->respond_text( '0|Label not persisted yet', 503 );
+		}
+
 		if ( 'not_found' === $lookup['status'] ) {
-			// 🔴 「label 表裡沒有」不等於「不是我們的單」。
-			//
-			// 建單的順序是：送出 → 收到回應 → 才 INSERT label。綠界的狀態通知
-			// 完全可能在那個 INSERT 之前就到（尤其是回應遺失、本地落盤失敗的
-			// 那些單——正是最需要後續通知的情況）。這時候回 1|OK，那則通知就
-			// 永遠不會再來了。
-			//
-			// 分辨的依據是建單授權：`MerchantTradeNo` 是我們**送出之前**就落盤的
-			// 值，查得到就代表這一單確實是我們發出去的，只是 label 還沒寫進來 →
-			// 回 503 請對方重送。查不到才是真的不干我們的事 → 1|OK 停止重送。
-			$dispatched = $this->dispatch_attempt_exists( $params );
-
-			if ( 'error' === $dispatched ) {
-				$this->respond_text( '0|Storage unavailable', 503 );
-			}
-
-			if ( 'found' === $dispatched ) {
-				$this->respond_text( '0|Label not persisted yet', 503 );
-			}
-
 			// 確定不是我們的單：回 1|OK 讓對方停止重送，但**什麼都不寫**。
 			$this->respond_text( '1|OK' );
 		}
@@ -114,26 +102,66 @@ final class EcpayLogisticsController {
 	 */
 	private function find_label( array $params ): array {
 		$logistics_id = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
-		if ( '' === $logistics_id ) {
-			return [ 'status' => 'not_found', 'label' => null ];
+		$trade_no      = trim( (string) ( $params['MerchantTradeNo'] ?? '' ) );
+		if ( '' === $logistics_id || '' === $trade_no ) {
+			return [ 'status' => 'mismatch', 'label' => null ];
 		}
 
 		global $wpdb;
 		$labels_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
-		$label        = $wpdb->get_row( $wpdb->prepare(
-			"SELECT * FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s ORDER BY id DESC LIMIT 1",
+		$attempt      = $this->find_dispatch_attempt_order( $trade_no );
+		if ( 'error' === $attempt['status'] ) {
+			return [ 'status' => 'error', 'label' => null ];
+		}
+
+		if ( 'found' === $attempt['status'] ) {
+			$order_id = (int) $attempt['order_id'];
+			$label    = $wpdb->get_row( $wpdb->prepare(
+				"SELECT * FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s AND order_id = %d AND merchant_trade_no = %s ORDER BY id DESC LIMIT 1",
+				'ecpay',
+				$logistics_id,
+				$order_id,
+				$trade_no
+			) );
+
+			if ( null !== $label ) {
+				return [ 'status' => 'found', 'label' => $label ];
+			}
+			if ( '' !== (string) $wpdb->last_error ) {
+				return [ 'status' => 'error', 'label' => null ];
+			}
+
+			// If this provider trade number belongs to another local tuple, this is a
+			// malformed cross-order callback, not an early-arrival retry.
+			$other = $wpdb->get_var( $wpdb->prepare(
+				"SELECT id FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s LIMIT 1",
+				'ecpay',
+				$logistics_id
+			) );
+			if ( '' !== (string) $wpdb->last_error ) {
+				return [ 'status' => 'error', 'label' => null ];
+			}
+
+			return null !== $other
+				? [ 'status' => 'mismatch', 'label' => null ]
+				: [ 'status' => 'pending', 'label' => null ];
+		}
+
+		// No pre-send authority exists for this MerchantTradeNo. A provider trade number
+		// that nevertheless exists locally is an identity mismatch; otherwise it is
+		// definitively unrelated to this installation and may be ACKed without writes.
+		$other = $wpdb->get_var( $wpdb->prepare(
+			"SELECT id FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s LIMIT 1",
 			'ecpay',
 			$logistics_id
 		) );
-
-		if ( null === $label ) {
-			// get_row() 對「查無資料」與「查詢失敗」都回 null；用 last_error 分辨。
-			return '' !== (string) $wpdb->last_error
-				? [ 'status' => 'error', 'label' => null ]
-				: [ 'status' => 'not_found', 'label' => null ];
+		if ( '' !== (string) $wpdb->last_error ) {
+			return [ 'status' => 'error', 'label' => null ];
 		}
 
-		return [ 'status' => 'found', 'label' => $label ];
+		return null !== $other
+			? [ 'status' => 'mismatch', 'label' => null ]
+			: [ 'status' => 'not_found', 'label' => null ];
 	}
 
 	/**
@@ -145,12 +173,7 @@ final class EcpayLogisticsController {
 	 * @param array<string,string> $params
 	 * @return string 'found'|'not_found'|'error'
 	 */
-	private function dispatch_attempt_exists( array $params ): string {
-		$trade_no = trim( (string) ( $params['MerchantTradeNo'] ?? '' ) );
-		if ( '' === $trade_no ) {
-			return 'not_found';
-		}
-
+	private function find_dispatch_attempt_order( string $trade_no ): array {
 		global $wpdb;
 		$attempts = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_label_attempts';
 
@@ -160,27 +183,28 @@ final class EcpayLogisticsController {
 		// 就會走到「不是我們的單」→ ACK，而那是不可逆的。查不動時回 error，
 		// 呼叫端會回 503 讓對方重送。
 		if ( '' !== (string) $wpdb->last_error ) {
-			return 'error';
+			return [ 'status' => 'error', 'order_id' => 0 ];
 		}
 
 		if ( $exists !== $attempts ) {
-			// 表確實不存在（核心未升級）＝證明不了，但也不該無限重送。交給既有的
-			// 核心版本 gate 處理，這裡當成「不是我們的」。
-			return 'not_found';
+			// Runtime callback identity cannot be proven without the durable attempt table.
+			return [ 'status' => 'error', 'order_id' => 0 ];
 		}
 
 		$found = $wpdb->get_var( $wpdb->prepare(
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			"SELECT id FROM {$attempts} WHERE merchant_trade_no = %s AND provider = %s LIMIT 1",
+			"SELECT order_id FROM {$attempts} WHERE merchant_trade_no = %s AND provider = %s LIMIT 1",
 			$trade_no,
 			'ecpay'
 		) );
 
 		if ( null === $found ) {
-			return '' !== (string) $wpdb->last_error ? 'error' : 'not_found';
+			return '' !== (string) $wpdb->last_error
+				? [ 'status' => 'error', 'order_id' => 0 ]
+				: [ 'status' => 'not_found', 'order_id' => 0 ];
 		}
 
-		return 'found';
+		return [ 'status' => 'found', 'order_id' => (int) $found ];
 	}
 
 	/**
@@ -209,7 +233,7 @@ final class EcpayLogisticsController {
 		}
 
 		$stored_trade_no = trim( (string) ( $label->merchant_trade_no ?? '' ) );
-		if ( '' !== $stored_trade_no && trim( (string) $params['MerchantTradeNo'] ) !== $stored_trade_no ) {
+		if ( '' === $stored_trade_no || trim( (string) $params['MerchantTradeNo'] ) !== $stored_trade_no ) {
 			return false;
 		}
 
@@ -310,9 +334,11 @@ final class EcpayLogisticsController {
 		$projection = [
 			'provider'            => 'ecpay',
 			'allpay_logistics_id' => (string) ( $params['AllPayLogisticsID'] ?? '' ),
-			'tracking_number'     => $tracking,
 			'updated_at'          => current_time( 'mysql' ),
 		];
+		if ( '' !== $tracking ) {
+			$projection['tracking_number'] = $tracking;
+		}
 
 		if ( $status_advance_allowed ) {
 			$projection['logistics_status']     = $status;
@@ -321,10 +347,10 @@ final class EcpayLogisticsController {
 
 		$payment_detail['shipping'] = array_merge( (array) ( $payment_detail['shipping'] ?? [] ), $projection );
 
-		$order_update = [
-			'payment_detail'  => wp_json_encode( $payment_detail ),
-			'tracking_number' => $tracking ?: (string) ( $order->tracking_number ?? '' ),
-		];
+		$order_update = [ 'payment_detail' => wp_json_encode( $payment_detail ) ];
+		if ( '' !== $tracking ) {
+			$order_update['tracking_number'] = $tracking;
+		}
 
 		// 沒有 pipeline 時由這裡直接對映；有 pipeline 時狀態由它負責，這裡不碰。
 		if ( ! class_exists( YSShippingPipelineService::class ) && $status_advance_allowed ) {
@@ -430,9 +456,12 @@ final class EcpayLogisticsController {
 			return false;
 		}
 
-		// affected=0 也回 0（不是 false），因此要讀回來確認狀態真的落盤了。
+		// affected=0 也回 0（不是 false），因此要讀回本次實際寫入的**每一欄**。
+		// C2C 的寄件碼若只檢查「呼叫過 update」而沒讀回，silent no-op 仍會被 ACK。
+		$columns   = array_keys( $update );
 		$persisted = $wpdb->get_row( $wpdb->prepare(
-			"SELECT status, tracking_number FROM {$table} WHERE id = %d",
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- internal column allowlist from $update.
+			"SELECT " . implode( ', ', $columns ) . " FROM {$table} WHERE id = %d",
 			(int) $label->id
 		) );
 
@@ -440,12 +469,10 @@ final class EcpayLogisticsController {
 			return false;
 		}
 
-		if ( $write_status && (string) $persisted->status !== (string) $update['status'] ) {
-			return false;
-		}
-
-		if ( '' !== $tracking && (string) ( $persisted->tracking_number ?? '' ) !== $tracking ) {
-			return false;
+		foreach ( $update as $column => $value ) {
+			if ( (string) ( $persisted->{$column} ?? '' ) !== (string) $value ) {
+				return false;
+			}
 		}
 
 		return true;

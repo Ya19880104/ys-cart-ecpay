@@ -99,7 +99,7 @@ final class EcpayStoreSelector {
 			20
 		);
 
-		set_transient( 'ys_ec_ecpay_map_' . $temp_id, [
+		$map_record = [
 			'shipping_id'       => $shipping_id,
 			'logistics_subtype' => $subtypes[ $shipping_id ],
 			'user_id'           => get_current_user_id(),
@@ -115,7 +115,10 @@ final class EcpayStoreSelector {
 			'payment_method'    => $payment_method,
 			'is_collection'     => $is_collection,
 			'created_at'        => current_time( 'timestamp' ),
-		], 30 * MINUTE_IN_SECONDS );
+		];
+		if ( ! set_transient( 'ys_ec_ecpay_map_' . $temp_id, $map_record, 30 * MINUTE_IN_SECONDS ) ) {
+			return false;
+		}
 
 		$fields = [
 			'MerchantID'        => $credentials['merchant_id'],
@@ -183,7 +186,7 @@ final class EcpayStoreSelector {
 	private static function issue_selection_token( array $selection, string $principal ): string {
 		$token = wp_generate_password( 32, false, false );
 
-		set_transient( self::SELECTION_PREFIX . $token, [
+		$record = [
 			'shipping_id'       => (string) ( $selection['shipping_id'] ?? '' ),
 			'logistics_subtype' => (string) ( $selection['cvs_type'] ?? '' ),
 			'store_id'          => (string) ( $selection['store_id'] ?? '' ),
@@ -203,7 +206,10 @@ final class EcpayStoreSelector {
 			// 每一次正常的訪客選店都簽出一張擁有者為空的憑證。
 			'principal'         => $principal,
 			'issued_at'         => current_time( 'timestamp' ),
-		], self::SELECTION_TTL );
+		];
+		if ( ! set_transient( self::SELECTION_PREFIX . $token, $record, self::SELECTION_TTL ) ) {
+			return '';
+		}
 
 		return $token;
 	}
@@ -214,7 +220,7 @@ final class EcpayStoreSelector {
 	 * 回空字串＝**無法識別**。那不是「訪客」，而是「證明不了是誰」——
 	 * consume 端據此拒絕（正常結帳一定有購物車 session）。
 	 */
-	private static function current_principal( string $cart_scope ): string {
+	public static function current_principal( string $cart_scope ): string {
 		$user_id = get_current_user_id();
 		if ( $user_id > 0 ) {
 			return 'u:' . $user_id;
@@ -222,8 +228,11 @@ final class EcpayStoreSelector {
 
 		$cookie = 'default' === $cart_scope ? 'ys_ec_session' : 'ys_ec_session_' . $cart_scope;
 		$value  = isset( $_COOKIE[ $cookie ] ) ? (string) $_COOKIE[ $cookie ] : '';
-		if ( '' !== $value ) {
-			return 's:' . hash( 'sha256', $value );
+		if ( '' !== $value
+			&& class_exists( YSRestAuth::class )
+			&& method_exists( YSRestAuth::class, 'validate_guest_token' )
+			&& YSRestAuth::validate_guest_token( $value ) ) {
+			return 'g:' . hash( 'sha256', $value );
 		}
 
 		// headless 的訪客沒有我方 cookie（前端可能在另一個 origin），身分來自
@@ -231,7 +240,9 @@ final class EcpayStoreSelector {
 		// 身分——地圖根本開不起來。
 		if ( class_exists( YSRestAuth::class ) && method_exists( YSRestAuth::class, 'get_guest_token' ) ) {
 			$guest = (string) ( YSRestAuth::get_guest_token() ?? '' );
-			if ( '' !== $guest ) {
+			if ( '' !== $guest
+				&& method_exists( YSRestAuth::class, 'validate_guest_token' )
+				&& YSRestAuth::validate_guest_token( $guest ) ) {
 				return 'g:' . hash( 'sha256', $guest );
 			}
 		}
@@ -406,18 +417,11 @@ final class EcpayStoreSelector {
 		$params  = self::params( $request );
 		$temp_id = (string) ( $params['ExtraData'] ?? $params['TempId'] ?? '' );
 
-		// 🔴 nonce 是**一次性**的，而且它就是這個回呼的認證本身（見
-		// {@see self::verify_map_payload()} 為什麼不能靠 CheckMacValue）。
-		//
-		// 因此必須**原子地消耗**：`delete_transient()` 只有真的刪掉才回 true。
-		// 先讀再刪的話，兩個同時進來的回呼會**都**讀到同一份 map session，
-		// 兩邊各簽出一張憑證——顧客最後用哪一張是賽跑的結果。
+		// Read first, validate every browser-carried field, then atomically claim the map
+		// session. A malformed callback must not burn the shopper's valid nonce.
 		$map_data = '' !== $temp_id ? get_transient( 'ys_ec_ecpay_map_' . $temp_id ) : false;
 		if ( ! is_array( $map_data ) ) {
 			wp_die( 'Invalid map session.', 'ECPay Store Callback', [ 'response' => 400 ] );
-		}
-		if ( ! delete_transient( 'ys_ec_ecpay_map_' . $temp_id ) ) {
-			wp_die( 'Map session already consumed.', 'ECPay Store Callback', [ 'response' => 409 ] );
 		}
 
 		if ( ! self::validate_map_owner( $map_data ) ) {
@@ -445,6 +449,10 @@ final class EcpayStoreSelector {
 		$store_id = trim( (string) ( $params['CVSStoreID'] ?? '' ) );
 		if ( '' === $store_id ) {
 			wp_die( 'Missing store id.', 'ECPay Store Callback', [ 'response' => 400 ] );
+		}
+
+		if ( ! delete_transient( 'ys_ec_ecpay_map_' . $temp_id ) ) {
+			wp_die( 'Map session already consumed.', 'ECPay Store Callback', [ 'response' => 409 ] );
 		}
 
 		// 🔴 門市**名稱與地址**是瀏覽器帶回來的，不可信（CODEX #3W）。
@@ -494,6 +502,9 @@ final class EcpayStoreSelector {
 		// 🔴 發 token，權威資料留伺服器。前端只帶這個字串回結帳。
 		// 擁有者識別不放進 $store_info——那份資料會被 JSON 印進回呼頁面。
 		$store_info['selection_token'] = self::issue_selection_token( $store_info, $actor );
+		if ( '' === $store_info['selection_token'] ) {
+			wp_die( 'Unable to persist store selection.', 'ECPay Store Callback', [ 'response' => 503 ] );
+		}
 
 		// 🔴 結果留在伺服器，用一次性 result code 交換（CODEX #3W C8）。
 		//
@@ -505,6 +516,10 @@ final class EcpayStoreSelector {
 		// 現在：結果存在伺服器，前端拿 code 到 `/ecpay/store-result` 換，
 		// 而且要用**同一個 principal** 才換得到、且只能換一次。
 		$result_code = self::issue_result_code( $store_info, $actor );
+		if ( '' === $result_code ) {
+			delete_transient( self::SELECTION_PREFIX . $store_info['selection_token'] );
+			wp_die( 'Unable to persist store result.', 'ECPay Store Callback', [ 'response' => 503 ] );
+		}
 
 		self::render_callback_page( $store_info, $result_code );
 	}
@@ -660,9 +675,9 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed> $store_info
 	 */
 	public static function issue_result_code( array $store_info, string $principal ): string {
-		$code = self::generate_nonce();
+		$code = self::generate_result_code();
 
-		set_transient(
+		$stored = set_transient(
 			self::RESULT_PREFIX . $code,
 			[
 				'principal' => $principal,
@@ -672,7 +687,7 @@ final class EcpayStoreSelector {
 			self::SELECTION_TTL
 		);
 
-		return $code;
+		return $stored ? $code : '';
 	}
 
 	/**
@@ -682,7 +697,7 @@ final class EcpayStoreSelector {
 	 */
 	public static function claim_result_code( string $code, string $principal ): array {
 		$code = trim( $code );
-		if ( '' === $code || '' === $principal ) {
+		if ( 1 !== preg_match( '/^[A-Za-z0-9]{32}$/', $code ) || '' === $principal ) {
 			return [ 'error' => '缺少提領碼或無法辨識身分。', 'store' => [] ];
 		}
 
@@ -702,6 +717,14 @@ final class EcpayStoreSelector {
 		}
 
 		return [ 'error' => null, 'store' => (array) ( $record['store'] ?? [] ) ];
+	}
+
+	private static function generate_result_code(): string {
+		$code = (string) preg_replace( '/[^A-Za-z0-9]/', '', wp_generate_password( 48, false, false ) );
+		while ( strlen( $code ) < 32 ) {
+			$code .= (string) preg_replace( '/[^A-Za-z0-9]/', '', wp_generate_password( 48, false, false ) );
+		}
+		return substr( $code, 0, 32 );
 	}
 
 	private static function sanitize_cart_scope( string $scope ): string {
@@ -724,12 +747,44 @@ final class EcpayStoreSelector {
 			return $fallback;
 		}
 
-		$return_url = wp_validate_redirect( esc_url_raw( $return_url ), $fallback );
+		$raw_return = esc_url_raw( $return_url );
+		$origin     = self::url_origin( $raw_return );
+		$home       = self::url_origin( home_url() );
+		$allowed    = '' !== $origin && $origin === $home;
+
+		if ( ! $allowed && '' !== $origin ) {
+			$configured = (string) Settings::get( 'headless_cors_origins', '' );
+			foreach ( array_filter( array_map( 'trim', preg_split( '/\R/', $configured ) ?: [] ) ) as $candidate ) {
+				if ( $origin === self::url_origin( (string) $candidate ) ) {
+					$allowed = true;
+					break;
+				}
+			}
+		}
+
+		$return_url = $allowed ? $raw_return : $fallback;
 		if ( 'default' !== $cart_scope ) {
 			$return_url = add_query_arg( [ 'cart_scope' => $cart_scope ], $return_url );
 		}
 
 		return $return_url ?: $fallback;
+	}
+
+	private static function url_origin( string $url ): string {
+		$parts = wp_parse_url( trim( $url ) );
+		if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+			return '';
+		}
+		$scheme = strtolower( (string) $parts['scheme'] );
+		$host   = strtolower( (string) $parts['host'] );
+		if ( ! in_array( $scheme, [ 'http', 'https' ], true ) ) {
+			return '';
+		}
+		$port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
+		if ( ( 'http' === $scheme && 80 === $port ) || ( 'https' === $scheme && 443 === $port ) ) {
+			$port = 0;
+		}
+		return $scheme . '://' . $host . ( $port > 0 ? ':' . $port : '' );
 	}
 
 	private static function checkout_url(): string {

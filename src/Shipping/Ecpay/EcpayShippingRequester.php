@@ -591,11 +591,14 @@ final class EcpayShippingRequester {
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 
 		$key = wp_generate_password( 24, false, false );
-		set_transient( 'ys_ec_ecpay_print_' . $key, [
+		$stored = set_transient( 'ys_ec_ecpay_print_' . $key, [
 			'api_url'   => Settings::logistics_endpoint( $spec['path'] ),
 			'fields'    => $fields,
 			'method_id' => $this->method->get_id(),
 		], 10 * MINUTE_IN_SECONDS );
+		if ( ! $stored ) {
+			return '';
+		}
 
 		return add_query_arg(
 			[

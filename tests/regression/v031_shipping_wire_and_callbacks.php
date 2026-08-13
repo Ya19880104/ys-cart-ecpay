@@ -98,6 +98,8 @@ namespace {
     $GLOBALS['ys_next_body']   = '';
     $GLOBALS['ys_filters']     = [];
     $GLOBALS['ys_transport_fails'] = false;
+    $GLOBALS['ys_transient_write_fails'] = false;
+    $_COOKIE['ys_ec_session'] = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
     function add_filter(string $tag, callable $cb, int $priority = 10, int $args = 1): void {
         $GLOBALS['ys_filters'][$tag][$priority][] = $cb;
@@ -115,6 +117,7 @@ namespace {
     function admin_url(string $path = ''): string { return 'https://example.test/wp-admin/' . ltrim($path, '/'); }
     function rest_url(string $path = ''): string { return 'https://example.test/wp-json/' . ltrim($path, '/'); }
     function wp_validate_redirect(string $url, string $fallback = ''): string { return $url ?: $fallback; }
+    function wp_parse_url(string $url) { return parse_url($url); }
     function add_query_arg(array $args, string $url): string {
         return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($args);
     }
@@ -136,6 +139,9 @@ namespace {
         throw new WpDie($message, (int) ($args['response'] ?? 500));
     }
     function set_transient(string $key, $value, int $ttl = 0): bool {
+        if (!empty($GLOBALS['ys_transient_write_fails'])) {
+            return false;
+        }
         $GLOBALS['ys_transients'][$key] = $value;
         return true;
     }
@@ -182,7 +188,17 @@ namespace {
         return [];
     }
 
+    function latest_print_payload(): array {
+        foreach ($GLOBALS['ys_transients'] as $key => $value) {
+            if (0 === strpos((string) $key, 'ys_ec_ecpay_print_')) {
+                return (array) $value;
+            }
+        }
+        return [];
+    }
+
     require_once $root . '/src/Shipping/Ecpay/EcpayStoreDirectory.php';
+    require_once dirname(__DIR__, 3) . '/ys-cart/src/Api/Storefront/YSRestAuth.php';
     require_once $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
     require_once $root . '/src/Support/Settings.php';
 
@@ -297,7 +313,7 @@ namespace {
 
     // 開電子地圖需要算得出顧客身分（憑證的擁有者要在同源這一側決定）。
     // 這裡模擬一個訪客的購物車 session。
-    $_COOKIE['ys_ec_session'] = 'v031-guest-session';
+    $_COOKIE['ys_ec_session'] = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     reset_settings();
 
     // ── (4) 每個超商方式的 subtype：地圖與送單必須是同一個 ─────────────────
@@ -816,6 +832,69 @@ namespace {
         ! array_key_exists('ScheduledPickupTime', $w_post)
             && ! array_key_exists('Temperature', $w_post)
     );
+
+    check(
+        '(X31) HOME 建單共同欄位、寄收件資料、地址隔離與最終 CMV 都在 wire 上',
+        '2026-08-12 10:00:00' === (string) ($w_tcat['MerchantTradeDate'] ?? '')
+            && '測試商品' === (string) ($w_tcat['GoodsName'] ?? '')
+            && '寄件人' === (string) ($w_tcat['SenderName'] ?? '')
+            && '0912345678' === (string) ($w_tcat['SenderCellPhone'] ?? '')
+            && '收件人' === (string) ($w_tcat['ReceiverName'] ?? '')
+            && '0987654321' === (string) ($w_tcat['ReceiverCellPhone'] ?? '')
+            && '106' === (string) ($w_tcat['SenderZipCode'] ?? '')
+            && '台北市大安區測試路1號' === (string) ($w_tcat['SenderAddress'] ?? '')
+            && '110' === (string) ($w_tcat['ReceiverZipCode'] ?? '')
+            && '台北市信義區測試路2號' === (string) ($w_tcat['ReceiverAddress'] ?? '')
+            && 'https://example.test/wp-json/ys-ecommerce/v1/ecpay/logistics-notify' === (string) ($w_tcat['ServerReplyURL'] ?? '')
+            && ! array_key_exists('ReceiverStoreID', $w_tcat)
+            && CheckMacValue::verify($w_tcat, HASH_KEY, HASH_IV, 'md5')
+    );
+
+    $GLOBALS['ys_transients'] = [];
+    $print_desc = EcpayShippingCatalog::get('ys_ec_ecpay_ship_tcat');
+    $print_requester = new EcpayShippingRequester(new $print_desc['class']());
+    $print_url = $print_requester->get_print_url(['L100', 'L200']);
+    $print_payload = latest_print_payload();
+    check(
+        '(X30a) B2C/HOME 列印走批次端點、逗號 IDs、PrintMode=1 且整包 CMV 有效',
+        '' !== $print_url
+            && str_ends_with((string) ($print_payload['api_url'] ?? ''), '/helper/printTradeDocument')
+            && 'L100,L200' === (string) ($print_payload['fields']['AllPayLogisticsID'] ?? '')
+            && '' === (string) ($print_payload['fields']['PlatformID'] ?? 'x')
+            && '1' === (string) ($print_payload['fields']['PrintMode'] ?? '')
+            && CheckMacValue::verify((array) ($print_payload['fields'] ?? []), HASH_KEY, HASH_IV, 'md5')
+    );
+
+    $GLOBALS['ys_transients'] = [];
+    $c2c_desc = EcpayShippingCatalog::get('ys_ec_ecpay_ship_unimart_c2c');
+    $c2c_requester = new EcpayShippingRequester(new $c2c_desc['class']());
+    $c2c_url = $c2c_requester->get_print_url('', [
+        'labels' => [[
+            'provider_trade_no' => 'L300',
+            'cvs_payment_no' => 'CP300',
+            'cvs_validation_no' => 'VN300',
+        ]],
+    ]);
+    $c2c_payload = latest_print_payload();
+    check(
+        '(X30b) UNIMART C2C 走專屬端點並帶物流編號、寄貨編號與驗證碼',
+        '' !== $c2c_url
+            && str_ends_with((string) ($c2c_payload['api_url'] ?? ''), '/Express/PrintUniMartC2COrderInfo')
+            && 'L300' === (string) ($c2c_payload['fields']['AllPayLogisticsID'] ?? '')
+            && 'CP300' === (string) ($c2c_payload['fields']['CVSPaymentNo'] ?? '')
+            && 'VN300' === (string) ($c2c_payload['fields']['CVSValidationNo'] ?? '')
+            && CheckMacValue::verify((array) ($c2c_payload['fields'] ?? []), HASH_KEY, HASH_IV, 'md5')
+    );
+
+    $missing_c2c = $c2c_requester->get_print_url('', [
+        'labels' => [[ 'provider_trade_no' => 'L301', 'cvs_payment_no' => 'CP301' ]],
+    ]);
+    check('(X30c) C2C 缺必要寄貨憑據時不交出壞列印 URL', '' === $missing_c2c);
+
+    $GLOBALS['ys_transient_write_fails'] = true;
+    $failed_print = $print_requester->get_print_url('L400');
+    $GLOBALS['ys_transient_write_fails'] = false;
+    check('(X30d) print payload transient 寫不進去時 fail closed', '' === $failed_print);
 
     echo "\nREGRESSION v031_shipping_wire_and_callbacks PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {

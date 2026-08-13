@@ -33,6 +33,7 @@ Standalone ECPay provider plugin for YS CART.
 - Store callback: `/wp-json/ys-ecommerce/v1/ecpay/store-callback`
 - Logistics notify: `/wp-json/ys-ecommerce/v1/ecpay/logistics-notify`
 - Store map form: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url`
+- One-time store result exchange: `/wp-json/ys-ecommerce-headless/v1/ecpay/store-result`
 
 Payment notify, payment info, return, store callback, and logistics notify are
 provider-facing callback routes. Browser UI should request only the store-map
@@ -56,16 +57,21 @@ is *cannot prove*, not "assume no collection". Guests on another origin must
 also identify themselves with the core `X-YS-Guest-Token` header; the token
 issued for a store selection is bound to that owner.
 
-Submit the returned `action_url` and `fields` as a top-level browser form post
-or popup form post. Do not expose ECPay hash keys or callback verification logic
-to browser code.
-Checkout must return the map callback's `selection_token` as `ecpay_store_token`
-(v0.2.12); the store id alone is no longer accepted. See `docs/headless.md`.
+Submit the returned `action_url` and `fields` as a top-level browser form post.
+The callback redirects only to an allowlisted `return_url` with a 32-character
+one-time result code. Exchange it through the result route under the same guest
+or login identity; do not read WordPress-origin `localStorage` from a different
+origin. The exchanged `selection_token` must be returned at checkout as
+`ecpay_store_token` (v0.2.12); the store id alone is no longer accepted. Do not
+expose ECPay hash keys or callback verification logic to browser code. See
+`docs/headless.md`.
 
 The bundled SDK exposes
 `YsCartEcpay.setGuestToken(token)` and
-`YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`
-for this request.
+`YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`,
+then `resultCodeFromLocation()` + `claimStoreResult()` and the absolute-API
+`checkout()` helper. Cookie-authenticated writes can set `X-WP-Nonce` through
+`setWpNonce()`.
 
 ## Release
 
