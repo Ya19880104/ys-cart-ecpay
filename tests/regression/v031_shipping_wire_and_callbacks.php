@@ -754,6 +754,69 @@ namespace {
     ]);
     check('(10f) 沒有門市代號的回呼被拒絕（那不是一次有效的選店）', 400 === callback_status($no_store));
 
+    // ══ #3X：金額守恆、官方同步失敗、TCAT 欄位集合 ═══════════════════════
+
+    // 🔴 CODEX #3W C7 實測：25,000 元黑貓 COD 送出 GoodsAmount=20000／
+    // CollectionAmount=20000——貨照出、**少收 5,000**，而本地紀錄還是 25,000。
+    // 上限是契約，超過就是送不出去，不是「幫它改成上限」。
+    [$w_cod_over, $r_cod_over] = send('ys_ec_ecpay_ship_tcat', base_order([
+        'product_amount' => 25000,
+        'payment_method' => 'ys_ec_cod',
+    ]));
+    check(
+        '(X13) 黑貓代收 25000 超過上限：送出前擋下，wire 上不得出現任何金額',
+        $r_cod_over instanceof \Throwable && [] === $w_cod_over
+    );
+
+    // 宅配非代收沒有上限——原金額要原樣送出去，不得被夾。
+    [$w_home_big] = send('ys_ec_ecpay_ship_tcat', base_order([
+        'product_amount' => 25000,
+        'payment_method' => 'ys_ec_credit',
+    ]));
+    check(
+        '(X14) 宅配非代收 25000：原金額送出（官方對 HOME 無上限）',
+        '25000' === (string) ($w_home_big['GoodsAmount'] ?? '')
+    );
+
+    // 超商邊界：20000 過、20001 擋。
+    [$w_cvs_max] = send('ys_ec_ecpay_ship_family', base_order([ 'product_amount' => 20000 ]));
+    [$w_cvs_over, $r_cvs_over] = send('ys_ec_ecpay_ship_family', base_order([ 'product_amount' => 20001 ]));
+    check(
+        '(X12) 超商 20000 送得出去、20001 送不出去（且不改寫金額）',
+        '20000' === (string) ($w_cvs_max['GoodsAmount'] ?? '')
+            && $r_cvs_over instanceof \Throwable && [] === $w_cvs_over
+    );
+
+    // 🔴 官方同步失敗回應是 `0|ErrorMessage`——**沒有簽章**（官方 SDK 收建單
+    // 回應用的是不驗簽的 StrResponse）。舊版把它丟去驗簽 → 驗不過 → indeterminate，
+    // 於是一張**根本沒建立**的單要人去綠界後台確認才能重來。
+    $GLOBALS['ys_next_body'] = '0|MerchantID Error';
+    $GLOBALS['ys_last_post'] = null;
+    $zero_desc   = EcpayShippingCatalog::get('ys_ec_ecpay_ship_family');
+    $zero_method = new $zero_desc['class']();
+    $r_zero      = (new EcpayShippingRequester($zero_method))->create_order(base_order());
+    check(
+        '(X15) 官方 0|ErrorMessage 同步回應＝明確拒絕（不是 indeterminate）',
+        false === ($r_zero['success'] ?? true)
+            && 'provider_failed' === (string) ($r_zero['outcome'] ?? '')
+    );
+
+    // 🔴 官方 TCAT 範例兩個時段欄位都有（CreateHome.php:33-34）；舊版只送了送達時段。
+    [$w_tcat] = send('ys_ec_ecpay_ship_tcat', base_order());
+    check(
+        '(X16) 黑貓送出取件與送達兩個時段（官方範例的欄位集合）',
+        '4' === (string) ($w_tcat['ScheduledPickupTime'] ?? '')
+            && '4' === (string) ($w_tcat['ScheduledDeliveryTime'] ?? '')
+    );
+
+    // 中華郵政官方明載「請忽略」這些欄位——不得送。
+    [$w_post] = send('ys_ec_ecpay_ship_post', base_order([ 'goods_weight' => '1.5' ]));
+    check(
+        '(X16b) 中華郵政不得送宅配專屬條件（官方明載請忽略）',
+        ! array_key_exists('ScheduledPickupTime', $w_post)
+            && ! array_key_exists('Temperature', $w_post)
+    );
+
     echo "\nREGRESSION v031_shipping_wire_and_callbacks PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {
         echo "Failed:\n";

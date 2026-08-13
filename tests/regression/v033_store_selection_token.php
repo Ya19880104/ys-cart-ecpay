@@ -531,6 +531,91 @@ namespace {
             && null === checkout($token, 'ys_ec_ecpay_ship_family', 'ys_ec_credit')
     );
 
+    // ══ #3X：官方的 map 回呼**不帶簽章**（CODEX #3W C5）═════════════════
+    //
+    // 🔴 這一組是這輪最重要的修正之一：舊版強制要求 `CheckMacValue`，
+    // 而綠界的電子地圖回呼根本不送它（官方 SDK 用不驗簽的 `ArrayResponse`，
+    // Factory 連 hashKey/hashIv 都沒帶）。結果是**合法的官方回呼一律 400**，
+    // 選店在正式環境走不完——而測試看不出來，因為上面那支 select_store()
+    // helper 自己替回呼簽了一個 CMV（14 個案例都是這樣）。
+    //
+    // 這兩條就是照官方的形狀送：不帶 CMV。
+    function callback_raw(array $params): int {
+        $cookies = $_COOKIE;
+        $user    = $GLOBALS['ys_user_id'] ?? 0;
+        $_COOKIE = [];
+        $GLOBALS['ys_user_id'] = 0;
+        $status  = 200;
+        try {
+            EcpayStoreSelector::handle_store_callback(new WP_REST_Request($params));
+        } catch (WpDie $e) {
+            $status = $e->http_status;
+        } catch (Responded $e) {
+            // 成功時 `render_callback_page()` 會呼叫 `status_header( 200 )`，
+            // 替身把它變成例外——那代表「走到輸出頁面了」，也就是成功。
+            $status = 200;
+        }
+        $_COOKIE = $cookies;
+        $GLOBALS['ys_user_id'] = $user;
+        return $status;
+    }
+
+    function official_callback_params(string $store_id = '991111'): array {
+        $GLOBALS['ys_transients'] = [];
+        $form    = EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_family', 'checkout', 0, 'default', '', 'ys_ec_credit');
+        $temp    = (string) $form['temp_id'];
+        $session = $GLOBALS['ys_transients']['ys_ec_ecpay_map_' . $temp];
+
+        return [
+            'MerchantID'       => MID,
+            'MerchantTradeNo'  => $session['merchant_trade_no'],
+            'LogisticsSubType' => $session['logistics_subtype'],
+            'CVSStoreID'       => $store_id,
+            'CVSStoreName'     => '官方回傳門市',
+            'CVSAddress'       => '台北市信義區官方路 1 號',
+            'ExtraData'        => $temp,
+            // 🔴 沒有 CheckMacValue——這就是官方的形狀。
+        ];
+    }
+
+    check(
+        '(X8) 官方的 map 回呼不帶 CheckMacValue，必須被接受',
+        200 === callback_raw(official_callback_params())
+    );
+
+    $tampered = official_callback_params();
+    $tampered['CheckMacValue'] = 'DEADBEEFDEADBEEFDEADBEEFDEADBEEF';
+    check(
+        '(X9) 帶了但簽章不對的回呼仍然要拒絕（缺席可以，錯誤不行）',
+        400 === callback_raw($tampered)
+    );
+
+    // 🔴 ExtraData 是綠界的欄位，官方上限 20 字。舊版放 36 字的 UUID。
+    $form_len = EcpayStoreSelector::build_map_form_data('ys_ec_ecpay_ship_family', 'checkout', 0, 'default', '', 'ys_ec_credit');
+    check(
+        '(X10) ExtraData 是 20 個英數字的一次性 nonce（官方長度上限）',
+        20 === strlen((string) ($form_len['fields']['ExtraData'] ?? ''))
+            && 1 === preg_match('/^[A-Za-z0-9]{20}$/', (string) ($form_len['fields']['ExtraData'] ?? ''))
+    );
+
+    // 🔴 同一份 map session 只能被消耗一次：兩個同時進來的回呼不得各簽一張憑證。
+    $once = official_callback_params();
+    $first_status  = callback_raw($once);
+    $second_status = callback_raw($once);
+    check(
+        '(X10b) map session 一次性：同一個 ExtraData 的第二次回呼被擋',
+        200 === $first_status && 200 !== $second_status
+    );
+
+    // 🔴 瀏覽器帶回來的門市名稱／地址查不到 canonical 時，必須明確標成未驗證，
+    // 不得冒充成已驗證的權威資料。
+    callback_raw(official_callback_params('995555'));
+    $unverified = latest_selection();
+    check(
+        '(X11) 查不到 canonical 門市時標記 store_verified=0（不冒充權威）',
+        0 === (int) ($unverified['store_verified'] ?? 1)
+    );
+
     echo "\nREGRESSION v033_store_selection_token PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {
         echo "Failed:\n";
