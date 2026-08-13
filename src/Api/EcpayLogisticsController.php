@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
+use YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
@@ -64,30 +65,70 @@ final class EcpayLogisticsController {
 			$this->respond_text( '1|OK' );
 		}
 
-		$label = $lookup['label'];
-
-		// 🔴 綁定必須逐項相符，缺欄位也拒絕。
-		//
-		// 舊版只用一個 AllPayLogisticsID 認人，而且 MerchantTradeNo／
-		// LogisticsSubType 寫成「有傳才比」——不傳就自動通過。B2C 與 C2C 是兩份
-		// 不同的合約、兩組不同的編號空間，這樣認人遲早會把狀態寫到別人的訂單上。
-		if ( ! $this->binding_matches( $label, $params ) ) {
+		$initial_label = $lookup['label'];
+		$order_id      = (int) ( $initial_label->order_id ?? 0 );
+		if ( $order_id <= 0 || ! $this->binding_matches( $initial_label, $params ) ) {
 			$this->respond_text( '0|Logistics binding mismatch', 400 );
 		}
 
-		$order = $this->find_order_by_label( $label );
-		if ( null === $order ) {
-			// label 在、訂單讀不到＝我們這邊出了狀況，不是對方送錯。回非 2xx。
-			$this->respond_text( '0|Storage unavailable', 503 );
+		// Different signed status callbacks are not replay duplicates. They still mutate the same
+		// order projections, so the pipeline decision and every durable write must share Core's
+		// order-wide advisory serialization boundary.
+		$serialized = $this->with_notify_serialization(
+			$order_id,
+			function () use ( $params, $order_id ): array {
+				$locked_lookup = $this->find_label( $params );
+				$status        = (string) ( $locked_lookup['status'] ?? 'error' );
+
+				if ( 'mismatch' === $status ) {
+					return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
+				}
+				if ( 'not_found' === $status || 'pending' === $status ) {
+					return [ 'body' => '0|Label not persisted yet', 'status' => 503 ];
+				}
+				if ( 'found' !== $status ) {
+					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
+				}
+
+				$locked_label = $locked_lookup['label'];
+				if ( $order_id !== (int) ( $locked_label->order_id ?? 0 )
+					|| ! $this->binding_matches( $locked_label, $params ) ) {
+					return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
+				}
+
+				// The lock can wait behind another callback. Drop any request-local order snapshot before
+				// the first transition decision so a later worker cannot project stale state backwards.
+				YSOrder::forget( $order_id );
+				$order = $this->find_order_by_label( $locked_label );
+				if ( null === $order ) {
+					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
+				}
+
+				if ( ! $this->update_order_shipping( $order, $params, $locked_label ) ) {
+					return [ 'body' => '0|Persistence failed', 'status' => 503 ];
+				}
+
+				return [ 'body' => '1|OK', 'status' => 200 ];
+			}
+		);
+
+		$release = (string) ( $serialized['serialization_release'] ?? '' );
+		$result  = $serialized['result'] ?? null;
+		if ( true !== ( $serialized['guard'] ?? false )
+			|| ! is_array( $result )
+			|| ! in_array( $release, [ 'released', 'session_closed', 'reentrant' ], true ) ) {
+			$this->respond_text( '0|Serialization unavailable', 503 );
 		}
 
-		// 🔴 全部寫入都 durable 之後才 ACK。任何一步失敗都回非 2xx——
-		// 「收到了但沒存起來」在 ACK 之後是無法補救的。
-		if ( ! $this->update_order_shipping( $order, $params, $label ) ) {
-			$this->respond_text( '0|Persistence failed', 503 );
-		}
+		$this->respond_text(
+			(string) ( $result['body'] ?? '0|Storage unavailable' ),
+			(int) ( $result['status'] ?? 503 )
+		);
+	}
 
-		$this->respond_text( '1|OK' );
+	/** @return array{guard:bool,reason:string,result:mixed,serialization_release:string} */
+	private function with_notify_serialization( int $order_id, callable $fn ): array {
+		return YSShippingDispatchAuthority::with_order_serialization( $order_id, $fn );
 	}
 
 	/**

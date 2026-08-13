@@ -39,8 +39,8 @@ spl_autoload_register(
 	}
 );
 
-/** 本外掛要求的 YS CART 核心最低版本（2.56.8 補齊 InnoDB 與 authority coherence repair）。 */
-define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.8' );
+/** 本外掛要求的 YS CART 核心最低版本（2.56.9 補齊 migration serialization 與 label uniqueness）。 */
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.9' );
 
 add_action(
 	'plugins_loaded',

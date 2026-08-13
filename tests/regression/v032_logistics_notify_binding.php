@@ -18,6 +18,14 @@ namespace YangSheep\Ecommerce\Models {
     final class YSOrder {
         /** @var array<int,array<string,mixed>> */
         public static array $updates = [];
+        /** @var array<int,int> */
+        public static array $forgotten = [];
+        /** @var array<int,int> */
+        public static array $update_depths = [];
+
+        public static function forget( int $id ): void {
+            self::$forgotten[] = $id;
+        }
 
         /**
          * 🔴 production 的 YSOrder::update() 對 affected=0 也回 true。
@@ -26,6 +34,7 @@ namespace YangSheep\Ecommerce\Models {
          */
         public static function update( int $id, array $data ): bool {
             self::$updates[] = [ 'id' => $id ] + $data;
+            self::$update_depths[] = \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$depth;
             if ( ! empty( $GLOBALS['ys_order_silent_write'] ) ) {
                 return true;
             }
@@ -35,6 +44,39 @@ namespace YangSheep\Ecommerce\Models {
                 }
             }
             return true;
+        }
+    }
+}
+
+namespace YangSheep\Ecommerce\Services\Shipping {
+    final class YSShippingDispatchAuthority {
+        public static int $calls = 0;
+        /** @var array<int,int> */
+        public static array $order_ids = [];
+        public static int $depth = 0;
+        public static bool $allow = true;
+        public static string $release = 'released';
+        /** @var callable|null */
+        public static $before_enter = null;
+
+        public static function with_order_serialization( int $order_id, callable $fn ): array {
+            self::$calls++;
+            self::$order_ids[] = $order_id;
+            if ( ! self::$allow ) {
+                return [ 'guard' => false, 'reason' => 'guard_unavailable', 'result' => null, 'serialization_release' => 'not_acquired' ];
+            }
+
+            self::$depth++;
+            try {
+                if ( is_callable( self::$before_enter ) ) {
+                    ( self::$before_enter )();
+                }
+                $result = $fn();
+            } finally {
+                self::$depth--;
+            }
+
+            return [ 'guard' => true, 'reason' => 'ok', 'result' => $result, 'serialization_release' => self::$release ];
         }
     }
 }
@@ -181,7 +223,12 @@ namespace {
                 $this->last_error = 'Lock wait timeout';
                 return false;
             }
-            $this->updates[] = [ 'table' => $table, 'data' => $data, 'where' => $where ];
+            $this->updates[] = [
+                'table' => $table,
+                'data' => $data,
+                'where' => $where,
+                'depth' => \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$depth,
+            ];
             return 1;
         }
     }
@@ -249,6 +296,14 @@ namespace {
         $wpdb->attempt_order_id = 42;
         $GLOBALS['wpdb'] = $wpdb;
         YSOrder::$updates = [];
+        YSOrder::$forgotten = [];
+        YSOrder::$update_depths = [];
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$calls = 0;
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$order_ids = [];
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$depth = 0;
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$allow = true;
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$release = 'released';
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$before_enter = null;
         return $wpdb;
     }
 
@@ -282,8 +337,10 @@ namespace {
         eval('namespace YangSheep\\Ecommerce\\Services\\Shipping; final class YSShippingPipelineService {
             public static array $result = [ "success" => true, "persisted" => true ];
             public static int $calls = 0;
+            public static array $depths = [];
             public static function advance_from_carrier_status(int $o, string $s, string $r = ""): array {
                 self::$calls++;
+                self::$depths[] = YSShippingDispatchAuthority::$depth;
                 return self::$result;
             }
         }');
@@ -292,6 +349,7 @@ namespace {
     function pipeline_reset(array $result = [ 'success' => true, 'persisted' => true ]): void {
         \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$result = $result;
         \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$calls  = 0;
+        \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$depths = [];
     }
 
     pipeline_reset();
@@ -557,6 +615,56 @@ namespace {
     );
 
     pipeline_reset();
+
+    $wpdb = seed_label();
+    pipeline_reset();
+    $serialized_code = notify( base_notify() );
+    check(
+        '(x29) callback pipeline/order/label projections all run inside order serialization',
+        200 === $serialized_code
+            && 1 === \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$calls
+            && [ 42 ] === \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$order_ids
+            && [ 42 ] === YSOrder::$forgotten
+            && [ 1 ] === \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$depths
+            && [ 1 ] === YSOrder::$update_depths
+            && 1 === (int) ( $wpdb->updates[0]['depth'] ?? 0 )
+    );
+
+    $wpdb = seed_label();
+    pipeline_reset();
+    \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$allow = false;
+    check(
+        '(x30) unavailable serialization returns 503 without writes',
+        503 === notify( base_notify() )
+            && 0 === \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$calls
+            && [] === YSOrder::$updates
+            && [] === $wpdb->updates
+    );
+
+    $wpdb = seed_label();
+    pipeline_reset();
+    \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$release = 'unknown';
+    check( '(x31) unknown advisory release must not ACK', 503 === notify( base_notify() ) );
+
+    $wpdb = seed_label();
+    pipeline_reset();
+    \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$release = 'reentrant';
+    check( '(x32) a legitimate reentrant serialization may ACK', 200 === notify( base_notify() ) );
+
+    $wpdb = seed_label();
+    pipeline_reset();
+    \YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority::$before_enter = static function () use ( $wpdb ): void {
+        $wpdb->label = (object) array_merge( (array) $wpdb->label, [
+            'logistics_subtype' => 'FAMIC2C',
+        ] );
+    };
+    check(
+        '(x33) locked relookup and binding recheck reject a raced label replacement',
+        400 === notify( base_notify() )
+            && 0 === \YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService::$calls
+            && [] === YSOrder::$updates
+            && [] === $wpdb->updates
+    );
 
     echo "\nREGRESSION v032_logistics_notify_binding PASS={$pass} FAIL={$fail}\n";
     if ($fail > 0) {
