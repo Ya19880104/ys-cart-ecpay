@@ -26,8 +26,8 @@ declare(strict_types=1);
 
 namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 
-use YangSheep\YSCartEcpay\Settings;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
+use YangSheep\YSCartEcpay\Support\Settings;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -65,7 +65,7 @@ final class EcpayStoreDirectory {
 			return self::normalize( $injected );
 		}
 
-		$list = self::store_list( $subtype );
+		$list = self::cached_store_list( $subtype );
 		if ( ! isset( $list[ $store_id ] ) ) {
 			return [];
 		}
@@ -74,25 +74,43 @@ final class EcpayStoreDirectory {
 	}
 
 	/**
-	 * 取得（並快取）某個通路的門市清單，索引為門市代號
+	 * 已快取的門市清單（**不會**發 HTTP）
+	 *
+	 * 🔴 選店回呼是顧客正在等的那一個請求。在它裡面同步打一支外部 API：
+	 * 對方慢一秒顧客就多等一秒，對方掛掉顧客就卡住——而換來的只是
+	 * 「門市名稱好看一點」。名稱與地址**不上 wire**（建單只送 `ReceiverStoreID`），
+	 * 所以它們永遠不值得擋住結帳。
+	 *
+	 * 因此查詢只讀快取；快取由 {@see self::refresh()} 另外補（尚未接排程，
+	 * 見交接檔的 stage gate）。查不到就是查不到，呼叫端標成未驗證即可。
 	 *
 	 * @return array<string,array<string,string>>
 	 */
-	private static function store_list( string $subtype ): array {
+	private static function cached_store_list( string $subtype ): array {
 		$cvs_type = self::cvs_type( $subtype );
 		if ( '' === $cvs_type ) {
 			return [];
 		}
 
-		$cache_key = self::CACHE_PREFIX . $cvs_type;
-		$cached    = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			return $cached;
+		$cached = get_transient( self::CACHE_PREFIX . $cvs_type );
+
+		return is_array( $cached ) ? $cached : [];
+	}
+
+	/**
+	 * 向綠界重新抓一份門市清單並快取（**不在回呼路徑上呼叫**）
+	 *
+	 * @return int 快取到幾間門市；0 代表沒抓到（不會把失敗快取成空清單）
+	 */
+	public static function refresh( string $subtype ): int {
+		$cvs_type = self::cvs_type( $subtype );
+		if ( '' === $cvs_type ) {
+			return 0;
 		}
 
 		$credentials = Settings::logistics_credentials();
 		if ( '' === $credentials['merchant_id'] ) {
-			return [];
+			return 0;
 		}
 
 		$response = ( new HttpFormClient() )->post(
@@ -106,17 +124,17 @@ final class EcpayStoreDirectory {
 		if ( empty( $response['success'] ) ) {
 			// 🔴 查不到就是查不到。**不要**把失敗快取成空清單——那會讓接下來
 			// 12 小時內每一次選店都被標成未驗證，而原因只是一次網路抖動。
-			return [];
+			return 0;
 		}
 
 		$parsed = self::parse_store_list( (string) ( $response['body'] ?? '' ), $cvs_type );
 		if ( [] === $parsed ) {
-			return [];
+			return 0;
 		}
 
-		set_transient( $cache_key, $parsed, self::CACHE_TTL );
+		set_transient( self::CACHE_PREFIX . $cvs_type, $parsed, self::CACHE_TTL );
 
-		return $parsed;
+		return count( $parsed );
 	}
 
 	/**

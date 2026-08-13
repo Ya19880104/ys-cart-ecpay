@@ -753,7 +753,7 @@ final class EcpayStoreSelector {
 		$context      = (string) ( $store_info['context'] ?? 'checkout' );
 
 		if ( '' !== $result_code ) {
-			$checkout_url = add_query_arg( 'ys_ec_store_result', rawurlencode( $result_code ), $checkout_url );
+			$checkout_url = add_query_arg( [ 'ys_ec_store_result' => rawurlencode( $result_code ) ], $checkout_url );
 		}
 
 		while ( ob_get_level() > 0 ) {

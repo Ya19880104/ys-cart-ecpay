@@ -134,6 +134,23 @@ namespace {
     // 🔴 載入**核心正式的** YSRestAuth：headless 訪客的身分來源是它定義的
     // `X-YS-Guest-Token`。自己在測試裡另寫一份，就永遠測不出兩邊漂移。
     require_once dirname(__DIR__, 3) . '/ys-cart/src/Api/Storefront/YSRestAuth.php';
+
+    /**
+     * 🔴 #3X：選店結果改存成**一次性提領證**（`ys_ec_ecpay_result_<code>`），
+     * 不再以 temp_id 落在一個沒有讀取端的 transient。測試跟著契約走。
+     *
+     * @return array<string,mixed>
+     */
+    function latest_selection(): array {
+        foreach ( $GLOBALS['ys_transients'] as $k => $v ) {
+            if ( 0 === strpos( (string) $k, 'ys_ec_ecpay_result_' ) ) {
+                return (array) ( ( (array) $v )['store'] ?? [] );
+            }
+        }
+        return [];
+    }
+
+    require_once $root . '/src/Shipping/Ecpay/EcpayStoreDirectory.php';
     require_once $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
     require_once $root . '/src/Support/Settings.php';
 
@@ -209,7 +226,7 @@ namespace {
         $_COOKIE = $cookies;
         $GLOBALS['ys_user_id'] = $user;
 
-        return (string) ($GLOBALS['ys_transients']['ys_ec_ecpay_store_' . $temp]['selection_token'] ?? '');
+        return (string) ( latest_selection()['selection_token'] ?? '' );
     }
 
     /** 結帳欄位驗證那一關：**只讀不消耗**。 */
