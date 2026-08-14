@@ -60,7 +60,11 @@ final class EcpayPaymentClient {
 	 */
 	public function query_trade( string $merchant_trade_no ): array {
 		$credentials = Settings::payment_credentials();
-		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
+		$merchant_trade_no = trim( $merchant_trade_no );
+		if ( '' === $merchant_trade_no
+			|| '' === $credentials['merchant_id']
+			|| '' === $credentials['hash_key']
+			|| '' === $credentials['hash_iv'] ) {
 			return [
 				'success' => false,
 				'data'    => null,
@@ -115,8 +119,8 @@ final class EcpayPaymentClient {
 			];
 		}
 
-		if ( isset( $data['CheckMacValue'] )
-			&& ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
+		if ( '' === (string) ( $data['CheckMacValue'] ?? '' )
+			|| ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
 			return [
 				'success' => false,
 				'data'    => $data,
@@ -124,11 +128,32 @@ final class EcpayPaymentClient {
 			];
 		}
 
-		if ( empty( $data['MerchantTradeNo'] ) && empty( $data['TradeStatus'] ) ) {
+		$returned_merchant_id = (string) ( $data['MerchantID'] ?? '' );
+		$returned_trade_no    = (string) ( $data['MerchantTradeNo'] ?? '' );
+		$trade_status         = (string) ( $data['TradeStatus'] ?? '' );
+		$provider_trade_no    = (string) ( $data['TradeNo'] ?? '' );
+		$trade_amount         = (string) ( $data['TradeAmt'] ?? '' );
+
+		if ( '' === $returned_merchant_id
+			|| ! hash_equals( $credentials['merchant_id'], $returned_merchant_id )
+			|| '' === $returned_trade_no
+			|| ! hash_equals( $merchant_trade_no, $returned_trade_no )
+			|| '' === $trade_status ) {
 			return [
 				'success' => false,
 				'data'    => $data,
-				'message' => (string) ( $data['RtnMsg'] ?? $data['Message'] ?? 'ECPay query returned no trade data.' ),
+				'message' => 'ECPay query response identity is invalid.',
+			];
+		}
+
+		if ( '1' === $trade_status
+			&& ( '' === $provider_trade_no
+				|| ! ctype_digit( $trade_amount )
+				|| (int) $trade_amount <= 0 ) ) {
+			return [
+				'success' => false,
+				'data'    => $data,
+				'message' => 'ECPay paid query response is incomplete.',
 			];
 		}
 

@@ -9,10 +9,10 @@ use YangSheep\Ecommerce\Api\Storefront\YSRequestParser;
 use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
 use YangSheep\Ecommerce\Api\Storefront\YSRestResponder;
 use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
-use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Security\YSRateLimiter;
 use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
+use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
 use YangSheep\YSCartEcpay\Api\EcpayLogisticsController;
 use YangSheep\YSCartEcpay\Api\EcpayPaymentController;
@@ -26,8 +26,10 @@ use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySavedStoreReauthorizer;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
 final class Plugin {
 	private static ?self $instance = null;
@@ -38,15 +40,6 @@ final class Plugin {
 		'ys_ec_ecpay_cvs',
 		'ys_ec_ecpay_barcode',
 	];
-
-	/**
-	 * 本外掛註冊的物流方式 ID——由型錄導出，不維護第二份清單。
-	 *
-	 * @return array<int,string>
-	 */
-	private static function registered_shipping_ids(): array {
-		return EcpayShippingCatalog::ids();
-	}
 
 	/**
 	 * 核心是否具備本外掛需要的版本與能力
@@ -70,7 +63,7 @@ final class Plugin {
 			];
 		}
 
-		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.9';
+		$required = defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE : '2.56.12';
 		if ( version_compare( (string) YS_ECOMMERCE_VERSION, $required, '<' ) ) {
 			return [
 				'met'     => false,
@@ -84,9 +77,25 @@ final class Plugin {
 			];
 		}
 
+		if ( ! class_exists( YSCrypto::class )
+			|| ! method_exists( YSCrypto::class, 'encrypt_for_storage' )
+			|| ! method_exists( YSCrypto::class, 'decrypt_from_storage' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'core_crypto_missing',
+				'message' => '核心缺少安全的加密儲存能力；綠界外掛不會載入，也不會以明文保存金流或物流密鑰。',
+			];
+		}
+
 		if ( ! class_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority' )
 			|| ! class_exists( '\YangSheep\Ecommerce\Database\YSMigration' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Database\YSMigration', 'shipping_label_dispatch_schema_ready' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Database\YSMigration', 'address_shipping_provider_schema_ready' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority', 'active_attempt' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Handlers\YSShippingHandler' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Handlers\YSShippingHandler', 'query_shipping_status_for_order' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService' )
+			|| ! interface_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentReconcilerInterface' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Shipping\YSShippingRegistry', 'is_method_allowed_for_cart' ) ) {
 			return [
 				'met'     => false,
@@ -95,17 +104,20 @@ final class Plugin {
 			];
 		}
 
-		$cache_key = 'ys_ec_ecpay_core_gate_' . md5( (string) YS_ECOMMERCE_VERSION );
+		$cache_key = 'ys_ec_ecpay_core_gate_' . md5(
+			(string) YS_ECOMMERCE_VERSION . '|' . ( defined( 'YS_CART_ECPAY_VERSION' ) ? (string) YS_CART_ECPAY_VERSION : 'dev' ) . '|v2'
+		);
 		$cached    = function_exists( 'get_transient' ) ? get_transient( $cache_key ) : false;
 		if ( 'ok' === $cached ) {
 			return [ 'met' => true, 'reason' => 'ok', 'message' => '' ];
 		}
 
-		if ( ! \YangSheep\Ecommerce\Database\YSMigration::shipping_label_dispatch_schema_ready() ) {
+		if ( ! \YangSheep\Ecommerce\Database\YSMigration::shipping_label_dispatch_schema_ready()
+			|| ! \YangSheep\Ecommerce\Database\YSMigration::address_shipping_provider_schema_ready() ) {
 			return [
 				'met'     => false,
 				'reason'  => 'core_schema_not_ready',
-				'message' => 'YS CART 的物流資料表尚未完成 v2.56.9 升級（欄位、索引、storage engine、label uniqueness 或 authority projection 缺失），'
+				'message' => 'YS CART 尚未完成 v2.56.12 配對升級（物流 authority、地址 provider identity 或 storage readiness 缺失），'
 					. '綠界物流方式未註冊。請重新啟用 YS CART 以完成升級。',
 			];
 		}
@@ -132,6 +144,9 @@ final class Plugin {
 		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
 		add_action( 'ys_ec_register_gateways', [ $this, 'register_gateways' ] );
 		add_action( 'ys_ec_register_shipping_methods', [ $this, 'register_shipping_methods' ] );
+		// 🔴 門市目錄的 production caller（v0.2.13）：沒有這一行，refresh() 只有
+		// 測試會呼叫，安裝後快取永遠不會建立、store_verified 恆為 0。
+		Shipping\Ecpay\EcpayStoreDirectory::register_cron();
 		add_action( 'ys_ec_register_admin_rest_routes', [ $this, 'register_admin_routes' ] );
 		add_action( 'ys_ec_register_storefront_routes', [ $this, 'register_storefront_routes' ] );
 		add_action( 'ys_ec_register_payment_reconcilers', [ $this, 'register_payment_reconcilers' ] );
@@ -141,6 +156,262 @@ final class Plugin {
 		add_filter( 'ys_ec_shipping_provider_labels', [ $this, 'register_shipping_provider_label' ] );
 		add_filter( 'ys_ec_validate_store_selection', [ $this, 'validate_store_selection' ], 10, 4 );
 		add_filter( 'ys_ec_claim_store_selection', [ $this, 'claim_store_selection' ], 10, 5 );
+		add_filter( 'ys_ec_resolve_fulfillment_selection_v1', [ $this, 'resolve_fulfillment_selection' ], 10, 3 );
+		add_filter( 'ys_ec_claim_fulfillment_selection_v1', [ $this, 'claim_fulfillment_selection' ], 10, 4 );
+	}
+
+	/**
+	 * Resolve the ECPay destination before Core writes the order row.
+	 *
+	 * @param array<string,mixed> $result
+	 * @param array<string,mixed> $data
+	 * @param array<string,mixed> $context
+	 * @return array<string,mixed>
+	 */
+	public function resolve_fulfillment_selection( $result, $data, $context = [] ): array {
+		if ( is_array( $result ) && true === ( $result['handled'] ?? false ) ) {
+			return $result;
+		}
+
+		$data       = is_array( $data ) ? $data : [];
+		$context    = is_array( $context ) ? $context : [];
+		$request    = $this->canonical_fulfillment_request( $data, $context );
+		if ( null === $request ) {
+			return $this->fulfillment_rejection( 'invalid_fulfillment_context', '物流結帳條件無法驗證，請重新整理後再試。' );
+		}
+		$data       = $request['data'];
+		$method_id  = $request['method_id'];
+		$descriptor = EcpayShippingCatalog::get( $method_id );
+		if ( null === $descriptor ) {
+			return is_array( $result ) ? $result : [ 'handled' => false ];
+		}
+
+		if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
+			return $this->fulfillment_rejection( 'method_unavailable', '所選的綠界物流方式目前未啟用。' );
+		}
+
+		$payment_method = $request['payment_method'];
+		$is_collection = 'ys_ec_cod' === $payment_method;
+		if ( $is_collection && true !== ( $descriptor['cod_capable'] ?? false ) ) {
+			return $this->fulfillment_rejection( 'collection_not_supported', 'The selected shipping method does not support collection.' );
+		}
+		if ( $request['zero_payment_order']
+			&& $is_collection ) {
+			return $this->fulfillment_rejection(
+				'zero_total_collection_mismatch',
+				'零元訂單不得沿用貨到付款的物流選擇，請改用非代收付款條件後重新選擇。'
+			);
+		}
+		$recipient_name = trim( sanitize_text_field( (string) ( $data['billing_name'] ?? '' ) ) );
+		$recipient_phone = trim( sanitize_text_field( (string) ( $data['billing_phone'] ?? '' ) ) );
+		$country = strtoupper( trim( sanitize_text_field( (string) ( $data['billing_country'] ?? 'TW' ) ) ) );
+
+		if ( 'CVS' === (string) $descriptor['logistics_type'] ) {
+			$inspection = EcpayStoreSelector::inspect_selection_authoritative( $data, $method_id, $payment_method );
+			if ( null !== $inspection['error'] ) {
+				return $this->fulfillment_rejection( 'store_selection_invalid', (string) $inspection['error'] );
+			}
+			$store = $inspection['store'];
+			$destination = [
+				'type'            => 'cvs',
+				'recipient_name'  => $recipient_name,
+				'recipient_phone' => $recipient_phone,
+				'country'         => $country,
+				'store_id'        => $store['store_id'],
+				'store_name'      => $store['store_name'],
+				'store_address'   => $store['store_address'],
+			];
+			$claim_type = 'store_selection';
+			$token      = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		} else {
+			$destination = [
+				'type'            => 'home',
+				'recipient_name'  => $recipient_name,
+				'recipient_phone' => $recipient_phone,
+				'country'         => $country,
+				'postcode'        => trim( sanitize_text_field( (string) ( $data['billing_postcode'] ?? '' ) ) ),
+				'state'           => trim( sanitize_text_field( (string) ( $data['billing_state'] ?? '' ) ) ),
+				'city'            => trim( sanitize_text_field( (string) ( $data['billing_city'] ?? '' ) ) ),
+				'district'        => trim( sanitize_text_field( (string) ( $data['billing_district'] ?? '' ) ) ),
+				'address'         => trim( sanitize_text_field( (string) ( $data['billing_address'] ?? '' ) ) ),
+				'address2'        => trim( sanitize_text_field( (string) ( $data['billing_address2'] ?? '' ) ) ),
+			];
+			$claim_type = 'home_selection';
+			$token      = '';
+		}
+
+		$temperature = match ( (string) ( $descriptor['temperature'] ?? '' ) ) {
+			EcpayShippingCatalog::TEMP_ROOM    => 'room',
+			EcpayShippingCatalog::TEMP_CHILLED => 'chilled',
+			EcpayShippingCatalog::TEMP_FROZEN  => 'frozen',
+			default                            => '',
+		};
+		if ( '' === $temperature ) {
+			return $this->fulfillment_rejection( 'invalid_method_contract', '物流方式缺少有效的溫層契約。' );
+		}
+
+		$selection = [
+			'provider_id' => 'ecpay',
+			'method_id'   => $method_id,
+			'destination' => $destination,
+			'service'     => [
+				'shipping_type'    => 'CVS' === (string) $descriptor['logistics_type'] ? 'cvs' : 'home',
+				'temperature_class' => $temperature,
+				'payment_method_id' => $payment_method,
+				'collection_mode'   => $is_collection ? 'collect' : 'prepaid',
+			],
+		];
+		$digest = self::fulfillment_selection_digest( $selection );
+		if ( '' === $digest ) {
+			return $this->fulfillment_rejection( 'selection_digest_failed', '無法建立物流收件資料摘要。' );
+		}
+
+		$weight_required = true === ( $descriptor['requires_goods_weight'] ?? false );
+		$default_weight = null;
+		if ( $weight_required ) {
+			$raw_default = trim( (string) Settings::shipping_method_option( $method_id, 'goods_weight', '' ) );
+			if ( preg_match( '/^(?:0|[1-9]\d*)(?:\.\d{1,3})?$/D', $raw_default )
+				&& (float) $raw_default > 0.0
+				&& (float) $raw_default <= 20.0 ) {
+				$default_weight = number_format( (float) $raw_default, 3, '.', '' );
+			}
+		}
+
+		$claim = [
+			'provider_id'      => 'ecpay',
+			'method_id'        => $method_id,
+			'type'             => $claim_type,
+			'token'            => $token,
+			'selection_digest' => $digest,
+		];
+		$claim['seal'] = self::fulfillment_claim_seal( $claim );
+		if ( '' === $claim['seal'] ) {
+			return $this->fulfillment_rejection( 'claim_seal_failed', 'Unable to seal the fulfillment claim.' );
+		}
+
+		return [
+			'handled'   => true,
+			'ok'        => true,
+			'code'      => '',
+			'message'   => '',
+			'selection' => $selection,
+			'weight_policy' => [
+				'required'          => $weight_required,
+				'default_weight_kg' => $default_weight,
+				'max_weight_kg'     => $weight_required ? '20.000' : null,
+			],
+			'claim' => $claim,
+		];
+	}
+
+	/** Atomically consume the typed claim and bind it to the exact resolved digest. */
+	public function claim_fulfillment_selection( $result, $claim, $data, $context = [] ): array {
+		if ( is_array( $result ) && true === ( $result['handled'] ?? false ) ) {
+			return $result;
+		}
+		if ( ! is_array( $claim ) || 'ecpay' !== (string) ( $claim['provider_id'] ?? '' ) ) {
+			return is_array( $result ) ? $result : [ 'handled' => false ];
+		}
+		$claim_keys = array_keys( $claim );
+		sort( $claim_keys );
+		$expected_claim_keys = [ 'method_id', 'provider_id', 'seal', 'selection_digest', 'token', 'type' ];
+		sort( $expected_claim_keys );
+		$received_seal = is_string( $claim['seal'] ?? null ) ? $claim['seal'] : '';
+		$expected_seal = self::fulfillment_claim_seal( $claim );
+		if ( $claim_keys !== $expected_claim_keys
+			|| '' === $received_seal
+			|| '' === $expected_seal
+			|| ! hash_equals( $expected_seal, $received_seal ) ) {
+			return [ 'handled' => true, 'ok' => false, 'code' => 'invalid_provider_claim', 'message' => 'The fulfillment claim envelope is invalid.', 'digest' => '' ];
+		}
+
+		$data    = is_array( $data ) ? $data : [];
+		$context = is_array( $context ) ? $context : [];
+		$request = $this->canonical_fulfillment_request( $data, $context );
+		if ( null === $request ) {
+			return [ 'handled' => true, 'ok' => false, 'code' => 'invalid_fulfillment_context', 'message' => '物流結帳條件無法驗證，請重新整理後再試。', 'digest' => '' ];
+		}
+		$data = $request['data'];
+		$claim_type = (string) ( $claim['type'] ?? '' );
+		if ( 'store_selection' === $claim_type ) {
+			$claim_token = is_string( $claim['token'] ?? null ) ? trim( $claim['token'] ) : '';
+			if ( '' === $claim_token ) {
+				return [ 'handled' => true, 'ok' => false, 'code' => 'invalid_provider_claim', 'message' => '物流收件憑證無法認領。', 'digest' => '' ];
+			}
+			// The opaque token captured during resolution is authoritative. Never
+			// consume a browser-swapped token from the later POST.
+			$data['ecpay_store_token'] = $claim_token;
+		}
+		$digest  = (string) ( $context['selection_digest'] ?? '' );
+		$resolved = $this->resolve_fulfillment_selection( [ 'handled' => false ], $data, $context );
+		if ( true !== ( $resolved['ok'] ?? false ) ) {
+			return [
+				'handled' => true,
+				'ok'      => false,
+				'code'    => (string) ( $resolved['code'] ?? 'claim_rejected' ),
+				'message' => (string) ( $resolved['message'] ?? '物流收件憑證無法認領。' ),
+				'digest'  => '',
+			];
+		}
+
+		$recomputed = is_array( $resolved['selection'] ?? null )
+			? self::fulfillment_selection_digest( $resolved['selection'] )
+			: '';
+		$resolved_claim = is_array( $resolved['claim'] ?? null ) ? $resolved['claim'] : [];
+		if ( '' === $digest
+			|| ! hash_equals( $digest, (string) ( $claim['selection_digest'] ?? '' ) )
+			|| ! hash_equals( $digest, $recomputed )
+			|| $claim !== $resolved_claim ) {
+			return [ 'handled' => true, 'ok' => false, 'code' => 'claim_digest_mismatch', 'message' => '物流收件憑證與訂單內容不一致。', 'digest' => '' ];
+		}
+
+		if ( 'store_selection' === $claim_type ) {
+			$claimed = EcpayStoreSelector::claim_selection_authoritative(
+				$data,
+				$request['method_id'],
+				$request['payment_method']
+			);
+			if ( null !== $claimed['error'] ) {
+				return [ 'handled' => true, 'ok' => false, 'code' => 'claim_rejected', 'message' => (string) $claimed['error'], 'digest' => '' ];
+			}
+		}
+
+		return [ 'handled' => true, 'ok' => true, 'code' => '', 'message' => '', 'digest' => $digest ];
+	}
+
+	/** Seal the opaque claim so token/type substitutions cannot preserve its selection digest. */
+	private static function fulfillment_claim_seal( array $claim ): string {
+		$provider_id = $claim['provider_id'] ?? null;
+		$method_id = $claim['method_id'] ?? null;
+		$type = $claim['type'] ?? null;
+		$token = $claim['token'] ?? null;
+		$selection_digest = $claim['selection_digest'] ?? null;
+		if ( ! is_string( $provider_id ) || ! is_string( $method_id ) || ! is_string( $type ) || ! is_string( $token )
+			|| ! is_string( $selection_digest ) || '' === $provider_id || '' === $method_id || '' === $type
+			|| 1 !== preg_match( '/^[a-f0-9]{64}$/D', $selection_digest ) ) {
+			return '';
+		}
+
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
+		$hash_key = (string) ( $credentials['hash_key'] ?? '' );
+		$hash_iv  = (string) ( $credentials['hash_iv'] ?? '' );
+		if ( '' === $hash_key || '' === $hash_iv ) {
+			return '';
+		}
+
+		$payload = wp_json_encode( [
+			'provider_id'      => $provider_id,
+			'method_id'        => $method_id,
+			'type'             => $type,
+			'token'            => $token,
+			'selection_digest' => $selection_digest,
+		], JSON_UNESCAPED_SLASHES );
+		if ( ! is_string( $payload ) ) {
+			return '';
+		}
+
+		$key = hash( 'sha256', $hash_key . "\0" . $hash_iv, true );
+		return hash_hmac( 'sha256', $payload, $key );
 	}
 
 	/**
@@ -205,45 +476,60 @@ final class Plugin {
 			return $claim['error'];
 		}
 
-		// 🔴 用**伺服器保存的**門市資料覆寫訂單。
-		//
-		// 驗證只比得了門市代號（那是唯一有權威副本可比的欄位）；名稱與地址是
-		// 前端從 localStorage 送上來的，代號對得上也照樣可以被改成任何字串——
-		// 而那兩個欄位會原樣出現在出貨單、通知信與客服畫面上。
-		if ( ! $this->apply_authoritative_store( (int) $order_id, $claim['store'] ) ) {
-			return '無法儲存已驗證的取貨門市，訂單已停止處理；請重新選擇門市後再試。';
-		}
-
 		return null;
 	}
 
+	private static function fulfillment_selection_digest( array $selection ): string {
+		$encoded = wp_json_encode( $selection, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		return is_string( $encoded ) ? hash( 'sha256', $encoded ) : '';
+	}
+
 	/**
-	 * @param array<string,string> $store
+	 * Replace browser-carried identity fields with the context Core read and
+	 * validated for this exact cart. Empty context remains a legacy-compatible
+	 * fallback for pre-contract callers.
+	 *
+	 * @return array{data:array<string,mixed>,method_id:string,payment_method:string,cart_scope:string,zero_payment_order:bool}|null
 	 */
-	private function apply_authoritative_store( int $order_id, array $store ): bool {
-		if ( $order_id <= 0 || [] === $store || '' === ( $store['cvs_store_id'] ?? '' ) ) {
-			return false;
+	private function canonical_fulfillment_request( array $data, array $context ): ?array {
+		$has_typed_context = array_key_exists( 'method_id', $context )
+			|| array_key_exists( 'payment_method', $context )
+			|| array_key_exists( 'cart_scope', $context )
+			|| array_key_exists( 'zero_payment_order', $context );
+
+		if ( $has_typed_context
+			&& ( ! is_string( $context['method_id'] ?? null )
+				|| ! is_string( $context['payment_method'] ?? null )
+				|| ! is_string( $context['cart_scope'] ?? null )
+				|| ! is_bool( $context['zero_payment_order'] ?? null ) ) ) {
+			return null;
 		}
 
-		if ( ! class_exists( YSOrder::class ) || ! method_exists( YSOrder::class, 'update' ) ) {
-			return false;
+		$method_id = trim( $has_typed_context ? $context['method_id'] : (string) ( $data['shipping_method'] ?? '' ) );
+		$payment_method = trim( $has_typed_context ? $context['payment_method'] : (string) ( $data['payment_method'] ?? '' ) );
+		$cart_scope = sanitize_key( $has_typed_context ? $context['cart_scope'] : (string) ( $data['cart_scope'] ?? 'default' ) );
+		if ( '' === $cart_scope || ! preg_match( '/^[a-z0-9_]{1,32}$/D', $cart_scope ) ) {
+			$cart_scope = 'default';
+		}
+		if ( '' === $method_id ) {
+			return null;
 		}
 
-		if ( false === YSOrder::update( $order_id, $store ) ) {
-			return false;
-		}
+		$data['shipping_method'] = $method_id;
+		$data['payment_method']  = $payment_method;
+		$data['cart_scope']      = $cart_scope;
 
-		$persisted = YSOrder::find( $order_id );
-		if ( ! $persisted ) {
-			return false;
-		}
-		foreach ( [ 'cvs_store_id', 'cvs_store_name', 'cvs_store_addr' ] as $column ) {
-			if ( (string) ( $persisted->{$column} ?? '' ) !== (string) ( $store[ $column ] ?? '' ) ) {
-				return false;
-			}
-		}
+		return [
+			'data'               => $data,
+			'method_id'          => $method_id,
+			'payment_method'     => $payment_method,
+			'cart_scope'         => $cart_scope,
+			'zero_payment_order' => $has_typed_context ? $context['zero_payment_order'] : false,
+		];
+	}
 
-		return true;
+	private function fulfillment_rejection( string $code, string $message ): array {
+		return [ 'handled' => true, 'ok' => false, 'code' => $code, 'message' => $message ];
 	}
 
 	private function is_cvs_method( string $shipping_method ): bool {
@@ -304,14 +590,14 @@ final class Plugin {
 	}
 
 	public function register_shipping_methods(): void {
-		if ( ! class_exists( YSShippingRegistry::class ) || ! $this->is_shipping_enabled() ) {
+		if ( ! class_exists( YSShippingRegistry::class ) ) {
 			return;
 		}
 
 		// 逐一由型錄註冊。加一個方式＝在型錄加一列，這裡不需要動——
 		// 「型錄加了、註冊忘了」在語法上不可能發生。
 		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
-			if ( ! $this->is_method_enabled( 'shipping', $method_id ) ) {
+			if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
 				continue;
 			}
 
@@ -343,6 +629,16 @@ final class Plugin {
 				'methods'             => 'POST',
 				'callback'            => [ $this, 'ecpay_map_url' ],
 				'permission_callback' => [ YSRestAuth::class, 'permission_customer_or_guest_write' ],
+			]
+		);
+
+		register_rest_route(
+			$namespace,
+			'/stores/ecpay/reauthorize',
+			[
+				'methods'             => 'POST',
+				'callback'            => [ $this, 'ecpay_reauthorize_saved_store' ],
+				'permission_callback' => [ YSRestAuth::class, 'permission_logged_in_write' ],
 			]
 		);
 
@@ -394,7 +690,7 @@ final class Plugin {
 	}
 
 	public function ecpay_map_url( \WP_REST_Request $request ): \WP_REST_Response {
-		if ( ! $this->is_shipping_enabled() ) {
+		if ( ! $this->has_enabled_shipping_methods() ) {
 			return YSRestResponder::error( 'provider_disabled', '綠界物流尚未啟用。' );
 		}
 
@@ -447,7 +743,7 @@ final class Plugin {
 			return $payment_rejection;
 		}
 
-		if ( ! $this->is_method_enabled( 'shipping', $shipping_id ) ) {
+		if ( ! ShippingMethodOperability::is_operable( $shipping_id ) ) {
 			return YSRestResponder::error( 'shipping_method_disabled', '綠界物流方式尚未啟用。' );
 		}
 
@@ -486,6 +782,38 @@ final class Plugin {
 		} else {
 			$response = YSRestResponder::success( 'store_result_ready', '', $claimed['store'] );
 		}
+		$response->header( 'Cache-Control', 'no-store, private' );
+		return $response;
+	}
+
+	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {
+		try {
+			$result = EcpaySavedStoreReauthorizer::reauthorize( YSRequestParser::params( $request ) );
+		} catch ( \Throwable $e ) {
+			$result = [
+				'success' => false,
+				'code'    => 'saved_store_reauthorization_failed',
+				'message' => '目前無法重新授權已儲存門市，請稍後再試。',
+				'status'  => 503,
+				'data'    => [],
+			];
+		}
+
+		if ( true === ( $result['success'] ?? false ) ) {
+			$response = YSRestResponder::success(
+				(string) ( $result['code'] ?? 'saved_store_reauthorized' ),
+				(string) ( $result['message'] ?? '' ),
+				is_array( $result['data'] ?? null ) ? $result['data'] : []
+			);
+		} else {
+			$response = YSRestResponder::error(
+				(string) ( $result['code'] ?? 'saved_store_reauthorization_failed' ),
+				(string) ( $result['message'] ?? '' ),
+				(int) ( $result['status'] ?? 400 ),
+				is_array( $result['data'] ?? null ) ? $result['data'] : []
+			);
+		}
+
 		$response->header( 'Cache-Control', 'no-store, private' );
 		return $response;
 	}
@@ -641,7 +969,7 @@ final class Plugin {
 			return $requester;
 		}
 
-		if ( $method instanceof EcpayShipping ) {
+		if ( $method instanceof EcpayShipping && ShippingMethodOperability::is_operable( $method->get_id() ) ) {
 			return new EcpayShippingRequester( $method );
 		}
 
@@ -694,14 +1022,6 @@ final class Plugin {
 		return $this->is_provider_enabled();
 	}
 
-	private function is_shipping_enabled(): bool {
-		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
-			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_capability_enabled( 'ys_ecpay', 'shipping', self::manifest() );
-		}
-
-		return $this->is_provider_enabled();
-	}
-
 	public function register_payment_reconcilers( $registry ): void {
 		if ( ! $this->has_enabled_payment_methods()
 			|| ! Settings::has_payment_credentials()
@@ -729,20 +1049,14 @@ final class Plugin {
 	}
 
 	private function has_enabled_shipping_methods(): bool {
-		if ( ! $this->is_shipping_enabled() ) {
-			return false;
-		}
-
-		foreach ( self::registered_shipping_ids() as $method_id ) {
-			if ( $this->is_method_enabled( 'shipping', $method_id ) ) {
-				return true;
-			}
-		}
-
-		return false;
+		return ShippingMethodOperability::has_operable_method();
 	}
 
 	private function is_method_enabled( string $domain, string $method_id ): bool {
+		if ( 'shipping' === $domain ) {
+			return ShippingMethodOperability::is_operable( $method_id );
+		}
+
 		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
 			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( $domain, $method_id, self::manifest() );
 		}
@@ -755,11 +1069,6 @@ final class Plugin {
 				'ys_ec_ecpay_barcode' => 'barcode',
 			];
 			return isset( $legacy_map[ $method_id ] ) && Settings::gateway_enabled( $legacy_map[ $method_id ] );
-		}
-
-		if ( 'shipping' === $domain ) {
-			$alias = EcpayShippingCatalog::id_to_alias()[ $method_id ] ?? '';
-			return '' !== $alias && Settings::shipping_enabled( $alias );
 		}
 
 		return false;

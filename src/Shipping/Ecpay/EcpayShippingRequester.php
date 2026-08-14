@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
 /**
  * 綠界物流建單／列印
@@ -32,10 +33,19 @@ final class EcpayShippingRequester {
 	 * @return array<string,mixed>
 	 */
 	public function create_order( array $order_data ): array {
-		$credentials = Settings::logistics_credentials();
+		if ( ! ShippingMethodOperability::is_operable( $this->method->get_id() ) ) {
+			return [
+				'success' => false,
+				'outcome' => 'provider_failed',
+				'message' => 'ECPay shipping method is not operable.',
+			];
+		}
+
+		$method_id   = $this->method->get_id();
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
 		$fields      = $this->build_create_fields( $order_data, $credentials );
 
-		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create' ), $fields );
+		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
 		if ( ! $result['success'] ) {
 			// 🔴 傳輸層說不出「對方有沒有收到」，因此一律往上傳 indeterminate。
 			// 缺 outcome 時也當 indeterminate——缺欄位不是「明確失敗」。
@@ -57,8 +67,15 @@ final class EcpayShippingRequester {
 		// **根本沒建立**的單。但這不是第三方送來的訊息，是我們自己這一次 HTTP
 		// 的直接回應，前綴 `0` 就是綠界明說「沒建立」。
 		//
-		// 因此：前綴為 `0` ＝ 明確拒絕（可以安全地開下一次）。
-		if ( '0' === (string) ( $params['_status_prefix'] ?? '' ) ) {
+		// 因此：前綴不是 `1` 的**數字前綴**＝明確拒絕（可以安全地開下一次）。
+		//
+		// 🔴 v0.2.13：stage 實測到第二種拒絕形狀——`10500040|商品金額範圍為1~20000元`、
+		// `10500057|該收件人地址…`（數字**錯誤碼**開頭，同樣無簽章、同樣是我們這一次
+		// HTTP 的直接回應）。v0.2.12 只認 `0|`，錯誤碼開頭的會落到 indeterminate：
+		// 安全（不會重複建單）但把常見的欄位錯誤都變成人工裁決。
+		// 成功**只有** `1|`；完全沒有數字前綴的形狀維持 indeterminate（不知道≠沒建立）。
+		$status_prefix = (string) ( $params['_status_prefix'] ?? '' );
+		if ( '' !== $status_prefix && '1' !== $status_prefix ) {
 			return [
 				'success'           => false,
 				'outcome'           => 'provider_failed',
@@ -311,7 +328,11 @@ final class EcpayShippingRequester {
 	 * @throws \RuntimeException 任何一項不合格
 	 */
 	public function preflight( array $order_data ): void {
-		$this->build_create_fields( $order_data, Settings::logistics_credentials() );
+		if ( ! ShippingMethodOperability::is_operable( $this->method->get_id() ) ) {
+			throw new \RuntimeException( 'ECPay shipping method is not operable.' );
+		}
+
+		$this->build_create_fields( $order_data, Settings::logistics_credentials_for_method( $this->method->get_id() ) );
 	}
 
 	/**
@@ -337,6 +358,20 @@ final class EcpayShippingRequester {
 		}
 
 		$payment_method = trim( (string) $order_data['payment_method'] );
+		if ( array_key_exists( 'collection_mode', $order_data ) ) {
+			$collection_mode = is_string( $order_data['collection_mode'] )
+				? strtolower( trim( $order_data['collection_mode'] ) )
+				: '';
+			if ( ! in_array( $collection_mode, [ 'prepaid', 'collect' ], true )
+				|| ( 'collect' === $collection_mode && self::COD_GATEWAY_ID !== $payment_method )
+				|| ( 'prepaid' === $collection_mode && self::COD_GATEWAY_ID === $payment_method ) ) {
+				throw new \RuntimeException( 'The immutable collection mode does not match the bound payment method.' );
+			}
+			if ( 'collect' === $collection_mode && ! $this->method->supports_cod() ) {
+				throw new \RuntimeException( 'The selected shipping method does not support collection.' );
+			}
+			return 'collect' === $collection_mode;
+		}
 		if ( self::COD_GATEWAY_ID !== $payment_method ) {
 			return false;
 		}
@@ -513,57 +548,196 @@ final class EcpayShippingRequester {
 	}
 
 	/**
-	 * 取消物流訂單
+	 * Cancel a provider logistics order when an exact method contract exists.
 	 *
-	 * 🔴 本版**不實作**綠界的取消 API，因此明確回 `unsupported`——而不是 `false`。
-	 *
-	 * 差別在呼叫端：`false` 會被讀成「取消失敗」或「沒取消」，而重新取單／換門市
-	 * 的流程在那之後照樣把本機標成已取消再建一張新的；綠界那邊的舊單還活著，
-	 * 結果是同一張訂單出兩次貨。`unsupported` 讓核心把整條路擋掉。
-	 *
-	 * 綠界的取消是逐通路的獨立端點（C2C 7-ELEVEN 走 `/Express/CancelC2COrder`，
-	 * B2C 走異動 API），且需要各自的參數與實測，不在本批範圍。
+	 * Only UNIMARTC2C has a documented cancellation endpoint.  Every other
+	 * method returns `unsupported` before network I/O.  A request that could
+	 * have reached the provider but lacks an exact terminal response remains
+	 * indeterminate so the core keeps the order-level dispatch lock.
 	 *
 	 * @param array<string,mixed> $context
 	 * @return array<string,mixed>
 	 */
 	public function cancel_order( array $context = [] ): array {
-		unset( $context );
+		$method_id = $this->method->get_id();
+		$spec      = EcpayShippingCatalog::cancel_spec( $method_id );
+		if ( null === $spec ) {
+			return [
+				'success' => false,
+				'outcome' => 'unsupported',
+				'message' => 'This ECPay shipping method has no provider cancellation API.',
+			];
+		}
+
+		if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
+			return $this->indeterminate_result( 'ECPay shipping method is not operable.' );
+		}
+
+		$provider_trade_no = trim( (string) ( $context['provider_trade_no'] ?? '' ) );
+		$cvs_payment_no    = trim( (string) ( $context['cvs_payment_no'] ?? '' ) );
+		$cvs_validation_no = trim( (string) ( $context['cvs_validation_no'] ?? '' ) );
+		$merchant_trade_no = trim( (string) ( $context['merchant_trade_no'] ?? '' ) );
+		$bound_provider     = trim( (string) ( $context['provider'] ?? '' ) );
+		$bound_method       = trim( (string) ( $context['shipping_method'] ?? '' ) );
+		$bound_subtype      = strtoupper( trim( (string) ( $context['logistics_subtype'] ?? '' ) ) );
+
+		if ( '' === $provider_trade_no
+			|| '' === $cvs_payment_no
+			|| '' === $cvs_validation_no
+			|| '' === $merchant_trade_no
+			|| ! hash_equals( $this->method->get_provider(), $bound_provider )
+			|| ! hash_equals( $method_id, $bound_method )
+			|| ! hash_equals( $spec['logistics_subtype'], $bound_subtype ) ) {
+			return $this->indeterminate_result( 'ECPay cancellation is missing an exact durable label identity.' );
+		}
+
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
+		$fields      = [
+			'MerchantID'         => $credentials['merchant_id'],
+			'AllPayLogisticsID'  => $provider_trade_no,
+			'CVSPaymentNo'       => $cvs_payment_no,
+			'CVSValidationNo'    => $cvs_validation_no,
+			'PlatformID'         => '',
+		];
+		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		$result = $this->http->post( Settings::logistics_endpoint( $spec['path'], $method_id ), $fields );
+		if ( ! $result['success'] ) {
+			return $this->indeterminate_result( (string) $result['message'], (string) $result['body'] );
+		}
+
+		$body = (string) $result['body'];
+		if ( '1|OK' === $body ) {
+			return [
+				'success'      => true,
+				'outcome'      => 'terminal_cancelled',
+				'message'      => 'ECPay confirmed that the logistics order was cancelled.',
+				'raw_response' => $body,
+			];
+		}
+
+		if ( str_starts_with( $body, '0|' ) ) {
+			return [
+				'success'      => false,
+				'outcome'      => 'terminal_not_cancelled',
+				'message'      => substr( $body, 2 ),
+				'raw_response' => $body,
+			];
+		}
+
+		return $this->indeterminate_result( 'ECPay returned an ambiguous cancellation response.', $body );
+	}
+
+	/**
+	 * Query the provider by logistics ID and bind the signed response back to
+	 * both durable identifiers.  Query V5 declares AllPayLogisticsID and
+	 * MerchantTradeNo mutually exclusive, so the local trade number must never
+	 * appear on this request wire even though it remains mandatory for response
+	 * correlation.
+	 *
+	 * @param array<string,mixed> $context
+	 * @return array<string,mixed>
+	 */
+	public function query_status( string $tracking_number, array $context = [] ): array {
+		$method_id  = $this->method->get_id();
+		$descriptor = EcpayShippingCatalog::get( $method_id );
+		if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
+			return $this->indeterminate_result( 'ECPay shipping method is not operable.' );
+		}
+
+		$provider_trade_no = trim( $tracking_number );
+		$merchant_trade_no = trim( (string) ( $context['merchant_trade_no'] ?? '' ) );
+		$bound_provider     = trim( (string) ( $context['provider'] ?? '' ) );
+		$bound_method       = trim( (string) ( $context['shipping_method'] ?? '' ) );
+		$bound_subtype      = strtoupper( trim( (string) ( $context['logistics_subtype'] ?? '' ) ) );
+		$expected_subtype   = strtoupper( trim( (string) ( $descriptor['logistics_subtype'] ?? '' ) ) );
+		$expected_type      = strtoupper( trim( (string) ( $descriptor['logistics_type'] ?? '' ) ) ) . '_' . $expected_subtype;
+		if ( ! is_array( $descriptor )
+			|| '' === $provider_trade_no
+			|| '' === $merchant_trade_no
+			|| '' === $expected_subtype
+			|| ! hash_equals( $this->method->get_provider(), $bound_provider )
+			|| ! hash_equals( $method_id, $bound_method )
+			|| ! hash_equals( $expected_subtype, $bound_subtype ) ) {
+			return $this->indeterminate_result( 'ECPay logistics query requires an exact durable provider, method, subtype, and trade identity.' );
+		}
+
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
+		$fields      = [
+			'MerchantID'        => $credentials['merchant_id'],
+			'AllPayLogisticsID' => $provider_trade_no,
+			'TimeStamp'         => (string) time(),
+			'PlatformID'        => '',
+		];
+		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		$result = $this->http->post( Settings::logistics_endpoint( EcpayShippingCatalog::query_path(), $method_id ), $fields );
+		if ( ! $result['success'] ) {
+			return $this->indeterminate_result( (string) $result['message'], (string) $result['body'] );
+		}
+
+		$params = (array) $result['params'];
+		if ( ! CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'md5' ) ) {
+			return $this->indeterminate_result( 'ECPay logistics query response signature verification failed.', (string) $result['body'] );
+		}
+
+		$returned_merchant_id = (string) ( $params['MerchantID'] ?? '' );
+		$returned_provider_id = (string) ( $params['AllPayLogisticsID'] ?? '' );
+		$returned_trade_no    = (string) ( $params['MerchantTradeNo'] ?? '' );
+		$returned_type        = strtoupper( trim( (string) ( $params['LogisticsType'] ?? '' ) ) );
+		$returned_status      = trim( (string) ( $params['LogisticsStatus'] ?? '' ) );
+		if ( '' === $returned_merchant_id
+			|| '' === $returned_provider_id
+			|| '' === $returned_trade_no
+			|| '' === $returned_status
+			|| ! hash_equals( $credentials['merchant_id'], $returned_merchant_id )
+			|| ! hash_equals( $provider_trade_no, $returned_provider_id )
+			|| ! hash_equals( $merchant_trade_no, $returned_trade_no )
+			|| ! hash_equals( $expected_type, $returned_type ) ) {
+			return $this->indeterminate_result( 'ECPay logistics query response identity does not match this request.', (string) $result['body'] );
+		}
 
 		return [
-			'success' => false,
-			'outcome' => 'unsupported',
-			'message' => '本版尚未實作綠界物流單取消，請於綠界後台操作後再回系統處理。',
+			'success'      => true,
+			'outcome'      => 'confirmed',
+			'message'      => (string) ( $params['RtnMsg'] ?? '' ),
+			'data'         => $params,
+			'raw_response' => (string) $result['body'],
 		];
 	}
 
 	/**
-	 * @return array<string,mixed>
+	 * @return array{success:false,outcome:string,message:string,raw_response:string}
 	 */
-	public function query_status( string $tracking_number, array $context = [] ): array {
-		unset( $tracking_number, $context );
-		return [ 'success' => false, 'message' => 'ECPay logistics status query is not implemented.' ];
+	private function indeterminate_result( string $message, string $raw_response = '' ): array {
+		return [
+			'success'      => false,
+			'outcome'      => 'indeterminate',
+			'message'      => $message,
+			'raw_response' => $raw_response,
+		];
 	}
 
 	/**
 	 * 產生託運單列印網址。
 	 *
 	 * 🔴 C2C 與 B2C／宅配打的是**不同的端點**，需要的欄位也不同（C2C 要寄貨編號，
-	 * 7-ELEVEN 還要驗證碼），而且 C2C 一次只印一張。舊版一律打 B2C 那支，C2C 因此
-	 * 印不出單。
+	 * 7-ELEVEN 還要驗證碼）。專屬端點與批次能力是獨立契約：FAMIC2C／
+	 * UNIMARTC2C／HILIFEC2C 都能以各欄等長的逗號清單批次。
 	 *
 	 * @param string|array<int,mixed>|array<int,array<string,string>> $provider_trade_no
 	 * @param array<string,mixed>                                    $context
 	 */
 	public function get_print_url( $provider_trade_no, array $context = [] ): string {
 		$spec = EcpayShippingCatalog::print_spec( $this->method->get_id() );
-		if ( null === $spec || ! Settings::has_logistics_credentials() ) {
+		if ( null === $spec || ! ShippingMethodOperability::is_operable( $this->method->get_id() ) ) {
 			return '';
 		}
 
 		// 核心會以 context 附帶完整 label 列（含寄貨編號／驗證碼）——C2C 只有
 		// 這條路印得出來。沒有 context 時退回舊行為（只有物流編號）。
-		$source = isset( $context['labels'] ) && is_array( $context['labels'] ) && [] !== $context['labels']
+		$has_bound_labels = isset( $context['labels'] ) && is_array( $context['labels'] ) && [] !== $context['labels'];
+		$source = $has_bound_labels
 			? $context['labels']
 			: $provider_trade_no;
 
@@ -572,39 +746,68 @@ final class EcpayShippingRequester {
 			return '';
 		}
 
-		$credentials = Settings::logistics_credentials();
+		$method_id   = $this->method->get_id();
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
 		$fields      = [ 'MerchantID' => $credentials['merchant_id'] ];
 
-		if ( $spec['batch'] ) {
-			$ids = array_values( array_filter( array_map(
-				static fn( array $row ): string => (string) ( $row['AllPayLogisticsID'] ?? '' ),
-				$rows
-			) ) );
-			if ( [] === $ids ) {
+		if ( count( $rows ) > 1 && ! $spec['supports_batch'] ) {
+			return '';
+		}
+		if ( is_int( $spec['max_batch'] ) && count( $rows ) > $spec['max_batch'] ) {
+			return '';
+		}
+
+		$expected_method  = $this->method->get_id();
+		$expected_subtype = $this->method->get_logistics_subtype();
+		foreach ( $rows as $row ) {
+			$id = trim( (string) ( $row['AllPayLogisticsID'] ?? '' ) );
+			if ( '' === $id || str_contains( $id, ',' ) ) {
 				return '';
 			}
+			if ( $has_bound_labels ) {
+				$row_method  = (string) ( $row['ShippingMethod'] ?? '' );
+				$row_subtype = (string) ( $row['LogisticsSubType'] ?? '' );
+				if ( $expected_method !== $row_method
+					|| ( '' !== $row_subtype && $expected_subtype !== $row_subtype ) ) {
+					return '';
+				}
+			}
+		}
+
+		if ( 'generic' === $spec['endpoint_kind'] ) {
+			$ids = array_values( array_map(
+				static fn( array $row ): string => (string) ( $row['AllPayLogisticsID'] ?? '' ),
+				$rows
+			) );
 
 			$fields['AllPayLogisticsID'] = implode( ',', $ids );
 			$fields['PlatformID']        = '';
 			$fields['PrintMode']         = '1';
-		} else {
-			// C2C：一次一張，且缺任何一個必要欄位就不要送——送出去只會拿到
-			// 一頁綠界的錯誤畫面，賣家還以為是自己網路有問題。
-			$row = $rows[0];
+		} elseif ( 'specific' === $spec['endpoint_kind'] ) {
+			// C2C 專屬端點：每一列的每一個必要欄位都要先驗完。
+			// 批次時各欄各自串成逗號清單，因為是從同一組 rows 建立，
+			// 數量必然相同；任一格空白就整批 fail-closed，不能只印 row0。
 			foreach ( $spec['fields'] as $field ) {
-				$value = trim( (string) ( $row[ $field ] ?? '' ) );
-				if ( '' === $value ) {
-					return '';
+				$values = [];
+				foreach ( $rows as $row ) {
+					$value = trim( (string) ( $row[ $field ] ?? '' ) );
+					if ( '' === $value || str_contains( $value, ',' ) ) {
+						return '';
+					}
+					$values[] = $value;
 				}
-				$fields[ $field ] = $value;
+
+				$fields[ $field ] = $spec['supports_batch'] ? implode( ',', $values ) : $values[0];
 			}
+		} else {
+			return '';
 		}
 
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 
 		$key = wp_generate_password( 24, false, false );
 		$stored = set_transient( 'ys_ec_ecpay_print_' . $key, [
-			'api_url'   => Settings::logistics_endpoint( $spec['path'] ),
+			'api_url'   => Settings::logistics_endpoint( $spec['path'], $method_id ),
 			'fields'    => $fields,
 			'method_id' => $this->method->get_id(),
 		], 10 * MINUTE_IN_SECONDS );
@@ -640,18 +843,23 @@ final class EcpayShippingRequester {
 					'AllPayLogisticsID' => sanitize_text_field( (string) ( $item['provider_trade_no'] ?? $item['AllPayLogisticsID'] ?? '' ) ),
 					'CVSPaymentNo'      => sanitize_text_field( (string) ( $item['cvs_payment_no'] ?? $item['CVSPaymentNo'] ?? '' ) ),
 					'CVSValidationNo'   => sanitize_text_field( (string) ( $item['cvs_validation_no'] ?? $item['CVSValidationNo'] ?? '' ) ),
+					'ShippingMethod'    => sanitize_key( (string) ( $item['shipping_method'] ?? $item['ShippingMethod'] ?? '' ) ),
+					'LogisticsSubType'  => strtoupper( trim( sanitize_text_field( (string) ( $item['logistics_subtype'] ?? $item['LogisticsSubType'] ?? '' ) ) ) ),
 				];
 			} else {
 				$row = [
 					'AllPayLogisticsID' => sanitize_text_field( (string) $item ),
 					'CVSPaymentNo'      => '',
 					'CVSValidationNo'   => '',
+					'ShippingMethod'    => '',
+					'LogisticsSubType'  => '',
 				];
 			}
 
-			if ( '' !== $row['AllPayLogisticsID'] ) {
-				$rows[] = $row;
+			if ( '' === $row['AllPayLogisticsID'] ) {
+				return [];
 			}
+			$rows[] = $row;
 		}
 
 		return $rows;

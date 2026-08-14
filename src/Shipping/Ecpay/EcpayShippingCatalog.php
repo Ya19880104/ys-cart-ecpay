@@ -24,18 +24,18 @@
  * 範例，兩者列出的 `LogisticsSubType` 全集是：
  *
  *   B2C：FAMI / UNIMART / UNIMARTFREEZE / HILIFE
- *   C2C：FAMIC2C / UNIMARTC2C / HILIFEC2C / OKMARTC2C
+ *   C2C：FAMIC2C / UNIMARTC2C / HILIFEC2C
  *   宅配：TCAT / POST
  *
- * **`UNIMARTFREEZEC2C` 不在其中**——整份官方鏡像（guides＋references＋SDK）
- * 搜不到任何 `FREEZEC2C` 字樣。也就是說 7-ELEVEN 冷凍**只有 B2C**，沒有 C2C。
+ * **`UNIMARTFREEZEC2C` 不在其中**——官方目前只列 7-ELEVEN 冷凍 B2C，
+ * 沒有冷凍 C2C。`OKMARTC2C` 則已於 2026-07-01 終止服務，也不屬於
+ * 這份可註冊型錄。
  *
  * 先前的實作自創了這個 subtype。自創 subtype 的後果不是「少一個選項」，而是
  * 業主開了它、顧客選得到、送單時綠界直接回「找不到加密金鑰，請確認是否有申請
  * 開通此物流方式」——與 B2C/C2C 用錯 subtype 的症狀一模一樣，極難查。
  *
  * 因此本型錄只收官方載明的方式。7-ELEVEN 冷凍 C2C 需要綠界正式書面確認後才能加。
- * （另：官方尚有 `OKMARTC2C`（OK 超商，僅 C2C），本批未在需求範圍內，故未收。）
  * ─────────────────────────────────────────────────────────────────────────
  *
  * @package YangSheep\YSCartEcpay
@@ -95,11 +95,9 @@ final class EcpayShippingCatalog {
 	 * - `enabled_option`             啟用開關的設定 key。
 	 * - `class`                      物流方式類別（每個方式一個獨立類別）。
 	 *
-	 * 🔴 `cod_capable` 的保守取值：綠界官方文件**沒有**逐 subtype 的代收支援矩陣，
-	 * 只載明 `IsCollection` 這個開關與 20,000 元上限。本 session 紀律禁止使用憑證／
-	 * 連線實測，因此 7-ELEVEN 冷凍與中華郵政採 fail-closed（false）——寧可少開一個
-	 * 能力，也不要讓業主開了代收卻在送單當下被綠界打回。這一項列在 #3S 的
-	 * 「未驗 official-provider gates」，正式開通前必須以綠界合約內容確認後再放行。
+	 * 🔴 `cod_capable` 只表示供應商契約允許代收，不是這張訂單要不要代收。
+	 * UNIMARTFREEZE 的當前官方契約包含代收，因此能力為 true；代收與否仍由
+	 * 訂單的最終付款方式決定。中華郵政不支援代收，維持 fail-closed。
 	 *
 	 * @var array<string,array<string,mixed>>
 	 */
@@ -235,7 +233,7 @@ final class EcpayShippingCatalog {
 			'temperature'                => self::TEMP_FROZEN,
 			'logistics_type'             => 'CVS',
 			'logistics_subtype'          => 'UNIMARTFREEZE',
-			'cod_capable'                => false,
+			'cod_capable'                => true,
 			'requires_store'             => true,
 			'supports_return_store'      => false,
 			'return_store_option'        => '',
@@ -318,8 +316,9 @@ final class EcpayShippingCatalog {
 			'requires_collection_amount' => false,
 			// 🔴 綠界官方明載：LogisticsSubType=POST 時 GoodsWeight 必填（上限 20 公斤）。
 			'requires_goods_weight'      => true,
-			// 🔴 綠界官方明載：中華郵政請忽略 Temperature／Distance／Specification／
-			// ScheduledPickupTime／ScheduledDeliveryTime。舊版對郵局照送這些欄位。
+			// POST 的 Temperature 可省略（官方預設 0001；若送也只能 0001）。
+			// Distance／Specification／ScheduledPickupTime／ScheduledDeliveryTime 請忽略；
+			// 本地選擇省略整組宅配條件，採官方常溫預設。
 			'sends_home_conditions'      => false,
 			'required_response_fields'   => [ 'AllPayLogisticsID' ],
 			'enabled_option'             => 'ys_ec_ecpay_ship_post_enabled',
@@ -337,12 +336,49 @@ final class EcpayShippingCatalog {
 	 * 這也是為什麼核心必須把 `CVSPaymentNo`／`CVSValidationNo` 落盤——它們不是
 	 * 「追蹤碼的一種」，是賣家把貨交出去的唯一憑據。
 	 *
-	 * @var array<string,string>
+	 * `endpoint_kind` 與 `supports_batch` 是兩個獨立維度：專屬 C2C 端點
+	 * 不等於只能單筆。FAMIC2C 與 UNIMARTC2C 專屬端點都支援各欄等長的
+	 * 逗號批次；三支專屬 C2C 端點都以 100 筆作為單次批次上限。
+	 *
+	 * @var array<string,array{path:string,supports_batch:bool,max_batch:int,fields:array<int,string>}>
 	 */
-	private const PRINT_PATHS = [
-		'FAMIC2C'    => '/Express/PrintFAMIC2COrderInfo',
-		'UNIMARTC2C' => '/Express/PrintUniMartC2COrderInfo',
-		'HILIFEC2C'  => '/Express/PrintHILIFEC2COrderInfo',
+	private const PRINT_SPECIFIC = [
+		'FAMIC2C'    => [
+			'path'           => '/Express/PrintFAMIC2COrderInfo',
+			'supports_batch' => true,
+			'max_batch'      => 100,
+			'fields'         => [ 'AllPayLogisticsID', 'CVSPaymentNo' ],
+		],
+		'UNIMARTC2C' => [
+			'path'           => '/Express/PrintUniMartC2COrderInfo',
+			'supports_batch' => true,
+			'max_batch'      => 100,
+			'fields'         => [ 'AllPayLogisticsID', 'CVSPaymentNo', 'CVSValidationNo' ],
+		],
+		'HILIFEC2C'  => [
+			'path'           => '/Express/PrintHILIFEC2COrderInfo',
+			'supports_batch' => true,
+			'max_batch'      => 100,
+			'fields'         => [ 'AllPayLogisticsID', 'CVSPaymentNo' ],
+		],
+	];
+
+	/** All current logistics methods share the signed V5 query endpoint. */
+	private const QUERY_PATH = '/Helper/QueryLogisticsTradeInfo/V5';
+
+	/**
+	 * Provider-confirmed cancellation contracts, keyed by the exact registered
+	 * shipping method.  Do not infer cancellation support from `channel=c2c`:
+	 * the legacy API below is documented only for 7-ELEVEN C2C.
+	 *
+	 * @var array<string,array{path:string,logistics_subtype:string,fields:array<int,string>}>
+	 */
+	private const CANCEL_SPECIFIC = [
+		'ys_ec_ecpay_ship_unimart_c2c' => [
+			'path'                 => '/Express/CancelC2COrder',
+			'logistics_subtype'    => 'UNIMARTC2C',
+			'fields'               => [ 'AllPayLogisticsID', 'CVSPaymentNo', 'CVSValidationNo' ],
+		],
 	];
 
 	/** B2C／宅配共用的列印端點（可一次帶多筆，逗號分隔）。 */
@@ -351,7 +387,7 @@ final class EcpayShippingCatalog {
 	/**
 	 * 取得列印契約：端點、可否批次、需要哪些欄位。
 	 *
-	 * @return array{path:string,batch:bool,fields:array<int,string>}|null
+	 * @return array{path:string,endpoint_kind:string,supports_batch:bool,max_batch:?int,fields:array<int,string>}|null
 	 */
 	public static function print_spec( string $method_id ): ?array {
 		$descriptor = self::get( $method_id );
@@ -360,24 +396,81 @@ final class EcpayShippingCatalog {
 		}
 
 		$subtype = (string) $descriptor['logistics_subtype'];
-		if ( ! isset( self::PRINT_PATHS[ $subtype ] ) ) {
+		if ( ! isset( self::PRINT_SPECIFIC[ $subtype ] ) ) {
 			return [
-				'path'   => self::PRINT_DEFAULT_PATH,
-				'batch'  => true,
-				'fields' => [ 'AllPayLogisticsID' ],
+				'path'           => self::PRINT_DEFAULT_PATH,
+				'endpoint_kind'  => 'generic',
+				'supports_batch' => true,
+				'max_batch'      => null,
+				'fields'         => [ 'AllPayLogisticsID' ],
 			];
 		}
 
-		$fields = [ 'AllPayLogisticsID', 'CVSPaymentNo' ];
-		if ( in_array( 'CVSValidationNo', (array) $descriptor['required_response_fields'], true ) ) {
-			$fields[] = 'CVSValidationNo';
-		}
+		$specific = self::PRINT_SPECIFIC[ $subtype ];
 
 		return [
-			'path'   => self::PRINT_PATHS[ $subtype ],
-			'batch'  => false,
-			'fields' => $fields,
+			'path'           => $specific['path'],
+			'endpoint_kind'  => 'specific',
+			'supports_batch' => $specific['supports_batch'],
+			'max_batch'      => $specific['max_batch'],
+			'fields'         => $specific['fields'],
 		];
+	}
+
+	/** Common signed logistics query endpoint. */
+	public static function query_path(): string {
+		return self::QUERY_PATH;
+	}
+
+	/**
+	 * Map the current official ECPay LogisticsStatus table to Core's canonical
+	 * pipeline states. Only codes whose meaning is unambiguous across the 11
+	 * supported methods are mapped; return-started/request-pending and unknown
+	 * codes deliberately remain advisory.
+	 */
+	public static function pipeline_state_for_logistics_status( string $status ): ?string {
+		return match ( trim( $status ) ) {
+			'300', '310', '311' => 'preparing',
+			'3001', '3006', '3015', '3120', '3301', '3312', '3313' => 'in_transit',
+			'2063', '2073', '3018', '3029', '2098' => 'arrived_at_store',
+			'2067', '3022', '3003', '3307', '3308', '3309' => 'delivered',
+			'2076', '2078', '3025', '3019', '2044', '2070', '3023', '5008', '3310' => 'returned',
+			default => null,
+		};
+	}
+
+	/** Preserve Core's durable shipping-label vocabulary at provider callbacks. */
+	public static function label_status_for_pipeline_state( string $pipeline_state ): ?string {
+		return match ( trim( $pipeline_state ) ) {
+			'preparing'        => 'label_created',
+			'in_transit'       => 'in_transit',
+			'arrived_at_store' => 'arrived',
+			'delivered'        => 'delivered',
+			'returned'         => 'returned',
+			'failed'           => 'failed',
+			default            => null,
+		};
+	}
+
+	/**
+	 * Return the exact cancellation contract for a registered method.
+	 *
+	 * The subtype is re-bound to the method descriptor before returning the
+	 * contract.  A future descriptor rename therefore fails closed instead of
+	 * accidentally enabling this endpoint for a different service.
+	 *
+	 * @return array{path:string,logistics_subtype:string,fields:array<int,string>}|null
+	 */
+	public static function cancel_spec( string $method_id ): ?array {
+		$descriptor = self::get( $method_id );
+		$spec       = self::CANCEL_SPECIFIC[ $method_id ] ?? null;
+		if ( null === $descriptor || null === $spec ) {
+			return null;
+		}
+
+		return $spec['logistics_subtype'] === (string) $descriptor['logistics_subtype']
+			? $spec
+			: null;
 	}
 
 	/**
@@ -420,6 +513,32 @@ final class EcpayShippingCatalog {
 		}
 
 		return null;
+	}
+
+	/**
+	 * Resolve a provider subtype to one credential channel. Duplicate subtype
+	 * descriptors (the three TCAT temperatures) are accepted only when every
+	 * descriptor belongs to the same channel.
+	 */
+	public static function channel_for_subtype( string $subtype ): string {
+		$subtype = strtoupper( trim( $subtype ) );
+		if ( '' === $subtype ) {
+			return '';
+		}
+
+		$channel = '';
+		foreach ( self::METHODS as $descriptor ) {
+			if ( $subtype !== strtoupper( (string) ( $descriptor['logistics_subtype'] ?? '' ) ) ) {
+				continue;
+			}
+			$current = (string) ( $descriptor['channel'] ?? '' );
+			if ( '' === $current || ( '' !== $channel && $channel !== $current ) ) {
+				return '';
+			}
+			$channel = $current;
+		}
+
+		return $channel;
 	}
 
 	/**

@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\Ecommerce\YSEcommerce;
+use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 
 final class Settings {
@@ -24,6 +25,22 @@ final class Settings {
 		'merchant_id' => 'ys_ec_ecpay_logistics_merchant_id',
 		'hash_key'    => 'ys_ec_ecpay_logistics_hash_key',
 		'hash_iv'     => 'ys_ec_ecpay_logistics_hash_iv',
+	];
+
+	/** B2C convenience-store and home-delivery credentials. */
+	public const LOGISTICS_B2C_HOME_KEYS = [
+		'test_mode'   => 'ys_ec_ecpay_logistics_b2c_home_test_mode',
+		'merchant_id' => 'ys_ec_ecpay_logistics_b2c_home_merchant_id',
+		'hash_key'    => 'ys_ec_ecpay_logistics_b2c_home_hash_key',
+		'hash_iv'     => 'ys_ec_ecpay_logistics_b2c_home_hash_iv',
+	];
+
+	/** C2C convenience-store credentials. */
+	public const LOGISTICS_C2C_KEYS = [
+		'test_mode'   => 'ys_ec_ecpay_logistics_c2c_test_mode',
+		'merchant_id' => 'ys_ec_ecpay_logistics_c2c_merchant_id',
+		'hash_key'    => 'ys_ec_ecpay_logistics_c2c_hash_key',
+		'hash_iv'     => 'ys_ec_ecpay_logistics_c2c_hash_iv',
 	];
 
 	/**
@@ -96,7 +113,83 @@ final class Settings {
 	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
 	 */
 	public static function logistics_credentials(): array {
-		return self::credentials( self::LOGISTICS_KEYS );
+		$b2c = self::logistics_credentials_for_channel( EcpayShippingCatalog::CHANNEL_B2C );
+		$c2c = self::logistics_credentials_for_channel( EcpayShippingCatalog::CHANNEL_C2C );
+		$b2c_ok = self::credentials_complete( $b2c );
+		$c2c_ok = self::credentials_complete( $c2c );
+		if ( $b2c_ok && ! $c2c_ok ) {
+			return $b2c;
+		}
+		if ( $c2c_ok && ! $b2c_ok ) {
+			return $c2c;
+		}
+
+		return self::empty_credentials();
+	}
+
+	/**
+	 * Resolve the credential family from the catalog entry for one exact method.
+	 *
+	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
+	 */
+	public static function logistics_credentials_for_method( string $method_id ): array {
+		$descriptor = EcpayShippingCatalog::get( trim( $method_id ) );
+		if ( null === $descriptor ) {
+			return self::empty_credentials();
+		}
+
+		return self::logistics_credentials_for_channel( (string) ( $descriptor['channel'] ?? '' ) );
+	}
+
+	/**
+	 * Resolve credentials for an exact provider catalog channel.
+	 * B2C and HOME intentionally share one account group; C2C never does.
+	 *
+	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
+	 */
+	public static function logistics_credentials_for_channel( string $channel ): array {
+		$family = self::credential_family_for_channel( $channel );
+		if ( '' === $family ) {
+			return self::empty_credentials();
+		}
+
+		$b2c = self::credentials( self::LOGISTICS_B2C_HOME_KEYS );
+		$c2c = self::credentials( self::LOGISTICS_C2C_KEYS );
+		if ( self::credentials_complete( $b2c )
+			&& self::credentials_complete( $c2c )
+			&& self::same_credential_tuple( $b2c, $c2c ) ) {
+			return self::empty_credentials();
+		}
+
+		$selected = 'c2c' === $family ? $c2c : $b2c;
+		if ( self::credentials_complete( $selected ) ) {
+			return $selected;
+		}
+		// Any partial explicit group is an operator error, not permission to use
+		// an unrelated legacy account.
+		if ( self::credentials_started( $selected ) ) {
+			return self::empty_credentials();
+		}
+
+		// Legacy fallback is deliberately narrow: both new groups must be empty,
+		// and enabled method switches must identify exactly one credential family.
+		// This supports a single-family historical install without ever allowing
+		// the old tuple to service B2C/home and C2C simultaneously.
+		if ( self::credentials_started( $b2c ) || self::credentials_started( $c2c )
+			|| $family !== self::unambiguous_legacy_family() ) {
+			return self::empty_credentials();
+		}
+
+		$legacy = self::credentials( self::LOGISTICS_KEYS );
+		return self::credentials_complete( $legacy ) ? $legacy : self::empty_credentials();
+	}
+
+	/**
+	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
+	 */
+	public static function logistics_credentials_for_subtype( string $subtype ): array {
+		$channel = EcpayShippingCatalog::channel_for_subtype( $subtype );
+		return '' === $channel ? self::empty_credentials() : self::logistics_credentials_for_channel( $channel );
 	}
 
 	/**
@@ -120,12 +213,29 @@ final class Settings {
 			return '';
 		}
 
-		$plain = class_exists( YSCrypto::class ) ? (string) YSCrypto::decrypt_from_storage( $stored ) : '';
+		if ( ! class_exists( YSCrypto::class ) || ! method_exists( YSCrypto::class, 'decrypt_from_storage' ) ) {
+			return '';
+		}
+
+		try {
+			$plain = (string) YSCrypto::decrypt_from_storage( $stored );
+		} catch ( \Throwable $error ) {
+			return '';
+		}
 		return '' !== $plain ? $plain : $stored;
 	}
 
 	public static function encrypt_secret( string $plain ): string {
-		return class_exists( YSCrypto::class ) ? (string) YSCrypto::encrypt_for_storage( $plain ) : $plain;
+		if ( ! class_exists( YSCrypto::class ) || ! method_exists( YSCrypto::class, 'encrypt_for_storage' ) ) {
+			throw new \RuntimeException( 'YS CART encrypted-secret capability is unavailable.' );
+		}
+
+		$encrypted = (string) YSCrypto::encrypt_for_storage( $plain );
+		if ( '' === $encrypted ) {
+			throw new \RuntimeException( 'YS CART failed to encrypt the provider secret.' );
+		}
+
+		return $encrypted;
 	}
 
 	public static function payment_endpoint(): string {
@@ -142,8 +252,19 @@ final class Settings {
 			: 'https://payment.ecpay.com.tw/Cashier/QueryTradeInfo/V5';
 	}
 
-	public static function logistics_endpoint( string $path = '' ): string {
-		$credentials = self::logistics_credentials();
+	public static function logistics_endpoint( string $path = '', string $method_id = '' ): string {
+		$credentials = '' === trim( $method_id )
+			? self::logistics_credentials()
+			: self::logistics_credentials_for_method( $method_id );
+		return self::logistics_endpoint_from_credentials( $path, $credentials );
+	}
+
+	public static function logistics_endpoint_for_channel( string $path, string $channel ): string {
+		return self::logistics_endpoint_from_credentials( $path, self::logistics_credentials_for_channel( $channel ) );
+	}
+
+	/** @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $credentials */
+	private static function logistics_endpoint_from_credentials( string $path, array $credentials ): string {
 		$base = $credentials['test_mode']
 			? 'https://logistics-stage.ecpay.com.tw'
 			: 'https://logistics.ecpay.com.tw';
@@ -170,6 +291,75 @@ final class Settings {
 
 	public static function has_logistics_credentials(): bool {
 		$c = self::logistics_credentials();
-		return '' !== $c['merchant_id'] && '' !== $c['hash_key'] && '' !== $c['hash_iv'];
+		return self::credentials_complete( $c );
+	}
+
+	public static function has_logistics_credentials_for_method( string $method_id ): bool {
+		return self::credentials_complete( self::logistics_credentials_for_method( $method_id ) );
+	}
+
+	/** @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $credentials */
+	private static function credentials_complete( array $credentials ): bool {
+		return '' !== $credentials['merchant_id'] && '' !== $credentials['hash_key'] && '' !== $credentials['hash_iv'];
+	}
+
+	/** @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $credentials */
+	private static function credentials_started( array $credentials ): bool {
+		return '' !== $credentials['merchant_id'] || '' !== $credentials['hash_key'] || '' !== $credentials['hash_iv'];
+	}
+
+	/**
+	 * @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $left
+	 * @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $right
+	 */
+	private static function same_credential_tuple( array $left, array $right ): bool {
+		// Environment selects an endpoint; it is not part of the signing
+		// identity. Reusing the same MID/key/IV across the two channel families
+		// would make callbacks impossible to bind even if one endpoint is test
+		// and the other is live.
+		return hash_equals( $left['merchant_id'], $right['merchant_id'] )
+			&& hash_equals( $left['hash_key'], $right['hash_key'] )
+			&& hash_equals( $left['hash_iv'], $right['hash_iv'] );
+	}
+
+	private static function credential_family_for_channel( string $channel ): string {
+		return match ( trim( $channel ) ) {
+			EcpayShippingCatalog::CHANNEL_B2C, EcpayShippingCatalog::CHANNEL_HOME => 'b2c_home',
+			EcpayShippingCatalog::CHANNEL_C2C => 'c2c',
+			default => '',
+		};
+	}
+
+	private static function unambiguous_legacy_family(): string {
+		$families = [];
+		$lifecycle = '\\YangSheep\\Ecommerce\\Core\\Provider\\YSProviderLifecycleState';
+		$has_lifecycle = class_exists( $lifecycle )
+			&& class_exists( Plugin::class )
+			&& method_exists( $lifecycle, 'is_provider_enabled' )
+			&& method_exists( $lifecycle, 'is_capability_enabled' )
+			&& method_exists( $lifecycle, 'is_method_enabled' );
+		$manifest = $has_lifecycle ? Plugin::manifest() : [];
+		if ( $has_lifecycle
+			&& ( ! $lifecycle::is_provider_enabled( 'ys_ecpay', $manifest )
+				|| ! $lifecycle::is_capability_enabled( 'ys_ecpay', 'shipping', $manifest ) ) ) {
+			return '';
+		}
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			$alias = (string) ( $descriptor['alias'] ?? '' );
+			$family = self::credential_family_for_channel( (string) ( $descriptor['channel'] ?? '' ) );
+			$enabled = $has_lifecycle
+				? $lifecycle::is_method_enabled( 'shipping', (string) $method_id, $manifest )
+				: self::shipping_enabled( $alias );
+			if ( '' !== $alias && '' !== $family && $enabled ) {
+				$families[ $family ] = true;
+			}
+		}
+
+		return 1 === count( $families ) ? (string) array_key_first( $families ) : '';
+	}
+
+	/** @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} */
+	private static function empty_credentials(): array {
+		return [ 'test_mode' => true, 'merchant_id' => '', 'hash_key' => '', 'hash_iv' => '' ];
 	}
 }

@@ -38,11 +38,13 @@ final class EcpayLogisticsController {
 
 	public function notify( \WP_REST_Request $request ): void {
 		$params = $this->params( $request );
-		if ( ! $this->verify( $params ) ) {
+		$lookup = $this->find_label( $params );
+		$label_method = 'found' === (string) ( $lookup['status'] ?? '' ) && is_object( $lookup['label'] ?? null )
+			? (string) ( $lookup['label']->shipping_method ?? '' )
+			: '';
+		if ( ! $this->verify( $params, $label_method ) ) {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
-
-		$lookup = $this->find_label( $params );
 
 		// 🔴 「查不到」與「查不動」是兩件事。
 		//
@@ -94,6 +96,14 @@ final class EcpayLogisticsController {
 				if ( $order_id !== (int) ( $locked_label->order_id ?? 0 )
 					|| ! $this->binding_matches( $locked_label, $params ) ) {
 					return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
+				}
+
+				$authority_status = $this->callback_authority_status( $locked_label );
+				if ( 'stale' === $authority_status ) {
+					return [ 'body' => '1|OK', 'status' => 200 ];
+				}
+				if ( 'current' !== $authority_status ) {
+					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
 				}
 
 				// The lock can wait behind another callback. Drop any request-local order snapshot before
@@ -284,6 +294,71 @@ final class EcpayLogisticsController {
 		return trim( (string) $params['LogisticsSubType'] ) === $expected_subtype;
 	}
 
+	/**
+	 * Decide whether this exact label still owns callback authority while the order lock is held.
+	 *
+	 * Local cancelled flags are not sufficient proof for legacy rows: older Core releases could
+	 * mark a label cancelled without a provider-confirmed cancellation. Attempt-backed rows use
+	 * Core's active label_id as the authority; legacy rows are matched against Core's equivalent
+	 * newest no-attempt fallback without excluding those local flags.
+	 *
+	 * @return string 'current'|'stale'|'error'
+	 */
+	private function callback_authority_status( object $label ): string {
+		$order_id = (int) ( $label->order_id ?? 0 );
+		$label_id = (int) ( $label->id ?? 0 );
+		if ( $order_id <= 0 || $label_id <= 0
+			|| ! is_callable( [ YSShippingDispatchAuthority::class, 'active_attempt' ] ) ) {
+			return 'error';
+		}
+
+		try {
+			$authority = YSShippingDispatchAuthority::active_attempt(
+				$order_id,
+				(string) ( $label->shipping_method ?? '' )
+			);
+		} catch ( \Throwable $e ) {
+			return 'error';
+		}
+
+		if ( null === $authority ) {
+			return 'stale';
+		}
+
+		if ( ! empty( $authority->legacy ) ) {
+			return $this->legacy_callback_authority_status( $order_id, $label_id );
+		}
+
+		$authority_label_id = (int) ( $authority->label_id ?? 0 );
+		if ( $authority_label_id <= 0 ) {
+			return 'error';
+		}
+
+		return $authority_label_id === $label_id ? 'current' : 'stale';
+	}
+
+	/** @return string 'current'|'stale'|'error' */
+	private function legacy_callback_authority_status( int $order_id, int $label_id ): string {
+		global $wpdb;
+
+		$labels   = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
+		$attempts = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_label_attempts';
+		$row      = $wpdb->get_row( $wpdb->prepare(
+			"SELECT l.id FROM {$labels} l
+			 LEFT JOIN {$attempts} a ON a.label_id = l.id
+			 WHERE l.order_id = %d
+			   AND a.id IS NULL
+			 ORDER BY l.id DESC LIMIT 1",
+			$order_id
+		) );
+
+		if ( null === $row ) {
+			return '' !== (string) ( $wpdb->last_error ?? '' ) ? 'error' : 'stale';
+		}
+
+		return (int) ( $row->id ?? 0 ) === $label_id ? 'current' : 'stale';
+	}
+
 	private function find_order_by_label( object $label ): ?object {
 		global $wpdb;
 		$orders_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
@@ -312,8 +387,10 @@ final class EcpayLogisticsController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function verify( array $params ): bool {
-		$credentials = Settings::logistics_credentials();
+	private function verify( array $params, string $method_id = '' ): bool {
+		$credentials = '' !== trim( $method_id )
+			? Settings::logistics_credentials_for_method( $method_id )
+			: Settings::logistics_credentials_for_subtype( (string) ( $params['LogisticsSubType'] ?? '' ) );
 		if ( '' === $credentials['merchant_id']
 			|| '' === $credentials['hash_key']
 			|| '' === $credentials['hash_iv']
@@ -394,8 +471,11 @@ final class EcpayLogisticsController {
 		}
 
 		// 沒有 pipeline 時由這裡直接對映；有 pipeline 時狀態由它負責，這裡不碰。
-		if ( ! class_exists( YSShippingPipelineService::class ) && $status_advance_allowed ) {
-			$order_update['shipping_status'] = $this->map_status( $status );
+		$legacy_status = $this->map_status( $status );
+		if ( ! class_exists( YSShippingPipelineService::class )
+			&& $status_advance_allowed
+			&& null !== $legacy_status ) {
+			$order_update['shipping_status'] = $legacy_status;
 		}
 
 		// 🔴 `YSOrder::update()` 對 affected=0 也回 true——「回 true」不代表寫進去了。
@@ -441,14 +521,8 @@ final class EcpayLogisticsController {
 		return true;
 	}
 
-	private function map_status( string $status ): string {
-		if ( in_array( $status, [ '300', '2063', '2067' ], true ) ) {
-			return 'delivered';
-		}
-		if ( in_array( $status, [ '2073', '2074', '2077' ], true ) ) {
-			return 'returned';
-		}
-		return 'in_transit';
+	private function map_status( string $status ): ?string {
+		return EcpayShippingCatalog::pipeline_state_for_logistics_status( $status );
 	}
 
 	/**
@@ -471,8 +545,12 @@ final class EcpayLogisticsController {
 		// 🔴 pipeline 說這個轉換不允許（遲到／亂序的通知）時就不要寫狀態。
 		// 寫下去的話 label 會被改回一個比訂單更早的狀態——同一件事兩邊各說各話。
 		// 憑據類欄位（追蹤碼、寄貨編號）不受影響：它們是補齊，不是倒退。
-		if ( $write_status ) {
-			$update['status']            = $this->map_status( $status );
+		$pipeline_status = $write_status ? $this->map_status( $status ) : null;
+		$label_status = null === $pipeline_status
+			? null
+			: EcpayShippingCatalog::label_status_for_pipeline_state( $pipeline_status );
+		if ( null !== $label_status ) {
+			$update['status']            = $label_status;
 			$update['status_code']       = $status;
 			$update['status_updated_at'] = current_time( 'mysql' );
 		}

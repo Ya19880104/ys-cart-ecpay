@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.2.14（未發布）
+
+### 配對契約與安全性
+
+- 最低核心版本提升至 **YS CART 2.56.12**。啟動時會同時驗證物流 authority、
+  storefront 查詢、地址 `shipping_provider` schema、付款 reconciliation 與安全加密能力；
+  部分部署不掛 provider hooks，也不會以明文保存密鑰。
+- B2C／宅配與 C2C 改用兩組獨立物流憑證；所有建單、電子地圖、callback、查詢、列印、
+  取消與門市目錄都依 exact method/channel 選帳號，簽章 tuple 相同或交叉替換時 fail closed。
+- 結帳改走 typed fulfillment resolve/claim：canonical destination、服務條件與 immutable
+  snapshot 由 Core 在同一次訂單交易落盤，provider claim 不再事後覆寫訂單。
+- 已存 CVS 地址改為登入擁有者 + exact provider/method 的 server-side reauthorization；
+  canonical directory miss 會排補抓並回 409，每次只簽 fresh one-use token，response 為 no-store。
+
+### 物流 API
+
+- 依官方 11 種方式更新 create/print 契約：UNIMARTFREEZE 支援 COD；TCAT 溫層條件；
+  POST 重量；FAMI／UNIMART／HILIFE C2C 等長批次（上限 100），缺欄、逗號注入、混 method
+  或 mixed subtype 均整批拒絕。
+- 新增簽章與 durable identity 全綁定的 QueryLogisticsTradeInfo/V5；取消 API 僅允許
+  exact UNIMARTC2C，且只有 `1|OK` 是 terminal cancelled。
+- 物流狀態採官方狀態表的單一映射；未知與退回中的非終態不猜。query 與 webhook 都在
+  order serialization 內重驗 current active label，已取消／被替換的舊 label 只 ACK/no-op。
+- 門市目錄快取 key 綁定 credential family、環境與 signer identity；stage→live 或帳號輪替
+  立即 miss，stage dummy store 不會沿用到正式環境。
+
+### 金流 authority
+
+- QueryTradeInfo/V5 回應必須驗 CheckMacValue、MerchantID、MerchantTradeNo；paid 還要求
+  TradeNo 與正整數 TradeAmt。缺欄或金額不符保持 frozen，零 lifecycle transition。
+- 送出付款表單前，MerchantTradeNo/gateway/payment identity 必須 durable exact readback；
+  明確 pre-send 拒絕與 provider-effect 後不確定結果使用不同 typed outcome。
+
+## 0.2.13（未發布）
+
+### 修正（stage 實測驅動；FINDINGS-STAGE-2026-08-13）
+
+- **門市目錄解得動真實的 GetStoreList 形狀**。綠界的回應是
+  `StoreList[].{CvsType, StoreInfo[]}` 兩層巢狀（stage 實測），0.2.12 的
+  parser 把群組元素當門市列 → 永遠解出空清單 → 所有選店恆為
+  `store_verified=0`。攤平巢狀後 canonical 名稱地址開始生效；並新增
+  「RtnCode!=1 不得快取空清單」守門。
+- **數字錯誤碼開頭的同步拒絕歸為明確拒絕**。官方的同步拒絕除了
+  `0|ErrorMessage` 還有 `10500040|商品金額範圍為1~20000元` 這種
+  **錯誤碼開頭**的形狀（stage 實測）。0.2.12 只認 `0|`，錯誤碼開頭的會
+  落到 indeterminate——安全但把常見欄位錯誤都變成人工裁決。現在
+  成功只有 `1|`，其餘數字前綴＝provider_failed；完全認不出的形狀
+  仍是 indeterminate。
+- **門市目錄接上 production**（此前只有測試會呼叫 `refresh()`，安裝後快取
+  永遠不會建立）：`register_cron()` 掛 twicedaily 排程（首跑 +60 秒）；
+  選店查不到 canonical 時排 60 秒後的單發補抓——單發用**獨立 hook**
+  （`…_soon`）去重，與週期事件共用 hook 會被 `wp_next_scheduled()`
+  永遠擋住，補抓一次都排不進去。
+- **GetStoreList 請求補簽 `CheckMacValue`**（官方契約必填；先前 stage 實測
+  通過是測試腳本自己簽的，production 未簽正式環境會被打回）。
+- **通路綁定**：多通路回應只攤平 `CvsType` 等於請求通路的群組。不同通路
+  可能有同號門市，不綁定會把別家通路的門市名掛在這家的號碼上並標成
+  canonical。
+- **快取寫入以「寫後讀回逐位比對」為準**：`set_transient()` 回傳值不可靠
+  （值相同回 false），只比筆數又會被「舊快取剛好同筆數」騙過——寫入失敗
+  時 `refresh()` 回 0，不把殘留的舊門市冒充成新目錄。
+- **總開關 gating**：provider 整個停用後，目錄排程不再對綠界發任何 HTTP
+  （`refresh_enabled_channels()` 改走「總開關 × 方法旗標」的合成 gate；
+  殘留的方法旗標不再足以觸發請求），`register_cron()` 在停用時同時清掉
+  既有排程，停用的站不會一直醒來。
+- 修 `HttpFormClient::parse_body()` 對 JSON 回應丟 PHP warning 的根因
+  （JSON body 早退＋scalar-safe 映射，附零 warning 常設守門測試）。
+
 ## [0.2.12] - 2026-08-13
 
 物流專用版（shipping-only），自 `v0.2.10` 重新實作。**不含**信用卡退刷、退款授權、

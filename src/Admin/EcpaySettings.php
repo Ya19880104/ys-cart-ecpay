@@ -53,7 +53,8 @@ final class EcpaySettings {
 
 		if ( 'api' === $tab ) {
 			self::save_credentials_group( 'payment', Settings::PAYMENT_KEYS );
-			self::save_credentials_group( 'logistics', Settings::LOGISTICS_KEYS );
+			self::save_credentials_group( 'logistics_b2c_home', Settings::LOGISTICS_B2C_HOME_KEYS );
+			self::save_credentials_group( 'logistics_c2c', Settings::LOGISTICS_C2C_KEYS );
 		}
 
 		if ( 'payment' === $tab ) {
@@ -351,12 +352,19 @@ final class EcpaySettings {
 			}
 		}
 
-		foreach ( [ 'payment' => Settings::PAYMENT_KEYS, 'logistics' => Settings::LOGISTICS_KEYS ] as $prefix => $keys ) {
+		foreach ( [
+			'payment'            => Settings::PAYMENT_KEYS,
+			'logistics_b2c_home' => Settings::LOGISTICS_B2C_HOME_KEYS,
+			'logistics_c2c'      => Settings::LOGISTICS_C2C_KEYS,
+		] as $prefix => $keys ) {
 			$out[ $prefix . '_test_mode' ]       = '1' === (string) Settings::get( $keys['test_mode'], '1' );
 			$out[ $prefix . '_merchant_id' ]     = (string) Settings::get( $keys['merchant_id'], '' );
 			$out[ $prefix . '_hash_key_is_set' ] = '' !== (string) Settings::get( $keys['hash_key'], '' );
 			$out[ $prefix . '_hash_iv_is_set' ]  = '' !== (string) Settings::get( $keys['hash_iv'], '' );
 		}
+		$out['legacy_logistics_credentials_present'] = '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['merchant_id'], '' )
+			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_key'], '' )
+			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_iv'], '' );
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
 		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );

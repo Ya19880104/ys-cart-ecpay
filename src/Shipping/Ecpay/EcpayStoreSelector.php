@@ -6,8 +6,8 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
-use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
 use YangSheep\Ecommerce\Services\Setup\YSPageResolver;
 
@@ -51,15 +51,14 @@ final class EcpayStoreSelector {
 
 		if ( null === $descriptor
 			|| ! isset( $subtypes[ $shipping_id ] )
-			|| ! self::is_method_enabled( $shipping_id )
-			|| ! Settings::has_logistics_credentials() ) {
+			|| ! ShippingMethodOperability::is_operable( $shipping_id ) ) {
 			return false;
 		}
 
 		// C2C 沒填退貨門市時連地圖都不要開：顧客選完門市、結帳完成，送單那一刻
 		// 才失敗，善後成本高得多。
 		$method = self::instantiate( $shipping_id );
-		if ( null === $method || ! $method->is_configured() ) {
+		if ( null === $method ) {
 			return false;
 		}
 
@@ -83,7 +82,7 @@ final class EcpayStoreSelector {
 		}
 
 		$return_url  = self::sanitize_return_url( $return_url, $cart_scope );
-		$credentials = Settings::logistics_credentials();
+		$credentials = Settings::logistics_credentials_for_method( $shipping_id );
 		// 🔴 `ExtraData` 是**一次性 nonce**，長度 20 個英數字（CODEX #3W C6）。
 		//
 		// 舊版放的是 `wp_generate_uuid4()`——36 個字元，超過官方對 `ExtraData` 的
@@ -137,7 +136,7 @@ final class EcpayStoreSelector {
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 
 		return [
-			'action_url'      => Settings::logistics_endpoint( self::MAP_PATH ),
+			'action_url'      => Settings::logistics_endpoint( self::MAP_PATH, $shipping_id ),
 			'fields'          => $fields,
 			'temp_id'         => $temp_id,
 			'collection_mode' => $is_collection ? 'Y' : 'N',
@@ -172,6 +171,67 @@ final class EcpayStoreSelector {
 	private const SELECTION_TTL = 30 * MINUTE_IN_SECONDS;
 
 	/**
+	 * Issue a fresh, one-use authority token for a canonical saved-store tuple.
+	 *
+	 * Saved address rows are display data only.  This entry point accepts a tuple
+	 * only after the caller has resolved it through {@see EcpayStoreDirectory}; it
+	 * then re-binds every checkout condition to the same server-side transient
+	 * used by a new ECPay map selection.
+	 *
+	 * @param array{name?:string,address?:string,phone?:string} $canonical
+	 */
+	public static function issue_canonical_saved_selection(
+		string $shipping_id,
+		string $logistics_subtype,
+		string $store_id,
+		array $canonical,
+		string $payment_method,
+		string $cart_scope,
+		string $principal
+	): string {
+		$shipping_id       = trim( $shipping_id );
+		$logistics_subtype = trim( $logistics_subtype );
+		$store_id          = trim( $store_id );
+		$payment_method    = trim( $payment_method );
+		$cart_scope        = self::sanitize_cart_scope( $cart_scope );
+		$principal         = trim( $principal );
+		$store_name        = trim( (string) ( $canonical['name'] ?? '' ) );
+		$store_address     = trim( (string) ( $canonical['address'] ?? '' ) );
+
+		$descriptor = EcpayShippingCatalog::get( $shipping_id );
+		$method     = self::instantiate( $shipping_id );
+		if ( null === $descriptor
+			|| null === $method
+			|| empty( $descriptor['requires_store'] )
+			|| $logistics_subtype !== (string) ( $descriptor['logistics_subtype'] ?? '' )
+			|| ! ShippingMethodOperability::is_operable( $shipping_id )
+			|| '' === $store_id
+			|| '' === $store_name
+			|| '' === $store_address
+			|| '' === $payment_method
+			|| '' === $principal
+			|| $principal !== self::current_principal( $cart_scope )
+			|| ( self::COD_GATEWAY_ID === $payment_method && ! $method->supports_cod() ) ) {
+			return '';
+		}
+
+		return self::issue_selection_token(
+			[
+				'shipping_id'       => $shipping_id,
+				'cvs_type'          => $logistics_subtype,
+				'store_id'          => $store_id,
+				'store_name'        => $store_name,
+				'store_address'     => $store_address,
+				'store_verified'    => 1,
+				'collection_mode'   => self::resolve_collection_mode( $method, $payment_method ) ? 'Y' : 'N',
+				'payment_method'    => $payment_method,
+				'cart_scope'        => $cart_scope,
+			],
+			$principal
+		);
+	}
+
+	/**
 	 * 發出一張不透明的門市選擇 token，並把**權威資料留在伺服器**。
 	 *
 	 * 🔴 前端拿到的只是一個沒有意義的字串。門市代號、subtype、代收前提、擁有者、
@@ -192,6 +252,7 @@ final class EcpayStoreSelector {
 			'store_id'          => (string) ( $selection['store_id'] ?? '' ),
 			'store_name'        => (string) ( $selection['store_name'] ?? '' ),
 			'store_address'     => (string) ( $selection['store_address'] ?? '' ),
+			'store_verified'    => 1 === (int) ( $selection['store_verified'] ?? 0 ) ? 1 : 0,
 			'collection_mode'   => (string) ( $selection['collection_mode'] ?? 'N' ),
 			// 🔴 存**精確的**付款方式，不是只存 N/Y。
 			// 只比代收模式的話，信用卡選的門市可以拿去給另一個非代收金流用——
@@ -330,6 +391,42 @@ final class EcpayStoreSelector {
 	}
 
 	/**
+	 * Read the server-owned canonical store tuple without consuming its token.
+	 *
+	 * The callback may retain browser values as an explicitly unverified display
+	 * hint when the directory cache is unavailable. Such hints are never allowed
+	 * to become the immutable order destination.
+	 *
+	 * @return array{error:?string,store:array<string,string>}
+	 */
+	public static function inspect_selection_authoritative( array $data, string $shipping_id, string $payment_method ): array {
+		$rejection = self::verify_selection( $data, $shipping_id, $payment_method );
+		if ( null !== $rejection ) {
+			return [ 'error' => $rejection, 'store' => [] ];
+		}
+
+		$token  = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		$record = get_transient( self::SELECTION_PREFIX . $token );
+		if ( ! is_array( $record ) || 1 !== (int) ( $record['store_verified'] ?? 0 ) ) {
+			return [
+				'error' => '目前無法取得門市的伺服器權威資料，請稍後重新選擇門市。',
+				'store' => [],
+			];
+		}
+
+		$store = [
+			'store_id'      => trim( (string) ( $record['store_id'] ?? '' ) ),
+			'store_name'    => trim( (string) ( $record['store_name'] ?? '' ) ),
+			'store_address' => trim( (string) ( $record['store_address'] ?? '' ) ),
+		];
+		if ( '' === $store['store_id'] || '' === $store['store_name'] || '' === $store['store_address'] ) {
+			return [ 'error' => '門市權威資料不完整，請重新選擇門市。', 'store' => [] ];
+		}
+
+		return [ 'error' => null, 'store' => $store ];
+	}
+
+	/**
 	 * 認領（消耗）一張門市選擇 token。
 	 *
 	 * 回 `null` 代表認領成功；回字串代表拒絕的理由。
@@ -438,7 +535,7 @@ final class EcpayStoreSelector {
 		}
 
 		$shipping_id = (string) ( $map_data['shipping_id'] ?? '' );
-		if ( '' === $shipping_id || ! isset( self::subtypes()[ $shipping_id ] ) || ! self::is_method_enabled( $shipping_id ) ) {
+		if ( '' === $shipping_id || ! isset( self::subtypes()[ $shipping_id ] ) || ! ShippingMethodOperability::is_operable( $shipping_id ) ) {
 			wp_die( 'Shipping method disabled.', 'ECPay Store Callback', [ 'response' => 403 ] );
 		}
 
@@ -466,6 +563,12 @@ final class EcpayStoreSelector {
 			$store_id
 		);
 		$verified  = [] !== $canonical;
+
+		// 目錄查不到＝快取還沒建（或過期）。排一次近期補抓，**不在回呼內同步打 API**
+		// ——這一位顧客的選擇仍標 unverified，但目錄一分鐘內補起來，不會永遠空著。
+		if ( ! $verified ) {
+			EcpayStoreDirectory::schedule_refresh_soon();
+		}
 
 		$store_name = $verified
 			? (string) ( $canonical['name'] ?? '' )
@@ -557,16 +660,6 @@ final class EcpayStoreSelector {
 		return $out;
 	}
 
-	private static function is_method_enabled( string $shipping_id ): bool {
-		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' ) ) {
-			return \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $shipping_id, Plugin::manifest() );
-		}
-
-		$alias = EcpayShippingCatalog::id_to_alias()[ $shipping_id ] ?? '';
-
-		return '' !== $alias && Settings::shipping_enabled( $alias );
-	}
-
 	/**
 	 * @param array<string,mixed> $map_data
 	 */
@@ -594,7 +687,8 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed>  $map_data
 	 */
 	private static function verify_map_payload( array $params, array $map_data ): bool {
-		$credentials = Settings::logistics_credentials();
+		$shipping_id = (string) ( $map_data['shipping_id'] ?? '' );
+		$credentials = Settings::logistics_credentials_for_method( $shipping_id );
 		if ( '' === $credentials['merchant_id']
 			|| '' === $credentials['hash_key']
 			|| '' === $credentials['hash_iv'] ) {

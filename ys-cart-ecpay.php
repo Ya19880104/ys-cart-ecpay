@@ -3,7 +3,7 @@
  * Plugin Name: YS CART - ECPay
  * Plugin URI: https://github.com/Ya19880104/ys-cart-ecpay
  * Description: ECPay AIO payment and domestic logistics provider for YS CART.
- * Version: 0.2.12
+ * Version: 0.2.14
  * Requires at least: 6.2
  * Requires PHP: 8.1
  * Requires Plugins: ys-cart
@@ -13,7 +13,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'YS_CART_ECPAY_VERSION', '0.2.12' );
+define( 'YS_CART_ECPAY_VERSION', '0.2.14' );
 define( 'YS_CART_ECPAY_FILE', __FILE__ );
 define( 'YS_CART_ECPAY_DIR', plugin_dir_path( __FILE__ ) );
 define( 'YS_CART_ECPAY_URL', plugin_dir_url( __FILE__ ) );
@@ -39,8 +39,8 @@ spl_autoload_register(
 	}
 );
 
-/** 本外掛要求的 YS CART 核心最低版本（2.56.9 補齊 migration serialization 與 label uniqueness）。 */
-define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.9' );
+/** Typed fulfillment, saved-CVS authority, durable query, and address identity pair contract. */
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.56.12' );
 
 add_action(
 	'plugins_loaded',

@@ -6,8 +6,8 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Shipping\YSShippingInterface;
-use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
 /**
  * 綠界物流方式基底
@@ -226,29 +226,11 @@ abstract class EcpayShipping implements YSShippingInterface {
 		// 郵局的重量是綠界必填欄位。訂單本身算得出重量時優先用訂單的，但
 		// 商品沒填重量的站台算出來會是 0——所以後台的預設重量必須先有值，
 		// 否則這個方式就是「選得到、送不出」。
-		if ( $this->requires_goods_weight() && $this->get_default_goods_weight() <= 0.0 ) {
-			return false;
-		}
-
-		return true;
+		return ShippingMethodOperability::is_configured( $this->get_id() );
 	}
 
 	public function is_enabled(): bool {
-		$descriptor = $this->descriptor();
-		if ( null === $descriptor ) {
-			return false;
-		}
-
-		if ( class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' )
-			&& ! \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $this->get_id(), Plugin::manifest() ) ) {
-			return false;
-		}
-
-		if ( ! Settings::shipping_enabled( $this->settings_key() ) || ! Settings::has_logistics_credentials() ) {
-			return false;
-		}
-
-		return $this->is_configured();
+		return ShippingMethodOperability::is_operable( $this->get_id() );
 	}
 
 	public function is_available( array $order_data ): bool {

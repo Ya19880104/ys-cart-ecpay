@@ -5,6 +5,11 @@ namespace YangSheep\YSCartEcpay\Api;
 
 defined( 'ABSPATH' ) || exit;
 
+use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
+use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
+
 final class EcpayPrintController {
 	public static function register(): void {
 		add_action( 'admin_post_ys_cart_ecpay_print', [ __CLASS__, 'handle' ] );
@@ -32,11 +37,20 @@ final class EcpayPrintController {
 		}
 
 		$method_id = sanitize_key( (string) ( $payload['method_id'] ?? '' ) );
-		if ( '' !== $method_id
-			&& class_exists( '\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState' )
-			&& ! \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::is_method_enabled( 'shipping', $method_id, \YangSheep\YSCartEcpay\Plugin::manifest() )
-		) {
+		if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
 			wp_die( esc_html__( 'ECPay print method is disabled.', 'ys-cart-ecpay' ), 403 );
+		}
+		$credentials = Settings::logistics_credentials_for_method( $method_id );
+		$fields = $payload['fields'];
+		$spec = EcpayShippingCatalog::print_spec( $method_id );
+		$expected_api_url = null === $spec ? '' : Settings::logistics_endpoint( (string) $spec['path'], $method_id );
+		if ( '' === $expected_api_url
+			|| ! hash_equals( $expected_api_url, (string) $payload['api_url'] )
+			|| '' === $credentials['merchant_id']
+			|| ! isset( $fields['MerchantID'], $fields['CheckMacValue'] )
+			|| ! hash_equals( $credentials['merchant_id'], (string) $fields['MerchantID'] )
+			|| ! CheckMacValue::verify( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' ) ) {
+			wp_die( esc_html__( 'ECPay print credentials do not match this method.', 'ys-cart-ecpay' ), 403 );
 		}
 
 		$api_url = (string) $payload['api_url'];

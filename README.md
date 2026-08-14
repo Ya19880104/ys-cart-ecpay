@@ -23,7 +23,7 @@ Standalone ECPay provider plugin for YS CART.
 
 - WordPress 6.2+
 - PHP 8.1+
-- YS CART with provider hook support
+- YS CART 2.56.12+ (typed fulfillment, durable logistics query, saved-address provider identity, and encrypted-secret capability)
 
 ## Callback Routes
 
@@ -34,6 +34,7 @@ Standalone ECPay provider plugin for YS CART.
 - Logistics notify: `/wp-json/ys-ecommerce/v1/ecpay/logistics-notify`
 - Store map form: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url`
 - One-time store result exchange: `/wp-json/ys-ecommerce-headless/v1/ecpay/store-result`
+- Saved-store reauthorization: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/reauthorize`
 
 Payment notify, payment info, return, store callback, and logistics notify are
 provider-facing callback routes. Browser UI should request only the store-map

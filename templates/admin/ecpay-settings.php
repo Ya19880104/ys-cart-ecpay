@@ -70,29 +70,42 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 				</div>
 			</div>
 
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '物流 API', 'ys-cart-ecpay' ); ?></h2>
-					<div class="ysca-form-grid">
-						<label class="ysca-field">
-							<span class="ysca-field__label"><?php esc_html_e( '測試模式', 'ys-cart-ecpay' ); ?></span>
-							<input type="checkbox" name="ys_ec_ecpay_logistics_test_mode" value="1" <?php checked( $settings['logistics_test_mode'] ); ?>>
-						</label>
-						<label class="ysca-field">
-							<span class="ysca-field__label"><?php esc_html_e( '商店代號', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_logistics_merchant_id" value="<?php echo esc_attr( $settings['logistics_merchant_id'] ); ?>" autocomplete="off">
-						</label>
-						<label class="ysca-field">
-							<span class="ysca-field__label"><?php esc_html_e( 'Hash Key', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_key_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
-						</label>
-						<label class="ysca-field">
-							<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
-							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_logistics_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['logistics_hash_iv_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
-						</label>
+			<?php
+			$ys_ec_logistics_groups = [
+				'logistics_b2c_home' => __( '物流 API：B2C 超商／宅配', 'ys-cart-ecpay' ),
+				'logistics_c2c'      => __( '物流 API：C2C 超商', 'ys-cart-ecpay' ),
+			];
+			?>
+			<?php foreach ( $ys_ec_logistics_groups as $ys_ec_group => $ys_ec_group_label ) : ?>
+				<div class="ysca-card ysca-mt-md">
+					<div class="ysca-card__body">
+						<h2><?php echo esc_html( $ys_ec_group_label ); ?></h2>
+						<div class="ysca-form-grid">
+							<label class="ysca-field">
+								<span class="ysca-field__label"><?php esc_html_e( '測試模式', 'ys-cart-ecpay' ); ?></span>
+								<input type="checkbox" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_test_mode" value="1" <?php checked( $settings[ $ys_ec_group . '_test_mode' ] ); ?>>
+							</label>
+							<label class="ysca-field">
+								<span class="ysca-field__label"><?php esc_html_e( '商店代號', 'ys-cart-ecpay' ); ?></span>
+								<input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_merchant_id" value="<?php echo esc_attr( $settings[ $ys_ec_group . '_merchant_id' ] ); ?>" autocomplete="off">
+							</label>
+							<label class="ysca-field">
+								<span class="ysca-field__label"><?php esc_html_e( 'Hash Key', 'ys-cart-ecpay' ); ?></span>
+								<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_hash_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings[ $ys_ec_group . '_hash_key_is_set' ] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
+							</label>
+							<label class="ysca-field">
+								<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
+								<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings[ $ys_ec_group . '_hash_iv_is_set' ] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
+							</label>
+						</div>
 					</div>
 				</div>
-			</div>
+			<?php endforeach; ?>
+			<?php if ( ! empty( $settings['legacy_logistics_credentials_present'] ) ) : ?>
+				<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md">
+					<?php esc_html_e( '偵測到舊版單一物流憑證。只有在啟用方法明確屬於單一帳號群組時才會暫時相容；請分別填妥 B2C／宅配與 C2C 憑證。', 'ys-cart-ecpay' ); ?>
+				</div>
+			<?php endif; ?>
 		<?php endif; ?>
 
 		<?php if ( 'payment' === $tab ) : ?>
