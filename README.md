@@ -15,6 +15,10 @@ Standalone ECPay provider plugin for YS CART.
   - Hi-Life
   - TCAT
   - Post
+- HOME requests can explicitly use either the B2C/home or C2C credential profile,
+  matching the capabilities enabled for that MerchantID in ECPay's merchant console.
+- Changing the HOME profile is a maintenance operation: disable every HOME method
+  first. The plugin refuses the change while an active or legacy HOME label exists.
 - Shipping method visibility, sorting, base rates, and free-shipping rules are managed in YS CART Shipping Settings.
 - ECPay CVS electronic map integration using YS CART's existing `cvs_store_id`, `cvs_store_name`, and `cvs_store_addr` checkout fields.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.

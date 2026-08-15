@@ -13,6 +13,22 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			<?php esc_html_e( '綠界設定已儲存。', 'ys-cart-ecpay' ); ?>
 		</div>
 	<?php endif; ?>
+	<?php
+	$ys_ec_settings_errors = [
+		'invalid_home_credential_family'      => __( '宅配憑證來源無效，設定未變更。', 'ys-cart-ecpay' ),
+		'home_methods_must_be_disabled'       => __( '切換宅配憑證來源前，請先停用所有黑貓與郵局物流方式。', 'ys-cart-ecpay' ),
+		'active_home_labels'                  => __( '仍有未結束的宅配物流單，為避免舊單回呼或列印失效，憑證來源未切換。', 'ys-cart-ecpay' ),
+		'home_label_lookup_failed'            => __( '無法確認既有宅配物流單狀態，已採安全模式拒絕切換。', 'ys-cart-ecpay' ),
+		'home_credential_family_save_failed'  => __( '宅配憑證來源未能可靠寫入，請稍後重試。', 'ys-cart-ecpay' ),
+	];
+	$ys_ec_settings_error = sanitize_key( wp_unslash( (string) ( $_GET['settings_error'] ?? '' ) ) );
+	?>
+	<?php if ( isset( $ys_ec_settings_errors[ $ys_ec_settings_error ] ) ) : ?>
+		<div class="ys-ec-notice ys-ec-notice-error">
+			<span class="dashicons dashicons-warning"></span>
+			<?php echo esc_html( $ys_ec_settings_errors[ $ys_ec_settings_error ] ); ?>
+		</div>
+	<?php endif; ?>
 
 	<div class="ys-ec-filters ysca-tabs ysca-tabs--with-indicator" role="tablist" aria-label="<?php esc_attr_e( '綠界設定分頁', 'ys-cart-ecpay' ); ?>">
 		<?php foreach ( $tabs as $key => $label ) : ?>
@@ -101,9 +117,22 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					</div>
 				</div>
 			<?php endforeach; ?>
+			<div class="ysca-card ysca-mt-md">
+				<div class="ysca-card__body">
+					<h2><?php esc_html_e( '宅配憑證來源', 'ys-cart-ecpay' ); ?></h2>
+					<label class="ysca-field">
+						<span class="ysca-field__label"><?php esc_html_e( 'HOME（黑貓／郵局）使用', 'ys-cart-ecpay' ); ?></span>
+						<select class="ysca-input ysca-field--md" name="ys_ec_ecpay_home_credential_family">
+							<option value="b2c_home" <?php selected( $settings['home_credential_family'], 'b2c_home' ); ?>><?php esc_html_e( 'B2C／宅配憑證', 'ys-cart-ecpay' ); ?></option>
+							<option value="c2c" <?php selected( $settings['home_credential_family'], 'c2c' ); ?>><?php esc_html_e( 'C2C 憑證', 'ys-cart-ecpay' ); ?></option>
+						</select>
+					</label>
+					<p class="description"><?php esc_html_e( '請依綠界後台該 MerchantID 實際開通的宅配能力選擇。切換前必須先停用全部宅配方式，且不能有未結束或升級前的宅配物流單；系統不會自行複製或混用兩組金鑰。', 'ys-cart-ecpay' ); ?></p>
+				</div>
+			</div>
 			<?php if ( ! empty( $settings['legacy_logistics_credentials_present'] ) ) : ?>
 				<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md">
-					<?php esc_html_e( '偵測到舊版單一物流憑證。只有在啟用方法明確屬於單一帳號群組時才會暫時相容；請分別填妥 B2C／宅配與 C2C 憑證。', 'ys-cart-ecpay' ); ?>
+					<?php esc_html_e( '偵測到舊版單一物流憑證。請把它移轉到實際的 B2C 或 C2C 憑證欄位，並依商家合約選擇宅配憑證來源。', 'ys-cart-ecpay' ); ?>
 				</div>
 			<?php endif; ?>
 		<?php endif; ?>
@@ -144,7 +173,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 				<div class="ysca-card__body">
 					<h2><?php esc_html_e( '物流方式', 'ys-cart-ecpay' ); ?></h2>
 					<p class="description">
-						<?php esc_html_e( 'B2C（大宗寄倉）與 C2C（店到店）是綠界兩份不同的合約，服務金鑰也不同，請依你實際申請的合約開啟對應的方式。', 'ys-cart-ecpay' ); ?>
+						<?php esc_html_e( '超商 B2C／C2C 與宅配能力以綠界後台對該 MerchantID 的實際開通狀態為準；宅配使用哪組憑證請在 API 設定明確指定。', 'ys-cart-ecpay' ); ?>
 					</p>
 
 					<?php

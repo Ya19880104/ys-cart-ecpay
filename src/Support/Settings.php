@@ -43,6 +43,11 @@ final class Settings {
 		'hash_iv'     => 'ys_ec_ecpay_logistics_c2c_hash_iv',
 	];
 
+	/** Which explicit credential profile signs HOME requests. */
+	public const HOME_CREDENTIAL_FAMILY = 'ys_ec_ecpay_home_credential_family';
+	public const FAMILY_B2C_HOME = 'b2c_home';
+	public const FAMILY_C2C = 'c2c';
+
 	/**
 	 * 金流方式的啟用開關。
 	 *
@@ -143,7 +148,11 @@ final class Settings {
 
 	/**
 	 * Resolve credentials for an exact provider catalog channel.
-	 * B2C and HOME intentionally share one account group; C2C never does.
+	 *
+	 * HOME is an independent ECPay LogisticsType. Production merchants may have
+	 * it enabled on either their B2C or C2C credential profile, so the operator
+	 * must declare the profile instead of the plugin inferring it from sandbox
+	 * account groupings. The default remains B2C/home for backward compatibility.
 	 *
 	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
 	 */
@@ -298,6 +307,58 @@ final class Settings {
 		return self::credentials_complete( self::logistics_credentials_for_method( $method_id ) );
 	}
 
+	public static function home_credential_family(): string {
+		global $wpdb;
+
+		// Core's generic get_setting() intentionally collapses a SQL error and a
+		// missing row into the same default (and caches that miss).  That semantic
+		// is unsafe for a cryptographic signer selector: a transient read failure
+		// must never choose the historical B2C signer.  Read this one row directly
+		// and retain wpdb's error channel.
+		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_row' ) ) {
+			return '';
+		}
+		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'settings';
+		$wpdb->last_error = '';
+		try {
+			$query = $wpdb->prepare(
+				"SELECT id, setting_value FROM {$table} WHERE setting_key = %s LIMIT 1",
+				self::HOME_CREDENTIAL_FAMILY
+			);
+			if ( ! is_string( $query ) || '' === $query ) {
+				return '';
+			}
+			$row = $wpdb->get_row( $query );
+		} catch ( \Throwable $e ) {
+			return '';
+		}
+		if ( '' !== (string) ( $wpdb->last_error ?? '' ) ) {
+			return '';
+		}
+		// The option did not exist before v0.2.15.  Only that genuinely missing
+		// value inherits the historical B2C/home behavior.  A persisted unknown
+		// value is corrupted operator state and must not silently select a signer.
+		if ( null === $row ) {
+			return self::FAMILY_B2C_HOME;
+		}
+		if ( ! is_object( $row ) || ! property_exists( $row, 'setting_value' ) ) {
+			return '';
+		}
+		$raw = $row->setting_value;
+		if ( ! is_scalar( $raw ) ) {
+			return '';
+		}
+
+		return self::normalize_home_credential_family( (string) $raw );
+	}
+
+	public static function normalize_home_credential_family( string $family ): string {
+		$family = strtolower( trim( $family ) );
+		return in_array( $family, [ self::FAMILY_B2C_HOME, self::FAMILY_C2C ], true )
+			? $family
+			: '';
+	}
+
 	/** @param array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string} $credentials */
 	private static function credentials_complete( array $credentials ): bool {
 		return '' !== $credentials['merchant_id'] && '' !== $credentials['hash_key'] && '' !== $credentials['hash_iv'];
@@ -324,8 +385,9 @@ final class Settings {
 
 	private static function credential_family_for_channel( string $channel ): string {
 		return match ( trim( $channel ) ) {
-			EcpayShippingCatalog::CHANNEL_B2C, EcpayShippingCatalog::CHANNEL_HOME => 'b2c_home',
-			EcpayShippingCatalog::CHANNEL_C2C => 'c2c',
+			EcpayShippingCatalog::CHANNEL_B2C => self::FAMILY_B2C_HOME,
+			EcpayShippingCatalog::CHANNEL_HOME => self::home_credential_family(),
+			EcpayShippingCatalog::CHANNEL_C2C => self::FAMILY_C2C,
 			default => '',
 		};
 	}

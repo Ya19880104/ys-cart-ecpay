@@ -1,13 +1,27 @@
 # Changelog
 
-## 0.2.14（未發布）
+## 0.2.15（已發布）
+
+### 宅配憑證能力
+
+- HOME（黑貓／郵局）不再硬綁 B2C 測試帳號分組。後台新增明確的「宅配憑證來源」：
+  預設沿用 B2C／宅配憑證，也可依綠界後台該 MerchantID 的實際開通能力改用 C2C
+  憑證。同一個 C2C profile 因此可以合法服務 C2C 超取與 HOME，不需要把同一組
+  MID／HashKey／HashIV 假裝成兩套憑證。
+- 只有「尚未建立 profile option」的升級站沿用既有 B2C／宅配預設；已儲存的非法值
+  fail closed，舊版表單缺少新欄位時保留現值，不會靜默切換 signer。
+- 切換 profile 前必須先停用全部 HOME 方法，且不得有 active authority 或無 attempt 的
+  legacy HOME label；狀態查詢失敗時拒絕切換，避免舊單 callback／query／print 失驗。
+  partial credential、跨 profile 相同 tuple 與 exact method identity 的既有守門維持不變。
+
+## 0.2.14（已發布）
 
 ### 配對契約與安全性
 
 - 最低核心版本提升至 **YS CART 2.56.12**。啟動時會同時驗證物流 authority、
   storefront 查詢、地址 `shipping_provider` schema、付款 reconciliation 與安全加密能力；
   部分部署不掛 provider hooks，也不會以明文保存密鑰。
-- B2C／宅配與 C2C 改用兩組獨立物流憑證；所有建單、電子地圖、callback、查詢、列印、
+- B2C／預設宅配與 C2C 改用兩組獨立物流憑證；所有建單、電子地圖、callback、查詢、列印、
   取消與門市目錄都依 exact method/channel 選帳號，簽章 tuple 相同或交叉替換時 fail closed。
 - 結帳改走 typed fulfillment resolve/claim：canonical destination、服務條件與 immutable
   snapshot 由 Core 在同一次訂單交易落盤，provider claim 不再事後覆寫訂單。
@@ -80,8 +94,8 @@ CLI 退款、payment detail CAS，也不要求核心 2.57.0——搭配核心 2.
 - **11 個獨立的物流方式**，每一個都有自己的 `method_id`、啟用開關、運費、免運門檻
   與 wire 欄位：全家（B2C／C2C）、7-ELEVEN（B2C／C2C）、萊爾富（B2C／C2C）、
   7-ELEVEN 冷凍（B2C）、黑貓宅配常溫／冷藏／冷凍、中華郵政。
-  B2C 與 C2C 是綠界**兩份不同的合約**（不同服務金鑰、不同 subtype、C2C 另需退貨
-  門市），不是一個開關。
+  超商 B2C 與 C2C 使用不同 subtype 與營運流程；實際可用服務及憑證組合以綠界後台
+  對該 MerchantID 的開通能力為準。C2C 另有專屬寄貨／驗證碼與部分退貨門市欄位。
 - `EcpayShippingCatalog`：物流方式的**單一事實來源**。manifest、類別註冊、後台
   清單與存檔、啟用清單、電子地圖 subtype、送單欄位、回呼驗證、封裝與測試矩陣全部
   由它導出。先前這份清單散在七個地方各寫一份，漏一處的症狀不是「方式不見了」，

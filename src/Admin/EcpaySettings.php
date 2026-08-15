@@ -46,6 +46,18 @@ final class EcpaySettings {
 		check_admin_referer( self::NONCE_ACTION );
 
 		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_POST['ys_ec_ecpay_tab'] ?? self::DEFAULT_TAB ) ) ) );
+		$settings_error = '';
+		if ( 'api' === $tab ) {
+			$settings_error = self::save_home_credential_family();
+			if ( '' !== $settings_error ) {
+				wp_safe_redirect( add_query_arg( [
+					'page'           => 'ys-provider-ecpay',
+					'tab'            => $tab,
+					'settings_error' => $settings_error,
+				], admin_url( 'admin.php' ) ) );
+				exit;
+			}
+		}
 
 		$provider_enabled = isset( $_POST['ys_ec_ecpay_enabled'] );
 		Settings::update( Settings::ENABLED, $provider_enabled ? '1' : '0' );
@@ -85,16 +97,16 @@ final class EcpaySettings {
 			self::save_sender_fields();
 		}
 
-		wp_safe_redirect(
-			add_query_arg(
-				[
-					'page'    => 'ys-provider-ecpay',
-					'tab'     => $tab,
-					'updated' => '1',
-				],
-				admin_url( 'admin.php' )
-			)
-		);
+		$redirect_args = [
+			'page' => 'ys-provider-ecpay',
+			'tab'  => $tab,
+		];
+		if ( '' === $settings_error ) {
+			$redirect_args['updated'] = '1';
+		} else {
+			$redirect_args['settings_error'] = $settings_error;
+		}
+		wp_safe_redirect( add_query_arg( $redirect_args, admin_url( 'admin.php' ) ) );
 		exit;
 	}
 
@@ -114,6 +126,130 @@ final class EcpaySettings {
 				Settings::update( $keys[ $secret_key ], Settings::encrypt_secret( $raw ) );
 			}
 		}
+	}
+
+	private static function save_home_credential_family(): string {
+		// A form opened before the plugin update has no such field.  Missing is
+		// therefore "leave unchanged", never "switch back to the default".
+		if ( ! array_key_exists( 'ys_ec_ecpay_home_credential_family', $_POST ) ) {
+			return '';
+		}
+
+		$target = Settings::normalize_home_credential_family(
+			sanitize_key( wp_unslash( (string) $_POST['ys_ec_ecpay_home_credential_family'] ) )
+		);
+		if ( '' === $target ) {
+			return 'invalid_home_credential_family';
+		}
+
+		$current = Settings::home_credential_family();
+		if ( hash_equals( $current, $target ) ) {
+			return '';
+		}
+
+		// Profile changes are a maintenance operation.  Requiring every HOME
+		// method switch to be off closes the ordinary create-vs-save race; the
+		// durable authority check below then proves that no older request remains.
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			if ( EcpayShippingCatalog::CHANNEL_HOME !== (string) ( $descriptor['channel'] ?? '' ) ) {
+				continue;
+			}
+			if ( self::home_method_is_enabled( (string) $method_id, $descriptor ) ) {
+				return 'home_methods_must_be_disabled';
+			}
+		}
+
+		$authority = self::home_authority_state();
+		if ( 'error' === $authority ) {
+			return 'home_label_lookup_failed';
+		}
+		if ( 'active' === $authority ) {
+			return 'active_home_labels';
+		}
+
+		if ( ! Settings::update( Settings::HOME_CREDENTIAL_FAMILY, $target )
+			|| ! hash_equals( $target, Settings::home_credential_family() ) ) {
+			return 'home_credential_family_save_failed';
+		}
+
+		return '';
+	}
+
+	/** @param array<string,mixed> $descriptor */
+	private static function home_method_is_enabled( string $method_id, array $descriptor ): bool {
+		$lifecycle = '\\YangSheep\\Ecommerce\\Core\\Provider\\YSProviderLifecycleState';
+		if ( class_exists( $lifecycle ) ) {
+			// A present-but-incomplete lifecycle API is unsafe to interpret through
+			// the legacy mirror.  Core 2.56.12 treats lifecycle state as authority.
+			if ( ! method_exists( $lifecycle, 'is_method_enabled' ) ) {
+				return true;
+			}
+			try {
+				return (bool) $lifecycle::is_method_enabled( 'shipping', $method_id, Plugin::manifest() );
+			} catch ( \Throwable $e ) {
+				return true;
+			}
+		}
+
+		$enabled_option = (string) ( $descriptor['enabled_option'] ?? '' );
+		return '' === $enabled_option || '1' === (string) Settings::get( $enabled_option, '0' );
+	}
+
+	/**
+	 * @return string 'none'|'active'|'error'
+	 */
+	private static function home_authority_state(): string {
+		global $wpdb;
+
+		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_var' ) ) {
+			return 'error';
+		}
+
+		$home_methods = [];
+		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
+			if ( EcpayShippingCatalog::CHANNEL_HOME === (string) ( $descriptor['channel'] ?? '' ) ) {
+				$home_methods[] = (string) $method_id;
+			}
+		}
+		if ( [] === $home_methods ) {
+			return 'error';
+		}
+
+		$attempts     = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_label_attempts';
+		$labels       = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'shipping_labels';
+		$placeholders = implode( ', ', array_fill( 0, count( $home_methods ), '%s' ) );
+		$args         = array_merge( [ 'ecpay' ], $home_methods );
+
+		$active = $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$attempts}
+			 WHERE provider = %s
+			   AND shipping_method IN ({$placeholders})
+			   AND active_order_key IS NOT NULL",
+			...$args
+		) );
+		if ( null === $active || '' !== (string) ( $wpdb->last_error ?? '' ) ) {
+			return 'error';
+		}
+		if ( (int) $active > 0 ) {
+			return 'active';
+		}
+
+		// Pre-authority labels have no attempt row.  Core intentionally treats
+		// them as active even if an old local-only cancel flag exists, because no
+		// provider cancellation was proven.
+		$legacy = $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$labels} l
+			 LEFT JOIN {$attempts} a ON a.label_id = l.id
+			 WHERE l.provider = %s
+			   AND l.shipping_method IN ({$placeholders})
+			   AND a.id IS NULL",
+			...$args
+		) );
+		if ( null === $legacy || '' !== (string) ( $wpdb->last_error ?? '' ) ) {
+			return 'error';
+		}
+
+		return (int) $legacy > 0 ? 'active' : 'none';
 	}
 
 	/**
@@ -365,6 +501,7 @@ final class EcpaySettings {
 		$out['legacy_logistics_credentials_present'] = '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['merchant_id'], '' )
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_key'], '' )
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_iv'], '' );
+		$out['home_credential_family'] = Settings::home_credential_family();
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
 		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );
