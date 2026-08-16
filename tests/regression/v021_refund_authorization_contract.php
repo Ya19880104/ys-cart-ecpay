@@ -255,7 +255,8 @@ namespace YangSheep\YSCartEcpay\Payment {
 }
 
 namespace {
-    $core = dirname(__DIR__, 3) . '/ys-cart/src/Services/Payment/';
+    $core_root = (string) ( getenv( 'YS_CORE_ROOT' ) ?: dirname(__DIR__, 3) . '/ys-cart' );
+    $core = $core_root . '/src/Services/Payment/';
     require_once $core . 'YSPaymentDetailResult.php';
     require_once $core . 'YSPaymentDetailStore.php';
     require_once $core . 'YSPaymentDispatch.php';

@@ -115,7 +115,7 @@ namespace {
         return (bool) $GLOBALS['ys_logged_in'];
     }
 
-    require_once dirname(__DIR__, 3) . '/ys-cart/src/Shipping/YSShippingRegistry.php';
+    require_once ( (string) ( getenv( 'YS_CORE_ROOT' ) ?: dirname(__DIR__, 3) . '/ys-cart' ) ) . '/src/Shipping/YSShippingRegistry.php';
 
     use YangSheep\Ecommerce\Handlers\YSCartHandler;
     use YangSheep\Ecommerce\Models\YSProduct;
