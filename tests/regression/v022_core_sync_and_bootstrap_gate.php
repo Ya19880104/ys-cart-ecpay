@@ -327,47 +327,66 @@ namespace {
         '(g) 🔴 旗標是 1 而不是 true → 拒絕（型別敏感）'
     );
 
-    // ══ bootstrap 版本 gate ═════════════════════════════════════════════════
+    // ══ bootstrap 版本 gate（合流後：gate 在 bootstrap 以 core_requirements()
+    // 執行——版本＋能力＋schema 三層；常數改為 YS_CART_ECPAY_REQUIRES_CORE）══
     require_once dirname( __DIR__, 2 ) . '/src/Plugin.php';
 
     use YangSheep\YSCartEcpay\Plugin;
 
+    $bootstrap_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/ys-cart-ecpay.php' );
     $assert(
-        '2.57.0' === Plugin::REQUIRES_CORE,
+        str_contains( $bootstrap_src, "define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.57.0' );" ),
         '(h) 宣告的最低核心版本是 2.57.0'
     );
 
-    // 核心常數不存在（外掛單獨啟用、或核心未載入）
+    // 模擬 bootstrap 的常數（測試 process 不載入主檔；上一個斷言已證明主檔
+    // 定義的就是這個值）。
+    define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.57.0' );
+
+    // 核心常數不存在（外掛單獨啟用、或核心未載入）→ met=false／core_missing，
+    // 不得當成「可能沒問題」。
+    $gate_missing = Plugin::core_requirements();
     $assert(
-        ! defined( 'YS_ECOMMERCE_VERSION' ) && false === Plugin::core_version_ok(),
+        ! defined( 'YS_ECOMMERCE_VERSION' )
+        && false === $gate_missing['met']
+        && 'core_missing' === $gate_missing['reason'],
         '(h2) 核心版本常數缺席 → 不滿足（不得當成「可能沒問題」）'
     );
 
-    // init() 在版本不符時只掛通知，其餘一律不註冊
-    $GLOBALS['ys_hooks'] = [];
-    Plugin::instance()->init();
-    $tags = array_map( static fn( array $h ): string => $h[1], $GLOBALS['ys_hooks'] );
-
+    // 版本不符時：bootstrap 在 Plugin::instance()->init() **之前**就以 gate 擋下、
+    // 只掛 admin_notices 後 return——gateway／物流／REST／CLI（在 init 內註冊）
+    // 一律不會被註冊。以來源順序斷言（gate 分支必須先於 init 呼叫）。
+    $pos_gate   = strpos( $bootstrap_src, 'Plugin::core_requirements()' );
+    $pos_notice = strpos( $bootstrap_src, "add_action(\n\t\t\t\t'admin_notices'" );
+    if ( false === $pos_notice ) {
+        $pos_notice = strpos( $bootstrap_src, "'admin_notices'" );
+    }
+    $pos_init = strpos( $bootstrap_src, 'Plugin::instance()->init()' );
     $assert(
-        [ 'admin_notices' ] === $tags,
-        '(h3) 🔴 版本不符 → 只掛 admin_notices，gateway／物流／REST／CLI 一律不註冊 — 實得 '
-            . json_encode( $tags )
+        false !== $pos_gate && false !== $pos_notice && false !== $pos_init
+        && $pos_gate < $pos_init && $pos_notice < $pos_init
+        && 1 === preg_match( '/if \( ! \$ys_cart_ecpay_gate\[\'met\'\] \) \{.*?return;/s', $bootstrap_src ),
+        '(h3) 🔴 gate 不符 → admin_notices＋return 先於 init()，gateway／物流／REST／CLI 一律不註冊'
     );
 
-    // 通知內容要說得出「需要什麼」與「現在是什麼」
-    ob_start();
-    Plugin::instance()->render_core_version_notice();
-    $notice = (string) ob_get_clean();
-
+    // 核心太舊（2.56.12 < 2.57.0）→ met=false／core_too_old，訊息帶出所需版本。
+    define( 'YS_ECOMMERCE_VERSION', '2.56.12' );
+    $gate_old = Plugin::core_requirements();
     $assert(
-        str_contains( $notice, 'notice-error' )
-        && str_contains( $notice, '2.57.0' ),
-        '(h4) 後台通知帶出所需版本'
+        false === $gate_old['met']
+        && 'core_too_old' === $gate_old['reason']
+        && str_contains( $gate_old['message'], '2.57.0' ),
+        '(h4) 核心太舊 → core_too_old 且訊息帶出所需版本'
     );
 
-    // 版本足夠時放行（用常數模擬已載入的核心）
-    define( 'YS_ECOMMERCE_VERSION', '2.57.0' );
-    $assert( true === Plugin::core_version_ok(), '(h5) 核心 2.57.0 → 放行' );
+    // 版本足夠時的放行路徑：define 不可重定義，無法在同一 process 內模擬 2.57.0；
+    // 以來源斷言版本比較確實以 YS_CART_ECPAY_REQUIRES_CORE 為準（'<' 擋下、否則續行）。
+    $plugin_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Plugin.php' );
+    $assert(
+        str_contains( $plugin_src, "defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE" )
+        && str_contains( $plugin_src, "version_compare( (string) YS_ECOMMERCE_VERSION, \$required, '<' )" ),
+        '(h5) 版本比較以 YS_CART_ECPAY_REQUIRES_CORE 為準'
+    );
 
     // ══ #2G：MerchantTradeNo 由穩定 operation key 導出 ═══════════════════════
     //

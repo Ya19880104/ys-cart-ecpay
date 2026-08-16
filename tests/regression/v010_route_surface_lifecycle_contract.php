@@ -40,11 +40,16 @@ v010_check(
         && str_contains($plugin, 'if ( $this->has_enabled_payment_methods() )')
 );
 
+// 合流後（0.2.16 main）：物流方式清單的權威在型錄——has_enabled_shipping_methods()
+// 委派 ShippingMethodOperability::has_operable_method()（逐式 is_operable 掃描），
+// 不再抄一份 REGISTERED_SHIPPING_IDS。
+$operability = v010_read('src/Support/ShippingMethodOperability.php');
 v010_check(
     'Shipping public/storefront routes require at least one enabled ECPay shipping method',
     str_contains($plugin, 'private function has_enabled_shipping_methods(): bool')
-        && str_contains($plugin, 'self::REGISTERED_SHIPPING_IDS as $method_id')
-        && str_contains($plugin, "is_method_enabled( 'shipping', \$method_id )")
+        && str_contains($plugin, 'ShippingMethodOperability::has_operable_method()')
+        && str_contains($operability, 'public static function has_operable_method(): bool')
+        && str_contains($operability, 'if ( self::is_operable( (string) $method_id ) )')
         && str_contains($plugin, 'if ( ! $this->has_enabled_shipping_methods() )')
 );
 
@@ -73,11 +78,13 @@ v010_check(
         && str_contains($print, 'Unsupported print host.')
 );
 
+// 合流後：列印端點的 method gate 同樣走 ShippingMethodOperability::is_operable()
+//（其內部含 provider／capability／method-level lifecycle 三層）。
 v010_check(
     'Print redirect payload carries method id and is blocked when lifecycle method is disabled',
     str_contains($requester, "'method_id' => \$this->method->get_id()")
         && str_contains($print, "\$method_id = sanitize_key")
-        && str_contains($print, "YSProviderLifecycleState::is_method_enabled( 'shipping', \$method_id")
+        && str_contains($print, '! ShippingMethodOperability::is_operable( $method_id )')
         && str_contains($print, 'ECPay print method is disabled.')
 );
 

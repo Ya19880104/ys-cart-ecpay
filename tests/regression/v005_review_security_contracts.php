@@ -35,21 +35,33 @@ v005_check(
     'payment return/order lookup must require signed payload and exact stored merchant trade number'
 );
 
+// 合流後（0.2.16 main）：訂單解析改為 label-first——先以 provider＋
+// provider_trade_no（＋order_id＋merchant_trade_no 綁定）鎖定 shipping label，
+// 再由 find_order_by_label() 取訂單；沒有 label 綁定就到不了訂單。
+// 安全性質與舊 INNER JOIN 相同（訂單只能透過 label 觸達），SQL 形狀不同。
 v005_check(
     false !== strpos($logistics, "'' === \$credentials['merchant_id']")
     && false !== strpos($logistics, "'' === \$credentials['hash_key']")
     && false !== strpos($logistics, "'' === \$credentials['hash_iv']")
-    && false !== strpos($logistics, 'INNER JOIN {$labels_table}'),
+    && false !== strpos($logistics, 'FROM {$labels_table} WHERE provider = %s AND provider_trade_no = %s')
+    && false !== strpos($logistics, 'find_order_by_label')
+    && false !== strpos($logistics, 'binding_matches'),
     'logistics notify must require non-empty credentials and resolve orders through shipping labels'
 );
 
+// 合流後（0.2.15 main）：打單路徑改由型錄依 subtype 決定——C2C 三家有專用
+// 列印端點（打錯端點回空白單），B2C／宅配用預設 /helper/printTradeDocument。
+$catalog_src = v005_read($root . '/src/Shipping/Ecpay/EcpayShippingCatalog.php');
 v005_check(
     false !== strpos($requester, 'verify_create_response')
     && false !== strpos($requester, "'tracking_no'")
     && false !== strpos($requester, 'ys_cart_ecpay_print')
-    && false !== strpos($requester, 'printTradeDocument')
-    && false !== strpos($requester, 'CheckMacValue::generate'),
-    'shipping requester must verify create response, return tracking_no, and generate signed print payloads'
+    && false !== strpos($requester, 'CheckMacValue::generate')
+    && false !== strpos($catalog_src, 'printTradeDocument')
+    && false !== strpos($catalog_src, '/Express/PrintFAMIC2COrderInfo')
+    && false !== strpos($catalog_src, '/Express/PrintUniMartC2COrderInfo')
+    && false !== strpos($catalog_src, '/Express/PrintHILIFEC2COrderInfo'),
+    'shipping requester must verify create response, return tracking_no, and generate signed print payloads (catalog-routed print paths)'
 );
 
 v005_check(

@@ -259,15 +259,19 @@ namespace {
         '(b2) 付款通知：生命週期推進結果也必須判定（推進失敗同樣不得 ACK）'
     );
 
+    // 合流後（0.2.16 main）：callback 走 label-bound 序列化閉包——
+    // update_order_shipping 多收 $label、失敗回 `0|Persistence failed`（503），
+    // 最終成功 ACK 是閉包內最後一個 `'1|OK', 'status' => 200`。語意不變：
+    // persist gate 與失敗回覆都必須先於最終 ACK。
     $logistics = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Api/EcpayLogisticsController.php'));
-    $pos_lcheck = strpos($logistics, '! $this->update_order_shipping( $order, $params )');
-    $pos_lfail  = strpos($logistics, "'0|Persist Failed'");
-    $pos_lok    = strpos($logistics, "respond_text( '1|OK' )");
+    $pos_lcheck = strpos($logistics, '! $this->update_order_shipping( $order, $params, $locked_label )');
+    $pos_lfail  = strpos($logistics, "'0|Persistence failed'");
+    $pos_lok    = strrpos($logistics, "'body' => '1|OK'"); // 最終成功 ACK（最後一次出現）
     $assert(
         false !== $pos_lcheck && false !== $pos_lfail && false !== $pos_lok
         && $pos_lcheck < $pos_lok && $pos_lfail < $pos_lok
-        && str_contains($logistics, 'private function update_order_shipping( object $order, array $params ): bool'),
-        '(c) 物流 callback：update_order_shipping 回 bool，失敗回 0|Persist Failed 且早於 1|OK'
+        && str_contains($logistics, 'private function update_order_shipping( object $order, array $params, object $label ): bool'),
+        '(c) 物流 callback：update_order_shipping 回 bool，失敗回 0|Persistence failed 且早於最終 1|OK'
     );
 
     // (d) 負向：三個進入點都不得再出現「忽略回傳值」的呼叫形態

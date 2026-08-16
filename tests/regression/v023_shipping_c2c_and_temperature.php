@@ -158,16 +158,26 @@ namespace {
     $ns = 'YangSheep\\YSCartEcpay\\Shipping\\Ecpay\\';
 
     // ── (a) C2C subtype 完整且與 B2C 分開 ─────────────────────────────────
+    // 合流後（官方型錄審查）：UNIMARTFREEZEC2C **不存在**——綠界官方目前僅
+    // 載明 7-ELEVEN 冷凍 B2C；冷凍 C2C 需綠界書面確認後才能加（見型錄註解）。
     $expected = [
-        'EcpayShippingUnimart'          => [ 'UNIMART', false ],
-        'EcpayShippingFamily'           => [ 'FAMI', false ],
-        'EcpayShippingHilife'           => [ 'HILIFE', false ],
-        'EcpayShippingUnimartC2C'       => [ 'UNIMARTC2C', true ],
-        'EcpayShippingFamilyC2C'        => [ 'FAMIC2C', true ],
-        'EcpayShippingHilifeC2C'        => [ 'HILIFEC2C', true ],
-        'EcpayShippingUnimartFreeze'    => [ 'UNIMARTFREEZE', false ],
-        'EcpayShippingUnimartFreezeC2C' => [ 'UNIMARTFREEZEC2C', true ],
+        'EcpayShippingUnimart'       => [ 'UNIMART', false ],
+        'EcpayShippingFamily'        => [ 'FAMI', false ],
+        'EcpayShippingHilife'        => [ 'HILIFE', false ],
+        'EcpayShippingUnimartC2C'    => [ 'UNIMARTC2C', true ],
+        'EcpayShippingFamilyC2C'     => [ 'FAMIC2C', true ],
+        'EcpayShippingHilifeC2C'     => [ 'HILIFEC2C', true ],
+        'EcpayShippingUnimartFreeze' => [ 'UNIMARTFREEZE', false ],
     ];
+
+    $assert(
+        ! class_exists( $ns . 'EcpayShippingUnimartFreezeC2C' )
+        && false === strpos(
+            (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Shipping/Ecpay/EcpayShippingCatalog.php' ),
+            "'UNIMARTFREEZEC2C'"
+        ),
+        '(a0) 🔴 UNIMARTFREEZEC2C 不得存在（官方僅載明冷凍 B2C；書面確認前不加）'
+    );
 
     $problems = [];
     foreach ( $expected as $class => [ $subtype, $is_c2c ] ) {
@@ -210,13 +220,15 @@ namespace {
     $chilled = new ( $ns . 'EcpayShippingTcatChilled' )();
     $frozen  = new ( $ns . 'EcpayShippingTcatFrozen' )();
 
+    // 合流後：溫層碼常數的權威在型錄（EcpayShippingCatalog::TEMP_*）。
+    $catalog_class = 'YangSheep\\YSCartEcpay\\Shipping\\Ecpay\\EcpayShippingCatalog';
     $assert(
-        EcpayShipping::TEMP_ROOM === $tcat->get_temperature_code()
-        && EcpayShipping::TEMP_CHILLED === $chilled->get_temperature_code()
-        && EcpayShipping::TEMP_FROZEN === $frozen->get_temperature_code()
-        && '0001' === EcpayShipping::TEMP_ROOM
-        && '0002' === EcpayShipping::TEMP_CHILLED
-        && '0003' === EcpayShipping::TEMP_FROZEN,
+        $catalog_class::TEMP_ROOM === $tcat->get_temperature_code()
+        && $catalog_class::TEMP_CHILLED === $chilled->get_temperature_code()
+        && $catalog_class::TEMP_FROZEN === $frozen->get_temperature_code()
+        && '0001' === $catalog_class::TEMP_ROOM
+        && '0002' === $catalog_class::TEMP_CHILLED
+        && '0003' === $catalog_class::TEMP_FROZEN,
         '(c) 🔴 黑貓常溫／冷藏／冷凍各自回自己的溫層碼（0001／0002／0003）'
     );
 
@@ -234,27 +246,57 @@ namespace {
         '(c3) 超商冷凍是獨立 subtype（不是常溫超商加溫層參數）'
     );
 
-    // ── (d) 🔴 貨到付款由設定決定，不再寫死 N ──────────────────────────────
+    // ── (d) 🔴 代收是**兩層**：通路能力（型錄 cod_capable）×訂單模式（requester
+    // 仲裁）。舊版寫死 'N'；更舊的錯是「後台開關直接當 IsCollection」——線上已
+    // 刷卡的訂單也送出代收，顧客到門市被再收一次錢。合流後：
+    //   能力層  supports_cod() 讀型錄（官方契約允不允許代收），
+    //   訂單層  resolve_is_collection() 只認「付款方式＝貨到付款」且能力成立，
+    //           collect×非COD付款／prepaid×COD付款／collect×不支援代收 一律 throw。
     Settings::$options = [];
     $unimart = new ( $ns . 'EcpayShippingUnimart' )();
-    $assert( false === $unimart->supports_cod(), '(d) 未設定時預設不代收' );
-
-    Settings::$options = [ 'shipping_ys_ec_ecpay_ship_unimart_cod_enabled' => '1' ];
-    $assert( true === $unimart->supports_cod(), '(d2) 🔴 後台開啟後 supports_cod() 才回 true（舊版寫死 N）' );
-
-    // ── (e) 🔴 C2C 必填退貨門市；缺值 fail-closed ──────────────────────────
-    Settings::$options = [];
-    $u_c2c = new ( $ns . 'EcpayShippingUnimartC2C' )();
+    $post    = new ( $ns . 'EcpayShippingPost' )();
     $assert(
-        '' === $u_c2c->get_return_store_id() && '' === $unimart->get_return_store_id(),
-        '(e) 未設定退貨門市時回空字串（由 requester fail-closed，不猜門市）'
+        true === $unimart->supports_cod() && false === $post->supports_cod(),
+        '(d) supports_cod() 是型錄能力（7-11 官方可代收；郵局不可），不是後台開關'
     );
 
-    Settings::$options = [ 'ship_c2c_return_store_id' => '991182' ];
+    $req_src = str_replace( "\r\n", "\n", (string) file_get_contents( $root . '/src/Shipping/Ecpay/EcpayShippingRequester.php' ) );
+    $assert(
+        str_contains( $req_src, "'collect' === \$collection_mode && self::COD_GATEWAY_ID !== \$payment_method" )
+        && str_contains( $req_src, "'collect' === \$collection_mode && ! \$this->method->supports_cod()" )
+        && str_contains( $req_src, 'if ( ! $this->method->supports_cod() ) {' )
+        && ! str_contains( $req_src, "'IsCollection'      => 'N'" ),
+        '(d2) 🔴 IsCollection 由訂單模式×能力仲裁（矛盾即 throw），不再寫死 N'
+    );
+
+    // ── (e) 🔴 退貨門市依官方規格：**選填**、且只有 7-ELEVEN C2C（UNIMARTC2C）
+    // 適用——官方明載「未設定時退回原寄件門市」。先前兩者都搞錯：對全家／萊爾富
+    // 送出它們不吃的欄位，又把「沒填」當錯誤擋啟用。option key 一方式一把，
+    // 共用一把 key 會把 A 通路的退貨寄到 B 通路的門市。
+    Settings::$options = [];
+    $u_c2c = new ( $ns . 'EcpayShippingUnimartC2C' )();
+    $f_c2c = new ( $ns . 'EcpayShippingFamilyC2C' )();
+    $assert(
+        true === $u_c2c->supports_return_store()
+        && false === $f_c2c->supports_return_store()
+        && false === $unimart->supports_return_store()
+        && '' === $u_c2c->get_return_store_id(),
+        '(e) 退貨門市僅 UNIMARTC2C 適用；未設定回空字串（合法，綠界退回原寄件門市）'
+    );
+
+    Settings::$options = [ 'ys_ec_ecpay_ship_unimart_c2c_return_store_id' => '991182' ];
     $assert(
         '991182' === $u_c2c->get_return_store_id()
+        && '' === $f_c2c->get_return_store_id()
         && '' === $unimart->get_return_store_id(),
-        '(e2) C2C 讀得到退貨門市；B2C 不需要也不讀'
+        '(e2) option key 一方式一把：只有 UNIMARTC2C 讀得到自己的退貨門市'
+    );
+
+    $assert(
+        str_contains( $req_src, 'if ( $this->method->supports_return_store() ) {' )
+        && str_contains( $req_src, "if ( '' !== \$return_store ) {" )
+        && str_contains( $req_src, "\$fields['ReturnStoreID'] = \$return_store;" ),
+        '(e3) requester 只在「適用且有值」時才送 ReturnStoreID（不適用的 subtype 一個字都不送）'
     );
 
     // ── (f) 契約：requester 的三個欄位都來自物流方式 ───────────────────────
@@ -279,25 +321,45 @@ namespace {
     );
 
     // ── (g) 契約：C2C 的寄件代碼必須帶回來（否則貨出不去）──────────────────
+    // 合流後：缺欄位 fail-closed 由型錄 required_response_fields 驅動——
+    // UNIMARTC2C 要求 CVSPaymentNo＋CVSValidationNo、FAMIC2C／HILIFEC2C 要求
+    // CVSPaymentNo；requester 逐欄檢查（missing_required_fields）後才回成功，
+    // 並把兩段寄件代碼分開持久化（不是混進 tracking）。
+    $catalog_src = str_replace( "\r\n", "\n", (string) file_get_contents( $root . '/src/Shipping/Ecpay/EcpayShippingCatalog.php' ) );
     $assert(
         str_contains( $code, "'cvs_payment_no'" )
         && str_contains( $code, "'cvs_validation_no'" )
-        && str_contains( $code, "\$this->method->is_c2c() && '' === \$cvs_payment_no" ),
-        '(g) 🔴 C2C 回單保留 CVSPaymentNo／CVSValidationNo，缺寄貨編號即失敗'
+        && str_contains( $code, 'missing_required_fields' )
+        && str_contains( $code, 'required_response_fields()' )
+        && str_contains( $catalog_src, "[ 'AllPayLogisticsID', 'CVSPaymentNo', 'CVSValidationNo' ]" )
+        && str_contains( $catalog_src, "[ 'AllPayLogisticsID', 'CVSPaymentNo' ]" ),
+        '(g) 🔴 C2C 回單保留 CVSPaymentNo／CVSValidationNo，缺寄貨編號即失敗（型錄驅動 fail-closed）'
     );
 
     // ── (h) 契約：電子地圖的 subtype 表與方式一致 ──────────────────────────
+    // 合流後：選店器**不再自己維護**對照表，一律向型錄查（map_subtypes()）；
+    // 代收模式與送單共用同一條仲裁規則（resolve_collection_mode ↔
+    // resolve_is_collection），IsCollection 不寫死。
     $sel = str_replace( "\r\n", "\n", (string) file_get_contents( $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php' ) );
     $missing = [];
     foreach ( $expected as $class => [ $subtype, $is_c2c ] ) {
-        $id = ( new ( $ns . $class )() )->get_id();
-        if ( ! str_contains( $sel, "'" . $id . "'" ) || ! str_contains( $sel, "'" . $subtype . "'" ) ) {
-            $missing[] = $id;
+        $m = new ( $ns . $class )();
+        if ( '' === trim( (string) $m->get_logistics_subtype() ) ) {
+            $missing[] = $m->get_id();
+        }
+    }
+    $map_subtypes = $catalog_class::map_subtypes();
+    foreach ( [ 'ys_ec_ecpay_ship_unimart', 'ys_ec_ecpay_ship_family_c2c', 'ys_ec_ecpay_ship_unimart_freeze' ] as $probe_id ) {
+        if ( ! isset( $map_subtypes[ $probe_id ] ) || '' === (string) $map_subtypes[ $probe_id ] ) {
+            $missing[] = $probe_id . '(map)';
         }
     }
     $assert(
-        [] === $missing && str_contains( $sel, 'self::is_cod_enabled( $shipping_id )' ),
-        '(h) 🔴 電子地圖涵蓋全部 subtype，且代收與送單一致（缺：' . ( implode( ', ', $missing ) ?: '無' ) . '）'
+        [] === $missing
+        && str_contains( $sel, 'EcpayShippingCatalog::map_subtypes()' )
+        && str_contains( $sel, 'self::resolve_collection_mode( $method, $payment_method )' )
+        && str_contains( $sel, "'IsCollection'      => \$is_collection ? 'Y' : 'N'" ),
+        '(h) 🔴 電子地圖 subtype 表由型錄導出、代收與送單同一條規則（缺：' . ( implode( ', ', $missing ) ?: '無' ) . '）'
     );
 
     echo "\nshipping c2c + temperature: {$pass} PASS / {$fail} FAIL\n";

@@ -61,12 +61,21 @@ v009_check(
         && false !== strpos($plugin, "is_capability_enabled( 'ys_ecpay', 'payment'")
 );
 
+// 合流後（0.2.16 main）：物流 gating 集中在 ShippingMethodOperability::is_operable()
+//（provider enabled＋shipping capability＋method-level lifecycle，缺 lifecycle 系統時
+// 退回設定開關且 fail-closed），register_shipping_methods 由型錄逐式套用。
+$operability = v009_read('src/Support/ShippingMethodOperability.php');
 v009_check(
     'Shipping methods are not registered when ECPay shipping capability is disabled',
-    (bool) preg_match('/function\s+register_shipping_methods\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSShippingRegistry::register).)*is_shipping_enabled\s*\(/s', $plugin)
-        && false !== strpos($plugin, "is_capability_enabled( 'ys_ecpay', 'shipping'")
+    (bool) preg_match('/function\s+register_shipping_methods\s*\([^)]*\)\s*:\s*void\s*\{(?:(?!YSShippingRegistry::register).)*ShippingMethodOperability::is_operable\s*\(/s', $plugin)
+        && false !== strpos($operability, "is_capability_enabled( self::PROVIDER_ID, 'shipping', \$manifest )")
+        && false !== strpos($operability, "is_method_enabled( 'shipping', \$method_id, \$manifest )")
+        && false !== strpos($operability, "is_provider_enabled( self::PROVIDER_ID, \$manifest )")
 );
 
+// 每一個方式的註冊都必須通過 is_operable：型錄迴圈內 gate 先於 register，
+// 且五個 B2C／宅配類別都必須存在於型錄描述中（id→class 配對）。
+$catalog = v009_read('src/Shipping/Ecpay/EcpayShippingCatalog.php');
 $shipping_methods = [
     'ys_ec_ecpay_ship_family'  => 'EcpayShippingFamily',
     'ys_ec_ecpay_ship_unimart' => 'EcpayShippingUnimart',
@@ -75,26 +84,31 @@ $shipping_methods = [
     'ys_ec_ecpay_ship_post'    => 'EcpayShippingPost',
 ];
 
+$loop_gated = (bool) preg_match(
+    '/foreach\s*\(\s*EcpayShippingCatalog::all\(\)[^{]*\{\s*if\s*\(\s*!\s*ShippingMethodOperability::is_operable\s*\(\s*\$method_id\s*\)\s*\)\s*\{\s*continue;.*?YSShippingRegistry::register\s*\(\s*\$method\s*\)/s',
+    $plugin
+);
+
 foreach ($shipping_methods as $method_id => $class_name) {
     v009_check(
         "{$class_name} registration requires its ECPay lifecycle method switch",
-        (bool) preg_match(
-            "/is_method_enabled\s*\(\s*'shipping'\s*,\s*'{$method_id}'\s*\).*?YSShippingRegistry::register\s*\(\s*new\s+{$class_name}\s*\(/s",
-            $plugin
-        )
+        $loop_gated
+            && (bool) preg_match(
+                "/'{$method_id}'.{0,2000}?{$class_name}::class/s",
+                $catalog
+            )
     );
 }
 
 v009_check(
     'CVS map form data requires the declared ECPay shipping method switch',
-    false !== strpos($store, 'METHOD_ALIASES')
-        && false !== strpos($store, "YSProviderLifecycleState::is_method_enabled( 'shipping', \$shipping_id")
-        && false !== strpos($store, 'Settings::shipping_enabled( $method_alias )')
+    false !== strpos($store, '! ShippingMethodOperability::is_operable( $shipping_id )')
+        && false !== strpos($operability, 'Settings::shipping_enabled( $alias )')
 );
 
 v009_check(
     'Store map route fails closed by lifecycle method state',
-    false !== strpos($plugin, "is_method_enabled( 'shipping', \$shipping_id")
+    false !== strpos($plugin, '! ShippingMethodOperability::is_operable( $shipping_id )')
         && false !== strpos($plugin, 'shipping_method_disabled')
 );
 

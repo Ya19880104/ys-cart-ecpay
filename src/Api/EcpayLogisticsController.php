@@ -14,6 +14,7 @@ use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
+use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayLogisticsController {
@@ -513,14 +514,19 @@ final class EcpayLogisticsController {
 		}
 
 		// 🔴 `YSOrder::update()` 對 affected=0 也回 true——「回 true」不代表寫進去了。
-		// ACK 不可逆，所以每一個寫入都要**讀回來**確認。
+		// ACK 不可逆，所以純量欄位（tracking_number／shipping_status）走 typed
+		// write＋readback（ScalarColumnWriter），與付款通知、建單同一條寫入紀律。
 		// （payment_detail 已由上方 CAS 落盤並驗證；這裡只剩純量欄位，可能為空。）
 		if ( [] !== $order_update ) {
-			if ( false === YSOrder::update( (int) $order->id, $order_update ) ) {
-				return false;
-			}
+			$written = ScalarColumnWriter::write( (int) $order->id, $order_update );
+			if ( ! ScalarColumnWriter::is_persisted( $written ) ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback 的訂單欄位寫入失敗（不 ACK，等重送）', [
+					'order_id' => (int) $order->id,
+					'status'   => $status,
+					'tracking' => $tracking,
+					'state'    => $written['state'],
+				] );
 
-			if ( ! $this->order_update_persisted( (int) $order->id, $order_update ) ) {
 				return false;
 			}
 		}
@@ -528,35 +534,6 @@ final class EcpayLogisticsController {
 		return $this->sync_label( $label, $params, $tracking, $status, $status_advance_allowed );
 	}
 
-	/**
-	 * 訂單那幾個欄位真的落盤了嗎
-	 *
-	 * @param array<string,mixed> $expected
-	 */
-	private function order_update_persisted( int $order_id, array $expected ): bool {
-		global $wpdb;
-
-		$orders_table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
-		$row          = $wpdb->get_row( $wpdb->prepare(
-			"SELECT payment_detail, tracking_number FROM {$orders_table} WHERE id = %d",
-			$order_id
-		) );
-
-		if ( null === $row ) {
-			return false;
-		}
-
-		foreach ( [ 'payment_detail', 'tracking_number' ] as $column ) {
-			if ( ! array_key_exists( $column, $expected ) ) {
-				continue;
-			}
-			if ( (string) ( $row->{$column} ?? '' ) !== (string) $expected[ $column ] ) {
-				return false;
-			}
-		}
-
-		return true;
-	}
 
 	private function map_status( string $status ): ?string {
 		return EcpayShippingCatalog::pipeline_state_for_logistics_status( $status );

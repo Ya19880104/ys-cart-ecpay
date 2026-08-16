@@ -34,21 +34,26 @@ $check(
 	version_compare( $v014_ver[1] ?? '0', '0.2.8', '>=' )
 );
 
+// 合流後（0.2.15 main）：build_map_form_data 多收 $payment_method（代收模式
+// 仲裁用）——return context 語意不變。
 $check(
 	'map route accepts return_url/cart_scope and passes them to selector',
 	strpos( $plugin, "\$cart_scope  = self::sanitize_cart_scope" ) !== false
 		&& strpos( $plugin, "\$return_url  = esc_url_raw" ) !== false
-		&& preg_match( '/build_map_form_data\(\s*\$shipping_id,\s*\$context,\s*\$order_id,\s*\$cart_scope,\s*\$return_url\s*\)/s', $plugin ) === 1
+		&& preg_match( '/build_map_form_data\(\s*\$shipping_id,\s*\$context,\s*\$order_id,\s*\$cart_scope,\s*\$return_url,\s*\$payment_method\s*\)/s', $plugin ) === 1
 );
 
+// 合流後：map transient 與 store payload 的 return context 欄位對齊為 8 空格
+// 縮排；store payload 的 return_url 統一經 sanitize_return_url()（含
+// wp_validate_redirect），不再直接抄 $store_info。
 $check(
 	'selector stores sanitized return context in map transient and store payload',
 	strpos( $selector, "string \$cart_scope = 'default'" ) !== false
 		&& strpos( $selector, "string \$return_url = ''" ) !== false
 		&& strpos( $selector, "'cart_scope'        => \$cart_scope" ) !== false
-		&& strpos( $selector, "'return_url'         => \$return_url" ) !== false
-		&& strpos( $selector, "\$store_info['return_url']" ) !== false
+		&& strpos( $selector, "'return_url'        => \$return_url" ) !== false
 		&& strpos( $selector, 'sanitize_return_url' ) !== false
+		&& strpos( $selector, "self::sanitize_return_url(\n\t\t\t\t(string) ( \$map_data['return_url'] ?? '' )" ) !== false
 );
 
 $check(
