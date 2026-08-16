@@ -28,6 +28,7 @@ use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySavedStoreReauthorizer;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
@@ -391,6 +392,10 @@ final class Plugin {
 			|| 1 !== preg_match( '/^[a-f0-9]{64}$/D', $selection_digest ) ) {
 			return '';
 		}
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return '';
+		}
 
 		$credentials = Settings::logistics_credentials_for_method( $method_id );
 		$hash_key = (string) ( $credentials['hash_key'] ?? '' );
@@ -411,6 +416,9 @@ final class Plugin {
 		}
 
 		$key = hash( 'sha256', $hash_key . "\0" . $hash_iv, true );
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return '';
+		}
 		return hash_hmac( 'sha256', $payload, $key );
 	}
 

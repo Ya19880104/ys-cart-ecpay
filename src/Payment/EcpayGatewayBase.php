@@ -113,7 +113,18 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		$form_data = ( new EcpayPaymentClient() )->build_aio_form( $persisted, $merchant_trade_no, $this->choose_payment() );
+		// 🔴 R14：表單建構受 reader lease 保護——設定 commit 期間（或前次 commit
+		// crash 未修復）丟例外＝本次未送出任何付款，可重試（retryable）。
+		try {
+			$form_data = ( new EcpayPaymentClient() )->build_aio_form( $persisted, $merchant_trade_no, $this->choose_payment() );
+		} catch ( \RuntimeException $e ) {
+			return [
+				'success'   => false,
+				'outcome'   => 'provider_unavailable',
+				'retryable' => true,
+				'message'   => $e->getMessage(),
+			];
+		}
 
 		return [
 			'success'      => true,

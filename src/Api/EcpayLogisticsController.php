@@ -11,6 +11,7 @@ use YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayLogisticsController {
@@ -37,11 +38,22 @@ final class EcpayLogisticsController {
 	}
 
 	public function notify( \WP_REST_Request $request ): void {
+		// 🔴 R14 reader lease：驗章與後續處理讀當下憑證——設定 commit 期間
+		// 回非 2xx（綠界會重送物流回呼），不誤拒也不遺失。lease 由 request
+		// 結束時自動釋放。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			$this->respond_text( '0|Provider settings maintenance', 503 );
+		}
+
 		$params = $this->params( $request );
 		$lookup = $this->find_label( $params );
 		$label_method = 'found' === (string) ( $lookup['status'] ?? '' ) && is_object( $lookup['label'] ?? null )
 			? (string) ( $lookup['label']->shipping_method ?? '' )
 			: '';
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			$this->respond_text( '0|Provider settings maintenance', 503 );
+		}
 		if ( ! $this->verify( $params, $label_method ) ) {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}

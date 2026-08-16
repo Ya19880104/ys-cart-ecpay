@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
@@ -81,7 +82,15 @@ final class EcpayStoreSelector {
 			return false;
 		}
 
-		$return_url  = self::sanitize_return_url( $return_url, $cart_scope );
+		$return_url = self::sanitize_return_url( $return_url, $cart_scope );
+
+		// 🔴 R14 reader lease：地圖表單以當下物流憑證簽章——設定 commit 期間
+		// 不開地圖（回 false＝既有「暫時不可用」語意，稍後重試即可）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return false;
+		}
+
 		$credentials = Settings::logistics_credentials_for_method( $shipping_id );
 		// 🔴 `ExtraData` 是**一次性 nonce**，長度 20 個英數字（CODEX #3W C6）。
 		//
@@ -134,6 +143,11 @@ final class EcpayStoreSelector {
 		];
 
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		// 🔴 R14：表單交付前 own-row fence（stalled 被收割的 request 不交出舊簽章）。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return false;
+		}
 
 		return [
 			'action_url'      => Settings::logistics_endpoint( self::MAP_PATH, $shipping_id ),
@@ -687,6 +701,13 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed>  $map_data
 	 */
 	private static function verify_map_payload( array $params, array $map_data ): bool {
+		// 🔴 R14 reader lease：選店回呼驗章讀當下憑證——設定 commit 期間拒驗
+		// （false＝回呼失敗，顧客重開地圖即可；不會用半套用 tuple 誤判）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return false;
+		}
+
 		$shipping_id = (string) ( $map_data['shipping_id'] ?? '' );
 		$credentials = Settings::logistics_credentials_for_method( $shipping_id );
 		if ( '' === $credentials['merchant_id']
@@ -732,6 +753,9 @@ final class EcpayStoreSelector {
 		//
 		// 若對方**確實帶了**簽章，那就驗它（帶錯＝拒絕）——多一層不會有壞處，
 		// 但**缺席不得成為拒絕的理由**。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return false;
+		}
 		if ( ! empty( $params['CheckMacValue'] ) ) {
 			return CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
 		}

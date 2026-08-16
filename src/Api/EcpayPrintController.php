@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 
@@ -40,10 +41,19 @@ final class EcpayPrintController {
 		if ( ! ShippingMethodOperability::is_operable( $method_id ) ) {
 			wp_die( esc_html__( 'ECPay print method is disabled.', 'ys-cart-ecpay' ), 403 );
 		}
+		// 🔴 R14 reader lease：本頁輸出的表單會直接 POST 給綠界，且下方以當下
+		// 憑證重驗 payload——設定 commit 期間不服務（維護結束後重按列印即可）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			wp_die( esc_html__( '綠界設定維護中，請稍後再試。', 'ys-cart-ecpay' ), 503 );
+		}
 		$credentials = Settings::logistics_credentials_for_method( $method_id );
 		$fields = $payload['fields'];
 		$spec = EcpayShippingCatalog::print_spec( $method_id );
 		$expected_api_url = null === $spec ? '' : Settings::logistics_endpoint( (string) $spec['path'], $method_id );
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			wp_die( esc_html__( '綠界設定維護中，請重新產生列印資料。', 'ys-cart-ecpay' ), 503 );
+		}
 		if ( '' === $expected_api_url
 			|| ! hash_equals( $expected_api_url, (string) $payload['api_url'] )
 			|| '' === $credentials['merchant_id']
@@ -57,6 +67,9 @@ final class EcpayPrintController {
 		$host    = strtolower( (string) wp_parse_url( $api_url, PHP_URL_HOST ) );
 		if ( ! in_array( $host, [ 'logistics.ecpay.com.tw', 'logistics-stage.ecpay.com.tw' ], true ) ) {
 			wp_die( esc_html__( 'Unsupported print host.', 'ys-cart-ecpay' ), 400 );
+		}
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			wp_die( esc_html__( '綠界設定維護中，請重新產生列印資料。', 'ys-cart-ecpay' ), 503 );
 		}
 
 		while ( ob_get_level() > 0 ) {

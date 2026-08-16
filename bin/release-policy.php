@@ -73,7 +73,7 @@ if (!function_exists('ys_cart_ecpay_release_slug')) {
             'artifacts', 'bin', 'node_modules', 'tests', 'tmp',
         ];
         $excludedFiles = [
-            '.gitignore', '.env', '.env.example',
+            '.gitignore', '.gitattributes', '.env', '.env.example',
             'composer.json', 'composer.lock', 'CHANGELOG.md', 'phpunit.xml',
             '.DS_Store',
         ];

@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Payment;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayPaymentClient {
@@ -20,6 +21,14 @@ final class EcpayPaymentClient {
 	 * @return array{action_url:string,fields:array<string,string>}
 	 */
 	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment ): array {
+		// 🔴 R14 reader lease：付款表單以當下 payment 憑證簽 CMV——設定 commit
+		// 期間簽出的表單可能帶著「隨後被回滾／被換掉」的 signer，顧客送回時
+		// 必失驗。lease 拿不到＝丟例外，caller 以「未送出任何付款」語意拒絕。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			throw new \RuntimeException( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），請稍後再試。' );
+		}
+
 		$credentials = Settings::payment_credentials();
 		$amount      = max( 1, (int) round( (float) ( $order->total ?? 0 ) ) );
 		$item_name   = $this->clean_item_name( $order );
@@ -47,6 +56,12 @@ final class EcpayPaymentClient {
 			'sha256'
 		);
 
+		// 🔴 表單交付＝這條路徑的「送出」（顧客瀏覽器隨後 POST 給綠界）——交付前
+		// own-row fence：stalled 而被 writer 收割的 request 不得再交出舊簽章表單。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			throw new \RuntimeException( '綠界設定維護窗與本次付款重疊，請稍後再試。' );
+		}
+
 		return [
 			'action_url' => Settings::payment_endpoint(),
 			'fields'     => $fields,
@@ -59,6 +74,17 @@ final class EcpayPaymentClient {
 	 * @return array{success:bool,data:array<string,string>|null,message:string}
 	 */
 	public function query_trade( string $merchant_trade_no ): array {
+		// 🔴 R14 reader lease（同 build_aio_form；查詢請求簽章＋回應驗章都用
+		// 當下憑證）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return [
+				'success' => false,
+				'data'    => null,
+				'message' => '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出查詢，請稍後再試。',
+			];
+		}
+
 		$credentials = Settings::payment_credentials();
 		$merchant_trade_no = trim( $merchant_trade_no );
 		if ( '' === $merchant_trade_no
@@ -84,6 +110,15 @@ final class EcpayPaymentClient {
 			$credentials['hash_iv'],
 			'sha256'
 		);
+
+		// 🔴 R14 pre-send fence。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return [
+				'success' => false,
+				'data'    => null,
+				'message' => '綠界設定維護窗與本次查詢重疊，本次未送出查詢，請稍後再試。',
+			];
+		}
 
 		$response = wp_remote_post(
 			Settings::payment_query_endpoint(),

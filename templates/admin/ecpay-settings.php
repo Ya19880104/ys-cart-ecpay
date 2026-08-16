@@ -16,10 +16,24 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 	<?php
 	$ys_ec_settings_errors = [
 		'invalid_home_credential_family'      => __( '宅配憑證來源無效，設定未變更。', 'ys-cart-ecpay' ),
-		'home_methods_must_be_disabled'       => __( '切換宅配憑證來源前，請先停用所有黑貓與郵局物流方式。', 'ys-cart-ecpay' ),
-		'active_home_labels'                  => __( '仍有未結束的宅配物流單，為避免舊單回呼或列印失效，憑證來源未切換。', 'ys-cart-ecpay' ),
-		'home_label_lookup_failed'            => __( '無法確認既有宅配物流單狀態，已採安全模式拒絕切換。', 'ys-cart-ecpay' ),
-		'home_credential_family_save_failed'  => __( '宅配憑證來源未能可靠寫入，請稍後重試。', 'ys-cart-ecpay' ),
+		'signer_change_requires_methods_disabled' => __( '本次儲存會改變物流簽章憑證來源。請先停用全部物流方式再變更（避免變更過程中建立的物流單使用不一致的憑證）。設定未變更。', 'ys-cart-ecpay' ),
+		'signer_change_active_labels'         => __( '仍有未結束或升級前的物流單，為避免舊單回呼、查詢或列印失驗，本次會改變簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
+		'signer_change_label_lookup_failed'   => __( '無法確認既有物流單狀態，已採安全模式，本次會改變簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
+		'secret_encrypt_failed'               => __( '金鑰加密能力不可用（YS CART 核心未載入或版本過舊），設定未變更。', 'ys-cart-ecpay' ),
+		'payment_signer_change_requires_methods_disabled' => __( '本次儲存會改變金流簽章憑證。請先停用全部綠界付款方式再變更（已簽出的結帳表單與進行中的付款會以舊憑證送回，變更會使其失驗）。設定未變更。', 'ys-cart-ecpay' ),
+		'payment_signer_change_active_attempts' => __( '仍有未終局的綠界付款訂單（pending／offline_payment）。為避免其回呼與查詢失驗，本次會改變金流簽章憑證的儲存未套用；請待付款終局後再變更。', 'ys-cart-ecpay' ),
+		'settings_crash_repair_requires_full_credentials' => __( '前次設定寫入未完整結束，簽章操作已安全停用。請在 API 設定頁重新輸入每一組 MerchantID／HashKey／HashIV，或明確勾選清除此組憑證，再儲存以完成全量修復。', 'ys-cart-ecpay' ),
+		'settings_crash_repair_requires_api_tab' => __( '前次 API 憑證設定未完整結束，簽章操作仍安全停用；付款／物流方式頁不能解除此隔離。請回 API 設定頁完成全量憑證修復。', 'ys-cart-ecpay' ),
+		'provider_lifecycle_commit_failed_rolled_back' => __( '供應商啟用狀態與 Core lifecycle 同步失敗，已還原原設定。', 'ys-cart-ecpay' ),
+		'provider_lifecycle_rollback_failed' => __( '供應商啟用狀態同步失敗且無法完整還原；系統已維持簽章隔離。請先修復資料庫寫入問題，再到 API 設定頁完成全量修復。', 'ys-cart-ecpay' ),
+		'method_lifecycle_commit_failed_rolled_back' => __( '付款／物流方式與 Core lifecycle 同步失敗，已還原本次設定。', 'ys-cart-ecpay' ),
+		'method_lifecycle_rollback_failed' => __( '付款／物流方式同步失敗且無法完整還原；系統已維持簽章隔離。請先修復資料庫寫入問題，再到 API 設定頁完成全量修復。', 'ys-cart-ecpay' ),
+		'payment_signer_change_attempt_lookup_failed' => __( '無法確認進行中付款訂單的狀態，已採安全模式，本次會改變金流簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
+		'settings_maintenance_lock_unavailable' => __( '目前有另一個設定儲存、或簽章操作（建單／查詢／回呼／列印）正在進行中，請稍後再試。設定未變更。', 'ys-cart-ecpay' ),
+		'settings_state_read_failed'          => __( '無法可靠讀取目前設定狀態（資料庫查詢失敗），已安全中止，設定未變更。', 'ys-cart-ecpay' ),
+		'settings_commit_failed_rolled_back'  => __( '設定寫入未完全成功，已全數還原為儲存前狀態，請稍後重試。', 'ys-cart-ecpay' ),
+		'signer_gate_rollback_failed'         => __( '設定寫入失敗且還原未完全成功——目前憑證狀態可能不一致，請立即檢查各組憑證欄位並重新儲存正確值。', 'ys-cart-ecpay' ),
+		'signer_gate_rollback_failed'         => __( '簽章憑證變更被拒且自動還原失敗——設定可能處於中間狀態，請立即人工檢查全部憑證欄位。', 'ys-cart-ecpay' ),
 	];
 	$ys_ec_settings_error = sanitize_key( wp_unslash( (string) ( $_GET['settings_error'] ?? '' ) ) );
 	?>
@@ -27,6 +41,13 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 		<div class="ys-ec-notice ys-ec-notice-error">
 			<span class="dashicons dashicons-warning"></span>
 			<?php echo esc_html( $ys_ec_settings_errors[ $ys_ec_settings_error ] ); ?>
+		</div>
+	<?php endif; ?>
+
+	<?php if ( class_exists( \YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock::class )
+		&& \YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock::crashed_flag_present() ) : ?>
+		<div class="notice notice-error">
+			<p><?php esc_html_e( '🔴 前次綠界設定儲存未正常完成（程序中斷），憑證狀態尚未驗證——所有綠界出網操作（建單／查詢／回呼驗章／列印）已暫停。請核對本頁各組憑證欄位後重新儲存一次；儲存成功即恢復。', 'ys-cart-ecpay' ); ?></p>
 		</div>
 	<?php endif; ?>
 
@@ -113,6 +134,13 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 								<span class="ysca-field__label"><?php esc_html_e( 'Hash IV', 'ys-cart-ecpay' ); ?></span>
 								<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings[ $ys_ec_group . '_hash_iv_is_set' ] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 							</label>
+							<?php if ( 'payment' !== $ys_ec_group ) : ?>
+								<label class="ysca-field">
+									<span class="ysca-field__label"><?php esc_html_e( '清除此組憑證', 'ys-cart-ecpay' ); ?></span>
+									<input type="checkbox" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_clear" value="1">
+								</label>
+								<p class="description"><?php esc_html_e( '勾選並儲存後，本組（測試模式／商店代號／Hash Key／Hash IV）全部清空。要啟用「重用金流憑證」時，所有物流憑證組必須為空。', 'ys-cart-ecpay' ); ?></p>
+							<?php endif; ?>
 						</div>
 					</div>
 				</div>
@@ -128,6 +156,16 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						</select>
 					</label>
 					<p class="description"><?php esc_html_e( '請依綠界後台該 MerchantID 實際開通的宅配能力選擇。切換前必須先停用全部宅配方式，且不能有未結束或升級前的宅配物流單；系統不會自行複製或混用兩組金鑰。', 'ys-cart-ecpay' ); ?></p>
+				</div>
+			</div>
+			<div class="ysca-card ysca-mt-md">
+				<div class="ysca-card__body">
+					<h2><?php esc_html_e( '重用金流憑證', 'ys-cart-ecpay' ); ?></h2>
+					<label class="ysca-field">
+						<span class="ysca-field__label"><?php esc_html_e( '物流簽章重用金流憑證', 'ys-cart-ecpay' ); ?></span>
+						<input type="checkbox" name="ys_ec_ecpay_logistics_reuse_payment" value="1" <?php checked( ! empty( $settings['logistics_reuse_payment'] ) ); ?>>
+					</label>
+					<p class="description"><?php esc_html_e( '綠界商家通常金流與物流共用同一組 MerchantID／HashKey／HashIV。啟用後，只要上方所有物流憑證欄位（含舊版單一憑證）全部留空，物流建單、選店、查詢、回呼即以金流憑證簽章，環境（測試／正式）也以金流設定為準。任一物流欄位有值時本開關不生效，仍走該組憑證的原有規則。', 'ys-cart-ecpay' ); ?></p>
 				</div>
 			</div>
 			<?php if ( ! empty( $settings['legacy_logistics_credentials_present'] ) ) : ?>

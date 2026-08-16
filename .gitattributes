@@ -1,0 +1,3 @@
+# 建包可重現性（R13）：任何 clone（不論 core.autocrlf 設定）checkout 一律 LF，
+# 官方 builder 在任何機器產出的 ZIP 位元組相同。二進位檔由 text=auto 自動偵測排除。
+* text=auto eol=lf

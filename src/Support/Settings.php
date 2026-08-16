@@ -93,6 +93,66 @@ final class Settings {
 		return YSEcommerce::get_instance()->update_setting( $key, $value );
 	}
 
+	/**
+	 * 直讀 settings 表一列（🔴 v0.2.16 R13：commit/rollback 驗證專用）。
+	 *
+	 * 為什麼不走 get()：core 的 get_setting 有 per-request cache，且把
+	 * 「row 不存在」與 default 壓成同一個值——對「寫入是否真的落盤」與
+	 * 「row 是否存在」這兩個問題都答不準。本方法繞過 cache 直問 DB，
+	 * 並保留 wpdb 錯誤通道（讀取失敗 ≠ 不存在）。
+	 *
+	 * @return array{ok:bool, existed:bool, value:string} ok=false＝無法判定（fail-closed）
+	 */
+	public static function db_probe( string $key ): array {
+		global $wpdb;
+		$fail = [ 'ok' => false, 'existed' => false, 'value' => '' ];
+		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_var' ) ) {
+			return $fail;
+		}
+		$table            = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'settings';
+		$wpdb->last_error = '';
+		try {
+			$value = $wpdb->get_var( $wpdb->prepare(
+				"SELECT setting_value FROM {$table} WHERE setting_key = %s",
+				$key
+			) );
+		} catch ( \Throwable $e ) {
+			return $fail;
+		}
+		if ( '' !== (string) ( $wpdb->last_error ?? '' ) ) {
+			return $fail;
+		}
+
+		return [ 'ok' => true, 'existed' => null !== $value, 'value' => null === $value ? '' : (string) $value ];
+	}
+
+	/**
+	 * 刪除 settings 表一列（🔴 v0.2.16 R13：rollback 恢復「row 不存在」態專用）。
+	 *
+	 * 「row 不存在」是一個**狀態**，不是空值：reader 對 absent 的預設值
+	 * （例如 test_mode 預設 '1'＝test）可能與任何顯式值都不同。rollback 把
+	 * 原本不存在的 key 寫成 '' 會悄悄改變 effective 行為（''≠absent）。
+	 * 呼叫端必須以 db_probe() 驗證刪除結果（core 2.56.12 無 cache 逐鍵失效
+	 * API，本 request 內的 get() 可能仍回快取值——驗證一律走 DB 直讀）。
+	 */
+	public static function delete( string $key ): bool {
+		global $wpdb;
+		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'delete' ) ) {
+			return false;
+		}
+		$table  = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'settings';
+		$result = $wpdb->delete( $table, [ 'setting_key' => $key ] );
+		if ( false === $result ) {
+			return false;
+		}
+		$core = YSEcommerce::get_instance();
+		if ( method_exists( $core, 'forget_setting' ) ) {
+			$core->forget_setting( $key ); // 新核心有逐鍵失效 API 時順手清 cache。
+		}
+
+		return true;
+	}
+
 	public static function enabled(): bool {
 		return '1' === (string) self::get( self::ENABLED, '0' );
 	}
@@ -108,10 +168,11 @@ final class Settings {
 	}
 
 	/**
+	 * @param array<string,string|null>|null $pending 見 {@see self::logistics_credentials_for_channel()}
 	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
 	 */
-	public static function payment_credentials(): array {
-		return self::credentials( self::PAYMENT_KEYS );
+	public static function payment_credentials( ?array $pending = null ): array {
+		return self::credentials( self::PAYMENT_KEYS, $pending );
 	}
 
 	/**
@@ -154,16 +215,22 @@ final class Settings {
 	 * must declare the profile instead of the plugin inferring it from sandbox
 	 * account groupings. The default remains B2C/home for backward compatibility.
 	 *
+	 * 🔴 v0.2.16 R13 `$pending` overlay：設定 request 用它在**寫入之前**評估
+	 * 「commit 後的 effective 簽章」——key 存在於 $pending 即以其值取代 DB 讀
+	 * （值為 null＝視同 row 不存在→退 reader 預設）。null pending＝純 DB 讀，
+	 * runtime 路徑完全不變。secrets 在 overlay 中一律是**儲存格式**（密文）。
+	 *
+	 * @param array<string,string|null>|null $pending
 	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
 	 */
-	public static function logistics_credentials_for_channel( string $channel ): array {
-		$family = self::credential_family_for_channel( $channel );
+	public static function logistics_credentials_for_channel( string $channel, ?array $pending = null ): array {
+		$family = self::credential_family_for_channel( $channel, $pending );
 		if ( '' === $family ) {
 			return self::empty_credentials();
 		}
 
-		$b2c = self::credentials( self::LOGISTICS_B2C_HOME_KEYS );
-		$c2c = self::credentials( self::LOGISTICS_C2C_KEYS );
+		$b2c = self::credentials( self::LOGISTICS_B2C_HOME_KEYS, $pending );
+		$c2c = self::credentials( self::LOGISTICS_C2C_KEYS, $pending );
 		if ( self::credentials_complete( $b2c )
 			&& self::credentials_complete( $c2c )
 			&& self::same_credential_tuple( $b2c, $c2c ) ) {
@@ -180,17 +247,60 @@ final class Settings {
 			return self::empty_credentials();
 		}
 
+		// ── v0.2.16 顯式「重用金流憑證」模式 ──
+		//
+		// 綠界正式商家通常只有一組介接金鑰（金流物流同一 MID；B2C/C2C 差在後台
+		// 開通能力），因此提供**顯式**開關讓物流簽章重用金流 tuple——不是隱性
+		// fallback。生效條件全部成立才回金流憑證，任一不成立 fail-closed：
+		//   1. 開關 ys_ec_ecpay_logistics_reuse_payment = '1'；
+		//   2. 兩個新物流組與 legacy 組**全空**（任何 partial 都不進本分支，
+		//      落回原有規則被各自的 partial 守門拒絕）；
+		//   3. 金流 tuple 完整；環境（test_mode）以金流為單一真相。
+		// 與 legacy fallback 不同：不要求 family 唯一——同一組金鑰服務 B2C/HOME/C2C
+		// 正是本模式的目的，能否使用以綠界後台對該 MID 的開通能力為準。
+		$legacy = self::credentials( self::LOGISTICS_KEYS, $pending );
+		if ( self::payment_reuse_enabled( $pending )
+			&& ! self::credentials_started( $b2c )
+			&& ! self::credentials_started( $c2c )
+			&& ! self::credentials_started( $legacy ) ) {
+			$payment = self::payment_credentials( $pending );
+			// 開關開了但金流不完整＝設定錯誤，不得改用任何其他來源。
+			return self::credentials_complete( $payment ) ? $payment : self::empty_credentials();
+		}
+
 		// Legacy fallback is deliberately narrow: both new groups must be empty,
 		// and enabled method switches must identify exactly one credential family.
 		// This supports a single-family historical install without ever allowing
 		// the old tuple to service B2C/home and C2C simultaneously.
 		if ( self::credentials_started( $b2c ) || self::credentials_started( $c2c )
-			|| $family !== self::unambiguous_legacy_family() ) {
+			|| $family !== self::unambiguous_legacy_family( $pending ) ) {
 			return self::empty_credentials();
 		}
 
-		$legacy = self::credentials( self::LOGISTICS_KEYS );
 		return self::credentials_complete( $legacy ) ? $legacy : self::empty_credentials();
+	}
+
+	/**
+	 * 顯式「物流重用金流憑證」開關（v0.2.16）。
+	 *
+	 * @param array<string,string|null>|null $pending 見 logistics_credentials_for_channel()
+	 */
+	public static function payment_reuse_enabled( ?array $pending = null ): bool {
+		return '1' === self::read_with_pending( 'ys_ec_ecpay_logistics_reuse_payment', '0', $pending );
+	}
+
+	/**
+	 * pending-overlay 讀值：key 在 $pending 中即以其值取代 DB（null＝視同 row
+	 * 不存在→回 $default）；否則走一般 get()。
+	 *
+	 * @param array<string,string|null>|null $pending
+	 */
+	private static function read_with_pending( string $key, string $default, ?array $pending ): string {
+		if ( null !== $pending && array_key_exists( $key, $pending ) ) {
+			return null === $pending[ $key ] ? $default : (string) $pending[ $key ];
+		}
+
+		return (string) self::get( $key, $default );
 	}
 
 	/**
@@ -202,16 +312,21 @@ final class Settings {
 	}
 
 	/**
-	 * @param array<string,string> $keys
+	 * @param array<string,string>           $keys
+	 * @param array<string,string|null>|null $pending
 	 * @return array{test_mode:bool,merchant_id:string,hash_key:string,hash_iv:string}
 	 */
-	private static function credentials( array $keys ): array {
-		$raw_key = (string) self::get( $keys['hash_key'], '' );
-		$raw_iv  = (string) self::get( $keys['hash_iv'], '' );
+	private static function credentials( array $keys, ?array $pending = null ): array {
+		$raw_key = self::read_with_pending( $keys['hash_key'], '', $pending );
+		$raw_iv  = self::read_with_pending( $keys['hash_iv'], '', $pending );
 
 		return [
-			'test_mode'   => '1' === (string) self::get( $keys['test_mode'], '1' ),
-			'merchant_id' => (string) self::get( $keys['merchant_id'], '' ),
+			// 🔴 v0.2.16 R13：live **只在顯式 '0'** 時成立——absent／''／其他值一律
+			// test（fail-safe 朝 stage：環境判定不明時打測試端點會大聲失敗，而不是
+			// 拿不確定的環境打正式機）。沒有任何 writer 會產生「tuple 完整＋test_mode
+			// 空字串」的狀態；此硬化是 rollback 語意的第二道防線。
+			'test_mode'   => '0' !== self::read_with_pending( $keys['test_mode'], '1', $pending ),
+			'merchant_id' => self::read_with_pending( $keys['merchant_id'], '', $pending ),
 			'hash_key'    => self::decrypt_secret( $raw_key ),
 			'hash_iv'     => self::decrypt_secret( $raw_iv ),
 		];
@@ -307,7 +422,17 @@ final class Settings {
 		return self::credentials_complete( self::logistics_credentials_for_method( $method_id ) );
 	}
 
-	public static function home_credential_family(): string {
+	/** @param array<string,string|null>|null $pending 見 logistics_credentials_for_channel() */
+	public static function home_credential_family( ?array $pending = null ): string {
+		// pending overlay：設定 request 在寫入前評估「commit 後」的 family。
+		// null＝視同 row 不存在→沿用歷史預設 b2c_home。
+		if ( null !== $pending && array_key_exists( self::HOME_CREDENTIAL_FAMILY, $pending ) ) {
+			$pending_value = $pending[ self::HOME_CREDENTIAL_FAMILY ];
+			return null === $pending_value
+				? self::FAMILY_B2C_HOME
+				: self::normalize_home_credential_family( (string) $pending_value );
+		}
+
 		global $wpdb;
 
 		// Core's generic get_setting() intentionally collapses a SQL error and a
@@ -383,16 +508,18 @@ final class Settings {
 			&& hash_equals( $left['hash_iv'], $right['hash_iv'] );
 	}
 
-	private static function credential_family_for_channel( string $channel ): string {
+	/** @param array<string,string|null>|null $pending */
+	private static function credential_family_for_channel( string $channel, ?array $pending = null ): string {
 		return match ( trim( $channel ) ) {
 			EcpayShippingCatalog::CHANNEL_B2C => self::FAMILY_B2C_HOME,
-			EcpayShippingCatalog::CHANNEL_HOME => self::home_credential_family(),
+			EcpayShippingCatalog::CHANNEL_HOME => self::home_credential_family( $pending ),
 			EcpayShippingCatalog::CHANNEL_C2C => self::FAMILY_C2C,
 			default => '',
 		};
 	}
 
-	private static function unambiguous_legacy_family(): string {
+	/** @param array<string,string|null>|null $pending */
+	private static function unambiguous_legacy_family( ?array $pending = null ): string {
 		$families = [];
 		$lifecycle = '\\YangSheep\\Ecommerce\\Core\\Provider\\YSProviderLifecycleState';
 		$has_lifecycle = class_exists( $lifecycle )
@@ -408,7 +535,7 @@ final class Settings {
 		}
 		foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
 			$alias = (string) ( $descriptor['alias'] ?? '' );
-			$family = self::credential_family_for_channel( (string) ( $descriptor['channel'] ?? '' ) );
+			$family = self::credential_family_for_channel( (string) ( $descriptor['channel'] ?? '' ), $pending );
 			$enabled = $has_lifecycle
 				? $lifecycle::is_method_enabled( 'shipping', (string) $method_id, $manifest )
 				: self::shipping_enabled( $alias );

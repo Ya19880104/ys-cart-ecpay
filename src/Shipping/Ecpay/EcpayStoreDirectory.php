@@ -28,6 +28,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
@@ -90,8 +91,18 @@ final class EcpayStoreDirectory {
 	 * @return array<string,array<string,string>>
 	 */
 	private static function cached_store_list( string $subtype ): array {
+		// The credential-scoped key and its transient are one logical read. Keep an
+		// outer lease across both so a writer cannot rotate credentials after key
+		// derivation and before the old authority's cache is consumed.
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return [];
+		}
 		$cache_key = self::cache_key( $subtype );
 		if ( '' === $cache_key ) {
+			return [];
+		}
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
 			return [];
 		}
 
@@ -108,9 +119,19 @@ final class EcpayStoreDirectory {
 	public static function refresh( string $subtype ): int {
 		$cvs_type = self::cvs_type( $subtype );
 		$channel  = EcpayShippingCatalog::channel_for_subtype( $subtype );
-		$cache_key = self::cache_key( $subtype );
-		if ( '' === $cvs_type || '' === $channel || '' === $cache_key
+		if ( '' === $cvs_type || '' === $channel
 			|| ! ShippingMethodOperability::has_operable_store_method( $subtype ) ) {
+			return 0;
+		}
+
+		// 🔴 R14 reader lease：門市清單請求以當下憑證簽章——設定 commit 期間
+		// 不出網（回 0＝既有「查不到」語意，下次排程重試）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return 0;
+		}
+		$cache_key = self::cache_key( $subtype );
+		if ( '' === $cache_key ) {
 			return 0;
 		}
 
@@ -132,6 +153,9 @@ final class EcpayStoreDirectory {
 			$credentials['hash_iv'],
 			'md5'
 		);
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return 0;
+		}
 
 		$response = ( new HttpFormClient() )->post(
 			Settings::logistics_endpoint_for_channel( '/Helper/GetStoreList', $channel ),
@@ -270,6 +294,10 @@ final class EcpayStoreDirectory {
 		if ( '' === $cvs_type || '' === $channel ) {
 			return '';
 		}
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return '';
+		}
 		$credentials = Settings::logistics_credentials_for_subtype( $subtype );
 		if ( '' === (string) ( $credentials['merchant_id'] ?? '' )
 			|| '' === (string) ( $credentials['hash_key'] ?? '' )
@@ -277,6 +305,9 @@ final class EcpayStoreDirectory {
 			return '';
 		}
 		$family = EcpayShippingCatalog::CHANNEL_C2C === $channel ? 'C2C' : 'B2C_HOME';
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return '';
+		}
 		$fingerprint = hash_hmac(
 			'sha256',
 			$family . "\0" . $cvs_type . "\0"

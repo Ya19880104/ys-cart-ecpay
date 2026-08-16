@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
@@ -41,9 +42,33 @@ final class EcpayShippingRequester {
 			];
 		}
 
+		// 🔴 v0.2.16 R14 reader lease：與設定 commit **真互斥**（writer acquire 時
+		// 讓步給活著的 reader；reader 註冊後 bracket 再查 writer）——不是 R13 的
+		// 唯讀檢查（check → commit → HTTP 的窗口已封）。null＝設定變更進行中或
+		// 前次變更 crash 未修復：拒送是明確失敗（一個 byte 都沒送出去，可重試）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return [
+				'success' => false,
+				'outcome' => 'provider_failed',
+				'message' => '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出任何請求，請稍後再試。',
+			];
+		}
+
 		$method_id   = $this->method->get_id();
 		$credentials = Settings::logistics_credentials_for_method( $method_id );
 		$fields      = $this->build_create_fields( $order_data, $credentials );
+
+		// 🔴 送出前 own-row fence：stalled 超過 READER_TTL 而被 writer 收割的
+		// request 在這裡死掉——舊憑證簽好的請求一個 byte 都不出網。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return [
+				'success'           => false,
+				'outcome'           => 'provider_failed',
+				'message'           => '綠界設定維護窗與本次建單重疊，本次未送出任何請求，請稍後再試。',
+				'merchant_trade_no' => $fields['MerchantTradeNo'],
+			];
+		}
 
 		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
 		if ( ! $result['success'] ) {
@@ -332,6 +357,13 @@ final class EcpayShippingRequester {
 			throw new \RuntimeException( 'ECPay shipping method is not operable.' );
 		}
 
+		// 🔴 v0.2.16 R14 reader lease：在 mark_submitted() 之前就中止，
+		// 訂單停在可重試狀態，不會有任何請求出網。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			throw new \RuntimeException( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），請稍後再試。' );
+		}
+
 		$this->build_create_fields( $order_data, Settings::logistics_credentials_for_method( $this->method->get_id() ) );
 	}
 
@@ -573,6 +605,13 @@ final class EcpayShippingRequester {
 			return $this->indeterminate_result( 'ECPay shipping method is not operable.' );
 		}
 
+		// 🔴 v0.2.16 R14 reader lease：設定 commit 期間不得以「可能隨後被回滾的
+		// 簽章」出網。未送出任何請求；indeterminate 保留 dispatch lock，可重試。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return $this->indeterminate_result( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出取消請求，請稍後再試。' );
+		}
+
 		$provider_trade_no = trim( (string) ( $context['provider_trade_no'] ?? '' ) );
 		$cvs_payment_no    = trim( (string) ( $context['cvs_payment_no'] ?? '' ) );
 		$cvs_validation_no = trim( (string) ( $context['cvs_validation_no'] ?? '' ) );
@@ -600,6 +639,11 @@ final class EcpayShippingRequester {
 			'PlatformID'         => '',
 		];
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		// 🔴 R14 pre-send fence（同 create_order）。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return $this->indeterminate_result( '綠界設定維護窗與本次取消重疊，本次未送出取消請求，請稍後再試。' );
+		}
 
 		$result = $this->http->post( Settings::logistics_endpoint( $spec['path'], $method_id ), $fields );
 		if ( ! $result['success'] ) {
@@ -645,6 +689,12 @@ final class EcpayShippingRequester {
 			return $this->indeterminate_result( 'ECPay shipping method is not operable.' );
 		}
 
+		// 🔴 v0.2.16 R14 reader lease：同 create/cancel——設定 commit 期間不出網。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return $this->indeterminate_result( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出查詢請求，請稍後再試。' );
+		}
+
 		$provider_trade_no = trim( $tracking_number );
 		$merchant_trade_no = trim( (string) ( $context['merchant_trade_no'] ?? '' ) );
 		$bound_provider     = trim( (string) ( $context['provider'] ?? '' ) );
@@ -670,6 +720,11 @@ final class EcpayShippingRequester {
 			'PlatformID'        => '',
 		];
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		// 🔴 R14 pre-send fence（同 create_order）。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return $this->indeterminate_result( '綠界設定維護窗與本次查詢重疊，本次未送出查詢請求，請稍後再試。' );
+		}
 
 		$result = $this->http->post( Settings::logistics_endpoint( EcpayShippingCatalog::query_path(), $method_id ), $fields );
 		if ( ! $result['success'] ) {
@@ -731,6 +786,13 @@ final class EcpayShippingRequester {
 	public function get_print_url( $provider_trade_no, array $context = [] ): string {
 		$spec = EcpayShippingCatalog::print_spec( $this->method->get_id() );
 		if ( null === $spec || ! ShippingMethodOperability::is_operable( $this->method->get_id() ) ) {
+			return '';
+		}
+
+		// 🔴 v0.2.16 R14 reader lease：列印 payload 同樣以當下憑證簽章——設定
+		// commit 期間不產生（空字串＝按鈕無效，維護結束後重新整理即恢復）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
 			return '';
 		}
 
@@ -804,6 +866,12 @@ final class EcpayShippingRequester {
 		}
 
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'md5' );
+
+		// 🔴 R14：payload 交付（transient）＝這條路徑的「送出」——之後任何人打開
+		// 列印 URL 都會 POST 這份簽章。交付前 fence。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return '';
+		}
 
 		$key = wp_generate_password( 24, false, false );
 		$stored = set_transient( 'ys_ec_ecpay_print_' . $key, [
