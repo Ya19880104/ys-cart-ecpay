@@ -15,6 +15,10 @@ Standalone ECPay provider plugin for YS CART.
   - Hi-Life
   - TCAT
   - Post
+- HOME requests can explicitly use either the B2C/home or C2C credential profile,
+  matching the capabilities enabled for that MerchantID in ECPay's merchant console.
+- Changing the HOME profile is a maintenance operation: disable every HOME method
+  first. The plugin refuses the change while an active or legacy HOME label exists.
 - Shipping method visibility, sorting, base rates, and free-shipping rules are managed in YS CART Shipping Settings.
 - ECPay CVS electronic map integration using YS CART's existing `cvs_store_id`, `cvs_store_name`, and `cvs_store_addr` checkout fields.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.
@@ -23,14 +27,17 @@ Standalone ECPay provider plugin for YS CART.
 
 - WordPress 6.2+
 - PHP 8.1+
-- **YS CART >= 2.57.0** (hard requirement)
+- **YS CART 2.57.0+** (hard requirement; on top of the 2.56.12 set — typed
+  fulfillment, durable logistics query, saved-address provider identity,
+  encrypted-secret capability — 0.3.0 additionally requires the shared
+  `payment_detail` CAS service and stable payment operation keys)
 
 ### Why YS CART 2.57.0 is a hard requirement
 
 This plugin does not carry its own writer for the order `payment_detail` column.
 It writes through the core's `YSPaymentDetailStore` compare-and-swap service and
-relies on the core's `YSPaymentDispatch` ambient guard so that every provider
-write is owner-conditioned. Neither exists before 2.57.0.
+relies on the core's `YSPaymentDispatch` operation keys so that every payment
+attempt derives a stable transaction identity. Neither exists before 2.57.0.
 
 If the core is older, the plugin **registers no payment gateways and no shipping
 methods** and shows an admin notice instead. A provider that is registered but
@@ -45,6 +52,8 @@ first one takes money.
 - Store callback: `/wp-json/ys-ecommerce/v1/ecpay/store-callback`
 - Logistics notify: `/wp-json/ys-ecommerce/v1/ecpay/logistics-notify`
 - Store map form: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/map-url`
+- One-time store result exchange: `/wp-json/ys-ecommerce-headless/v1/ecpay/store-result`
+- Saved-store reauthorization: `/wp-json/ys-ecommerce-headless/v1/stores/ecpay/reauthorize`
 
 Payment notify, payment info, return, store callback, and logistics notify are
 provider-facing callback routes. Browser UI should request only the store-map
@@ -53,19 +62,36 @@ form route when the customer needs convenience-store selection.
 ## Headless Logistics
 
 For ECPay CVS shipping, request the store-map form with the selected shipping
-method ID:
+method ID **and the customer's currently selected payment method**:
 
 ```json
 {
-  "shipping_id": "ys_ec_ecpay_ship_unimart"
+  "shipping_id": "ys_ec_ecpay_ship_unimart",
+  "payment_method": "ys_ec_ecpay_credit"
 }
 ```
 
-Submit the returned `action_url` and `fields` as a top-level browser form post
-or popup form post. Do not expose ECPay hash keys or callback verification logic
-to browser code.
-The bundled SDK exposes `YsCartEcpay.requestStoreMapForm(apiBase, shippingId)`
-for this request.
+`payment_method` is validated, not merely required — ECPay filters the store
+list by cash-on-delivery mode, so an empty string or an unregistered gateway id
+is *cannot prove*, not "assume no collection". Guests on another origin must
+also identify themselves with the core `X-YS-Guest-Token` header; the token
+issued for a store selection is bound to that owner.
+
+Submit the returned `action_url` and `fields` as a top-level browser form post.
+The callback redirects only to an allowlisted `return_url` with a 32-character
+one-time result code. Exchange it through the result route under the same guest
+or login identity; do not read WordPress-origin `localStorage` from a different
+origin. The exchanged `selection_token` must be returned at checkout as
+`ecpay_store_token` (v0.2.12); the store id alone is no longer accepted. Do not
+expose ECPay hash keys or callback verification logic to browser code. See
+`docs/headless.md`.
+
+The bundled SDK exposes
+`YsCartEcpay.setGuestToken(token)` and
+`YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, options)`,
+then `resultCodeFromLocation()` + `claimStoreResult()` and the absolute-API
+`checkout()` helper. Cookie-authenticated writes can set `X-WP-Nonce` through
+`setWpNonce()`.
 
 ## Release
 

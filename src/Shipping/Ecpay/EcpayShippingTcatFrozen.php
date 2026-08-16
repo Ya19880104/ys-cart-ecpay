@@ -5,19 +5,9 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay;
 
 defined( 'ABSPATH' ) || exit;
 
-/**
- * 綠界黑貓宅配（冷凍）（v0.3.0）
- *
- * 🔴 宅配的溫層是 `Temperature` 欄位，subtype 仍是
- * TCAT。舊版把它讀成
- * $order_data['temperature_code']，而那個 key 全 repo
- * 沒有任何寫入點——因此永遠送常溫。
- */
+/** 黑貓宅配冷凍（subtype TCAT，Temperature 0003）。 */
 final class EcpayShippingTcatFrozen extends EcpayShipping {
-	public function get_id(): string { return 'ys_ec_ecpay_ship_tcat_frozen'; }
-	public function get_title(): string { return '綠界黑貓宅配（冷凍）'; }
-	public function get_type(): string { return 'home'; }
-	public function get_logistics_subtype(): string { return 'TCAT'; }
-	protected function settings_key(): string { return 'ship_tcat_frozen'; }
-	public function get_temperature_code(): string { return self::TEMP_FROZEN; }
+	public function get_id(): string {
+		return 'ys_ec_ecpay_ship_tcat_frozen';
+	}
 }

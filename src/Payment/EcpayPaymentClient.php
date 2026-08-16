@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Payment;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayPaymentClient {
@@ -29,6 +30,14 @@ final class EcpayPaymentClient {
 	 * @throws \InvalidArgumentException 金額非 canonical TWD 正整數
 	 */
 	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment ): array {
+		// 🔴 R14 reader lease：付款表單以當下 payment 憑證簽 CMV——設定 commit
+		// 期間簽出的表單可能帶著「隨後被回滾／被換掉」的 signer，顧客送回時
+		// 必失驗。lease 拿不到＝丟例外，caller 以「未送出任何付款」語意拒絕。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			throw new \RuntimeException( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），請稍後再試。' );
+		}
+
 		$credentials = Settings::payment_credentials();
 
 		$total = $order->total ?? null;
@@ -69,6 +78,12 @@ final class EcpayPaymentClient {
 			'sha256'
 		);
 
+		// 🔴 表單交付＝這條路徑的「送出」（顧客瀏覽器隨後 POST 給綠界）——交付前
+		// own-row fence：stalled 而被 writer 收割的 request 不得再交出舊簽章表單。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			throw new \RuntimeException( '綠界設定維護窗與本次付款重疊，請稍後再試。' );
+		}
+
 		return [
 			'action_url'     => Settings::payment_endpoint(),
 			'fields'         => $fields,
@@ -84,12 +99,29 @@ final class EcpayPaymentClient {
 	 * @return array{success:bool,data:array<string,string>|null,message:string}
 	 */
 	public function query_trade( string $merchant_trade_no ): array {
-		$credentials = Settings::payment_credentials();
-		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
+		// 🔴 R14 reader lease（同 build_aio_form；查詢請求簽章＋回應驗章都用
+		// 當下憑證）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
 			return [
-				'success' => false,
-				'data'    => null,
-				'message' => 'ECPay payment settings are incomplete.',
+				'success'      => false,
+				'data'         => null,
+				'mac_verified' => false,
+				'message'      => '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出查詢，請稍後再試。',
+			];
+		}
+
+		$credentials       = Settings::payment_credentials();
+		$merchant_trade_no = trim( $merchant_trade_no );
+		if ( '' === $merchant_trade_no
+			|| '' === $credentials['merchant_id']
+			|| '' === $credentials['hash_key']
+			|| '' === $credentials['hash_iv'] ) {
+			return [
+				'success'      => false,
+				'data'         => null,
+				'mac_verified' => false,
+				'message'      => 'ECPay payment settings are incomplete.',
 			];
 		}
 
@@ -105,6 +137,16 @@ final class EcpayPaymentClient {
 			$credentials['hash_iv'],
 			'sha256'
 		);
+
+		// 🔴 R14 pre-send fence。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return [
+				'success'      => false,
+				'data'         => null,
+				'mac_verified' => false,
+				'message'      => '綠界設定維護窗與本次查詢重疊，本次未送出查詢，請稍後再試。',
+			];
+		}
 
 		$response = wp_remote_post(
 			Settings::payment_query_endpoint(),
@@ -140,37 +182,57 @@ final class EcpayPaymentClient {
 			];
 		}
 
-		// 🔴 v0.3.0：MAC 是否**驗過**必須明確回報，而不是「有帶就驗、沒帶就算了」。
-		//
-		// 退款是不可逆的動作，它的依據不能是一份無法證明來源的回應。呼叫端據
-		// `mac_verified` 決定要不要採信；一般查詢仍可容忍缺 MAC 的回應。
-		$mac_verified = false;
-		if ( isset( $data['CheckMacValue'] ) ) {
-			if ( ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
-				return [
-					'success'      => false,
-					'data'         => $data,
-					'mac_verified' => false,
-					'message'      => 'Invalid ECPay query CheckMacValue.',
-				];
-			}
-
-			$mac_verified = true;
-		}
-
-		if ( empty( $data['MerchantTradeNo'] ) && empty( $data['TradeStatus'] ) ) {
+		// 🔴 0.2.16（main 合流）：QueryTradeInfo/V5 官方回應**必帶** CheckMacValue——
+		// 缺 MAC 或驗不過一律 fail-closed，不再「有帶就驗、沒帶就算了」。退款是
+		// 不可逆的動作，它的依據不能是一份無法證明來源的回應；`mac_verified` 契約
+		// 保留給呼叫端（成功路徑恆為 true）。
+		if ( '' === (string) ( $data['CheckMacValue'] ?? '' )
+			|| ! CheckMacValue::verify( $data, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
 			return [
 				'success'      => false,
 				'data'         => $data,
-				'mac_verified' => $mac_verified,
-				'message'      => (string) ( $data['RtnMsg'] ?? $data['Message'] ?? 'ECPay query returned no trade data.' ),
+				'mac_verified' => false,
+				'message'      => 'Invalid ECPay query CheckMacValue.',
+			];
+		}
+
+		// 🔴 0.2.16（main 合流）：回應身分綁定——MerchantID／MerchantTradeNo 必須
+		// 與送出的請求一致；已付款（TradeStatus=1）還必須帶完整 TradeNo／TradeAmt。
+		$returned_merchant_id = (string) ( $data['MerchantID'] ?? '' );
+		$returned_trade_no    = (string) ( $data['MerchantTradeNo'] ?? '' );
+		$trade_status         = (string) ( $data['TradeStatus'] ?? '' );
+		$provider_trade_no    = (string) ( $data['TradeNo'] ?? '' );
+		$trade_amount         = (string) ( $data['TradeAmt'] ?? '' );
+
+		if ( '' === $returned_merchant_id
+			|| ! hash_equals( $credentials['merchant_id'], $returned_merchant_id )
+			|| '' === $returned_trade_no
+			|| ! hash_equals( $merchant_trade_no, $returned_trade_no )
+			|| '' === $trade_status ) {
+			return [
+				'success'      => false,
+				'data'         => $data,
+				'mac_verified' => true,
+				'message'      => 'ECPay query response identity is invalid.',
+			];
+		}
+
+		if ( '1' === $trade_status
+			&& ( '' === $provider_trade_no
+				|| ! ctype_digit( $trade_amount )
+				|| (int) $trade_amount <= 0 ) ) {
+			return [
+				'success'      => false,
+				'data'         => $data,
+				'mac_verified' => true,
+				'message'      => 'ECPay paid query response is incomplete.',
 			];
 		}
 
 		return [
 			'success'      => true,
 			'data'         => $data,
-			'mac_verified' => $mac_verified,
+			'mac_verified' => true,
 			'message'      => '',
 		];
 	}
@@ -189,6 +251,13 @@ final class EcpayPaymentClient {
 	 *               state ∈ authorized|to_close|closed|unknown
 	 */
 	public function query_credit_close_status( string $gwsr, int $amount ): array {
+		// 🔴 R14/0.2.16 reader lease：關帳查詢同樣以當下 payment 憑證簽 CMV，
+		// 且其結果是退款 action 仲裁的依據——不得在設定 commit 窗口內出網。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出查詢，請稍後再試。' ];
+		}
+
 		$credentials = Settings::payment_credentials();
 		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => 'ECPay payment settings are incomplete.' ];
@@ -210,6 +279,11 @@ final class EcpayPaymentClient {
 			'CreditCheckCode' => $credit_check_code,
 		];
 		$fields['CheckMacValue'] = CheckMacValue::generate( $fields, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' );
+
+		// 🔴 R14 pre-send fence。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '綠界設定維護窗與本次查詢重疊，本次未送出查詢，請稍後再試。' ];
+		}
 
 		$response = wp_remote_post(
 			Settings::payment_credit_query_endpoint(),
@@ -292,6 +366,18 @@ final class EcpayPaymentClient {
 	 * @return array{success:bool, indeterminate:bool, data:?array, message:string}
 	 */
 	public function do_action_refund( string $merchant_trade_no, string $trade_no, float $amount, string $action = 'R' ): array {
+		// 🔴 R14/0.2.16 reader lease：退刷是**不可逆出網動作**，簽章憑證絕不可在
+		// 設定 commit 窗口內讀取。lease 拿不到＝本次未送出（非 indeterminate）。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return [
+				'success' => false,
+				'indeterminate' => false,
+				'data'    => null,
+				'message' => '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），本次未送出退刷，請稍後再試。',
+			];
+		}
+
 		$credentials = Settings::payment_credentials();
 		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
 			return [
@@ -346,6 +432,16 @@ final class EcpayPaymentClient {
 			$credentials['hash_iv'],
 			'sha256'
 		);
+
+		// 🔴 R14 pre-send fence：被 writer 收割的 request 不得把舊簽章的退刷送出網。
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return [
+				'success' => false,
+				'indeterminate' => false,
+				'data'    => null,
+				'message' => '綠界設定維護窗與本次退刷重疊，本次未送出，請稍後再試。',
+			];
+		}
 
 		$response = wp_remote_post(
 			Settings::payment_do_action_endpoint(),

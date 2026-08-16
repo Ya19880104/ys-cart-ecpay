@@ -13,6 +13,7 @@ use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayPaymentController {
@@ -254,11 +255,24 @@ final class EcpayPaymentController {
 	 * @param array<string,string> $params
 	 */
 	private function verify_payment_payload( array $params ): bool {
+		// 🔴 R14 reader lease：驗章讀的也是當下憑證——設定 commit 期間讀到的
+		// 可能是半套用 tuple，據以判「驗章失敗」會誤拒真回呼。拿不到 lease＝
+		// 回 false → 呼叫端回 0|Invalid（非 2xx），綠界會重送 notify；
+		// return/payment_info 則顯示暫時失敗頁——都不遺失。
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return false;
+		}
+
 		$credentials = Settings::payment_credentials();
 		if ( '' === $credentials['merchant_id']
 			|| '' === $credentials['hash_key']
 			|| '' === $credentials['hash_iv']
 			|| (string) ( $params['MerchantID'] ?? '' ) !== $credentials['merchant_id'] ) {
+			return false;
+		}
+
+		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
 			return false;
 		}
 

@@ -55,19 +55,31 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	public function process_payment( int $order_id ): array {
 		$order = YSOrder::find( $order_id );
 		if ( ! $order ) {
-			return [ 'success' => false, 'message' => __( '找不到訂單。', 'ys-cart-ecpay' ) ];
+			return [
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '找不到訂單。', 'ys-cart-ecpay' ),
+			];
 		}
 
 		if ( ! Settings::has_payment_credentials() ) {
-			return [ 'success' => false, 'message' => __( '綠界金流設定尚未完成。', 'ys-cart-ecpay' ) ];
+			return [
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '綠界金流設定尚未完成。', 'ys-cart-ecpay' ),
+			];
 		}
 
 		// 讀取失敗不得當成空陣列：續作時要靠它認出「這個 operation 已經有交易編號」。
 		$payment_detail_before = OrderPaymentDetail::read( $order_id );
 		if ( null === $payment_detail_before ) {
 			return [
-				'success' => false,
-				'message' => __( '無法讀取訂單付款紀錄，已中止；請重新整理後再試一次。', 'ys-cart-ecpay' ),
+				'success'   => false,
+				'outcome'   => 'provider_unavailable',
+				'retryable' => true,
+				'message'   => __( '無法讀取訂單付款紀錄，已中止；請重新整理後再試一次。', 'ys-cart-ecpay' ),
 			];
 		}
 
@@ -89,8 +101,10 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			] );
 
 			return [
-				'success' => false,
-				'message' => __( '付款流程未正確開始（缺少交易識別），請重新整理後再試一次。', 'ys-cart-ecpay' ),
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '付款流程未正確開始（缺少交易識別），請重新整理後再試一次。', 'ys-cart-ecpay' ),
 			];
 		}
 
@@ -110,8 +124,19 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			] );
 
 			return [
-				'success' => false,
-				'message' => $e->getMessage(),
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => $e->getMessage(),
+			];
+		} catch ( \RuntimeException $e ) {
+			// 🔴 R14/0.2.16：表單建構受 reader lease 保護——設定 commit 期間（或
+			// 前次 commit crash 未修復）丟例外＝本次未送出任何付款，可重試。
+			return [
+				'success'   => false,
+				'outcome'   => 'provider_unavailable',
+				'retryable' => true,
+				'message'   => $e->getMessage(),
 			];
 		}
 
@@ -155,8 +180,10 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			) );
 
 			return [
-				'success' => false,
-				'message' => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
 			];
 		}
 
@@ -177,8 +204,10 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			] );
 
 			return [
-				'success' => false,
-				'message' => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
 			];
 		}
 
