@@ -77,9 +77,10 @@ final class CheckMacValue {
 			return $value ? '1' : '0';
 		}
 		if ( is_scalar( $value ) || null === $value ) {
-			return trim( (string) $value );
+			// Official SDK concatenates values byte-for-byte. Normalizing whitespace
+			// here would verify a different payload than the one ECPay signed.
+			return (string) $value;
 		}
 		return wp_json_encode( $value ) ?: '';
 	}
 }
-

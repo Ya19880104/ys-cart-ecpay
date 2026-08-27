@@ -180,7 +180,7 @@ namespace YangSheep\YSCartEcpay\Payment {
                 : [];
 
             $next = array_shift(self::$do_action_results);
-            return $next ?? ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => 'ECPAY-RESP-9'], 'message' => ''];
+            return $next ?? ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => $tn], 'message' => ''];
         }
 
         public static function do_action_count(): int
@@ -321,16 +321,16 @@ namespace {
         '(a5) 整數值 float 經 JSON 存取後就是 int（因此放行）——float 分支見 v021 (a4)'
     );
 
-    // ══ F2／F6：指紋不可變、回應 ID 獨立 ══════════════════════════════════
+    // ══ F2／F6：指紋不可變、DoAction 回應身分綁定 ═════════════════════════
     $seed();
     $r = $refund();
     $entry = $ledger();
     $assert(
         !empty($r['success'])
         && 'TN-1' === ($entry['trade_no'] ?? '')
-        && 'ECPAY-RESP-9' === ($entry['response_trade_no'] ?? '')
-        && 'ECPAY-RESP-9' === ($r['transaction_id'] ?? ''),
-        '(b1) 🔴 指紋內的 trade_no 維持原值，綠界回應另存 response_trade_no'
+        && 'TN-1' === ($entry['response_trade_no'] ?? '')
+        && 'TN-1' === ($r['transaction_id'] ?? ''),
+        '(b1) 🔴 DoAction 回應 TradeNo 與本次 request identity 一致才可結案'
     );
 
     $seed();
@@ -344,6 +344,32 @@ namespace {
         && 'indeterminate' === ($r['outcome'] ?? '')
         && 'pending' === ($entry['status'] ?? ''),
         '(b2) 🔴 回應缺 TradeNo → indeterminate 並維持凍結（不得靜默退回成自己送出的 trade_no）'
+    );
+
+    $seed();
+    EcpayPaymentClient::$do_action_results = [
+        ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => 'ECPAY-OTHER'], 'message' => ''],
+    ];
+    $r = $refund();
+    $entry = $ledger();
+    $assert(
+        empty($r['success'])
+        && 'indeterminate' === ($r['outcome'] ?? '')
+        && 'pending' === ($entry['status'] ?? ''),
+        '(b3) 🔴 回應 TradeNo 與 request 不符 → indeterminate 並凍結，不能把別筆回應當成功'
+    );
+
+    $seed();
+    EcpayPaymentClient::$do_action_results = [
+        ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => "TN-1\n"], 'message' => ''],
+    ];
+    $r = $refund();
+    $entry = $ledger();
+    $assert(
+        empty($r['success'])
+        && 'indeterminate' === ($r['outcome'] ?? '')
+        && 'pending' === ($entry['status'] ?? ''),
+        '(b4) 🔴 回應 TradeNo 帶空白 → 逐位元身分不符並凍結，不得 trim 後結案'
     );
 
     // ══ F3：送出前的 durable token ════════════════════════════════════════

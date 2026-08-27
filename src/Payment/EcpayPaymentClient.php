@@ -6,6 +6,7 @@ namespace YangSheep\YSCartEcpay\Payment;
 defined( 'ABSPATH' ) || exit;
 
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
+use YangSheep\YSCartEcpay\Support\HttpFormClient;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -170,9 +171,7 @@ final class EcpayPaymentClient {
 
 		$this->last_http_status = (int) wp_remote_retrieve_response_code( $response );
 		$raw                    = (string) wp_remote_retrieve_body( $response );
-		$data                   = [];
-		parse_str( $raw, $data );
-		$data = array_map( static fn ( mixed $value ): string => is_scalar( $value ) ? trim( (string) $value ) : '', $data );
+		$data                   = HttpFormClient::parse_verified_body( $raw );
 
 		if ( $this->last_http_status < 200 || $this->last_http_status >= 300 ) {
 			return [
@@ -308,9 +307,37 @@ final class EcpayPaymentClient {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => 'ECPay credit query failed.' ];
 		}
 
+		$rtn_value = is_array( $data['RtnValue'] ?? null ) ? $data['RtnValue'] : [];
+		$rtn_msg   = $data['RtnMsg'] ?? null;
+		$trade_id  = $rtn_value['TradeID'] ?? null;
+		$raw_amount = $rtn_value['amount'] ?? null;
+
+		$trade_id_text = is_int( $trade_id ) || is_string( $trade_id )
+			? (string) $trade_id
+			: '';
+		$amount_text = is_int( $raw_amount ) || is_string( $raw_amount )
+			? (string) $raw_amount
+			: '';
+
+		// QueryTrade/V2 decides which irreversible DoAction plan is allowed. A
+		// mapped status is not enough: the response must also report success and
+		// bind to this exact authorization id and canonical TWD amount.
+		if ( ! is_string( $rtn_msg )
+			|| '' !== $rtn_msg
+			|| '' === $trade_id_text
+			|| ! hash_equals( $gwsr, $trade_id_text )
+			|| ! ctype_digit( $amount_text )
+			|| (string) $amount !== $amount_text ) {
+			return [
+				'success' => false,
+				'state'   => 'unknown',
+				'raw'     => $data,
+				'message' => 'ECPay credit query response identity is invalid.',
+			];
+		}
+
 		// 官方判定規則：以 close_data 中「最後一筆**正金額**紀錄」的 status 為準
 		// （「要關帳」等狀態位於 close_data；頂層 status 僅作 fallback）。
-		$rtn_value  = is_array( $data['RtnValue'] ?? null ) ? $data['RtnValue'] : $data;
 		$close_rows = is_array( $rtn_value['close_data'] ?? null ) ? $rtn_value['close_data'] : [];
 
 		$status_text = '';
@@ -467,9 +494,7 @@ final class EcpayPaymentClient {
 
 		$this->last_http_status = (int) wp_remote_retrieve_response_code( $response );
 		$raw                    = (string) wp_remote_retrieve_body( $response );
-		$data                   = [];
-		parse_str( $raw, $data );
-		$data = array_map( static fn ( mixed $value ): string => is_scalar( $value ) ? trim( (string) $value ) : '', $data );
+		$data                   = HttpFormClient::parse_body( $raw );
 
 		if ( $this->last_http_status < 200 || $this->last_http_status >= 300 ) {
 			// 非 2xx：結果不確定（可能已處理）→ indeterminate。
@@ -488,6 +513,26 @@ final class EcpayPaymentClient {
 				'indeterminate' => true,
 				'data'    => $data,
 				'message' => 'ECPay DoAction 回應無法解析（無 RtnCode）。',
+			];
+		}
+
+		$returned_merchant_id = (string) ( $data['MerchantID'] ?? '' );
+		$returned_trade_no    = (string) ( $data['MerchantTradeNo'] ?? '' );
+		$returned_provider_id = (string) ( $data['TradeNo'] ?? '' );
+		if ( '' === $returned_merchant_id
+			|| ! hash_equals( $credentials['merchant_id'], $returned_merchant_id )
+			|| '' === $returned_trade_no
+			|| ! hash_equals( $merchant_trade_no, $returned_trade_no )
+			|| '' === $returned_provider_id
+			|| ! hash_equals( $trade_no, $returned_provider_id ) ) {
+			// A 2xx response with a different or incomplete identity cannot prove
+			// whether this irreversible request succeeded. Freeze it; never classify
+			// the unrelated RtnCode as a safe provider rejection.
+			return [
+				'success'       => false,
+				'indeterminate' => true,
+				'data'          => $data,
+				'message'       => 'ECPay DoAction response identity is invalid.',
 			];
 		}
 

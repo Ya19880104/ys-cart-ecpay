@@ -98,6 +98,17 @@ final class EcpayPaymentController {
 			$this->respond_text( '0|Amount Mismatch', 400 );
 		}
 
+		// ECPay's backend simulation is signed and reports RtnCode=1, but no funds
+		// were captured.  ACK it so ECPay does not retry, while returning before
+		// any real-payment identity or lifecycle state is persisted.
+		if ( '1' === (string) ( $params['SimulatePaid'] ?? '' ) ) {
+			YSLogger::warning( 'ecpay', '收到綠界模擬付款通知；已 ACK，但未變更訂單付款狀態', [
+				'order_id' => (int) $order->id,
+			] );
+			$this->respond_text( '1|OK' );
+			return;
+		}
+
 		$detail = $this->detail_from_payload( $params );
 		if ( '1' === (string) ( $params['RtnCode'] ?? '' ) ) {
 			// v0.3.0：持久化信用卡授權單號 gwsr（NeedExtraPaidInfo=Y 回傳、已過
@@ -224,7 +235,7 @@ final class EcpayPaymentController {
 	}
 
 	public function return_page( \WP_REST_Request $request ): void {
-		$params = $this->params( $request );
+		$params = $this->params( $request, true );
 		$order  = $this->verify_payment_payload( $params )
 			? $this->find_order_by_merchant_trade_no( (string) ( $params['MerchantTradeNo'] ?? '' ) )
 			: null;
@@ -240,13 +251,23 @@ final class EcpayPaymentController {
 	/**
 	 * @return array<string,string>
 	 */
-	private function params( \WP_REST_Request $request ): array {
+	private function params( \WP_REST_Request $request, bool $allow_query_fallback = false ): array {
+		$source = method_exists( $request, 'get_body_params' )
+			? $request->get_body_params()
+			: $request->get_params();
+		if ( $allow_query_fallback && [] === $source && method_exists( $request, 'get_query_params' ) ) {
+			$source = $request->get_query_params();
+		}
+
 		$params = [];
-		foreach ( $request->get_params() as $key => $value ) {
+		foreach ( $source as $key => $value ) {
 			if ( is_array( $value ) ) {
 				continue;
 			}
-			$params[ (string) $key ] = sanitize_text_field( wp_unslash( (string) $value ) );
+			// WP REST body/query parameters have already been unslashed by the server.
+			// A second wp_unslash() changes signed backslash bytes and invalidates CMV.
+			// Domain fields are cleaned only at their sinks after verification succeeds.
+			$params[ (string) $key ] = (string) $value;
 		}
 		return $params;
 	}
@@ -284,19 +305,19 @@ final class EcpayPaymentController {
 	 */
 	private function detail_from_payload( array $params ): YSPaymentDetailDTO {
 		$detail = [
-			'payment_type'     => (string) ( $params['PaymentType'] ?? '' ),
-			'trade_status'     => (string) ( $params['RtnCode'] ?? '' ),
-			'trade_no'         => (string) ( $params['TradeNo'] ?? '' ),
-			'gateway_trade_no' => (string) ( $params['TradeNo'] ?? '' ),
-			'mer_trade_no'     => (string) ( $params['MerchantTradeNo'] ?? '' ),
-			'response_code'    => (string) ( $params['RtnCode'] ?? '' ),
-			'response_message' => (string) ( $params['RtnMsg'] ?? '' ),
-			'pay_no'           => (string) ( $params['PaymentNo'] ?? $params['BankCode'] ?? $params['vAccount'] ?? '' ),
-			'bank_type'        => (string) ( $params['BankCode'] ?? '' ),
-			'expire_date'      => (string) ( $params['ExpireDate'] ?? '' ),
-			'card_4no'         => (string) ( $params['card4no'] ?? $params['Card4No'] ?? '' ),
-			'card_6no'         => (string) ( $params['card6no'] ?? $params['Card6No'] ?? '' ),
-			'auth_code'        => (string) ( $params['auth_code'] ?? $params['AuthCode'] ?? '' ),
+			'payment_type'     => sanitize_text_field( (string) ( $params['PaymentType'] ?? '' ) ),
+			'trade_status'     => sanitize_text_field( (string) ( $params['RtnCode'] ?? '' ) ),
+			'trade_no'         => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
+			'gateway_trade_no' => sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ),
+			'mer_trade_no'     => sanitize_text_field( (string) ( $params['MerchantTradeNo'] ?? '' ) ),
+			'response_code'    => sanitize_text_field( (string) ( $params['RtnCode'] ?? '' ) ),
+			'response_message' => sanitize_text_field( (string) ( $params['RtnMsg'] ?? '' ) ),
+			'pay_no'           => sanitize_text_field( (string) ( $params['PaymentNo'] ?? $params['BankCode'] ?? $params['vAccount'] ?? '' ) ),
+			'bank_type'        => sanitize_text_field( (string) ( $params['BankCode'] ?? '' ) ),
+			'expire_date'      => sanitize_text_field( (string) ( $params['ExpireDate'] ?? '' ) ),
+			'card_4no'         => sanitize_text_field( (string) ( $params['card4no'] ?? $params['Card4No'] ?? '' ) ),
+			'card_6no'         => sanitize_text_field( (string) ( $params['card6no'] ?? $params['Card6No'] ?? '' ) ),
+			'auth_code'        => sanitize_text_field( (string) ( $params['auth_code'] ?? $params['AuthCode'] ?? '' ) ),
 		];
 
 		return YSPaymentDetailDTO::from_legacy_array( $detail, '' );

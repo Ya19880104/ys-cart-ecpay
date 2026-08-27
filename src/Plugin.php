@@ -89,6 +89,7 @@ final class Plugin {
 		}
 
 		if ( ! class_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority', 'with_order_serialization' )
 			|| ! class_exists( '\YangSheep\Ecommerce\Database\YSMigration' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Database\YSMigration', 'shipping_label_dispatch_schema_ready' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Database\YSMigration', 'address_shipping_provider_schema_ready' )
@@ -96,12 +97,23 @@ final class Plugin {
 			|| ! class_exists( '\YangSheep\Ecommerce\Handlers\YSShippingHandler' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Handlers\YSShippingHandler', 'query_shipping_status_for_order' )
 			|| ! class_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService', 'advance_from_carrier_status' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService', 'publish_advance_hook' )
+			|| ( new \ReflectionMethod( '\YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService', 'advance_from_carrier_status' ) )->getNumberOfParameters() < 5
+			|| ! class_exists( '\YangSheep\Ecommerce\Security\YSWebhookGuard' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSWebhookGuard', 'reserve' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSWebhookGuard', 'commit_replay' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSWebhookGuard', 'release_replay' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Security\YSReplayReservation' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSReplayReservation', 'get_token' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSReplayReservation', 'is_acquired' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Security\YSReplayReservation', 'can_acknowledge' )
 			|| ! interface_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentReconcilerInterface' )
 			|| ! method_exists( '\YangSheep\Ecommerce\Shipping\YSShippingRegistry', 'is_method_allowed_for_cart' ) ) {
 			return [
 				'met'     => false,
 				'reason'  => 'core_capability_missing',
-				'message' => '核心缺少物流建單授權或商品物流守門的 API，綠界物流方式未註冊。',
+				'message' => '核心缺少物流建單授權、typed replay 或 deferred hook API，綠界物流方式未註冊。',
 			];
 		}
 
@@ -123,7 +135,7 @@ final class Plugin {
 		}
 
 		$cache_key = 'ys_ec_ecpay_core_gate_' . md5(
-			(string) YS_ECOMMERCE_VERSION . '|' . ( defined( 'YS_CART_ECPAY_VERSION' ) ? (string) YS_CART_ECPAY_VERSION : 'dev' ) . '|v2'
+			(string) YS_ECOMMERCE_VERSION . '|' . ( defined( 'YS_CART_ECPAY_VERSION' ) ? (string) YS_CART_ECPAY_VERSION : 'dev' ) . '|v3'
 		);
 		$cached    = function_exists( 'get_transient' ) ? get_transient( $cache_key ) : false;
 		if ( 'ok' === $cached ) {

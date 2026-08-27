@@ -35,6 +35,16 @@ v005_check(
     'payment return/order lookup must require signed payload and exact stored merchant trade number'
 );
 
+v005_check(
+    false !== strpos($payment, 'get_body_params')
+    && false !== strpos($logistics, 'get_body_params')
+    && false !== strpos($selector, 'get_body_params')
+    && 0 === preg_match('/=\s*wp_unslash\s*\(/', $payment)
+    && 0 === preg_match('/=\s*wp_unslash\s*\(/', $logistics)
+    && 0 === preg_match('/=\s*wp_unslash\s*\(/', $selector),
+    'signed REST callbacks must use already-unslashed body params without changing raw CMV bytes'
+);
+
 // 合流後（0.2.16 main）：訂單解析改為 label-first——先以 provider＋
 // provider_trade_no（＋order_id＋merchant_trade_no 綁定）鎖定 shipping label，
 // 再由 find_order_by_label() 取訂單；沒有 label 綁定就到不了訂單。
@@ -65,10 +75,11 @@ v005_check(
 );
 
 v005_check(
-    false !== strpos($selector, 'empty( $params[\'CheckMacValue\'] )')
+    false !== strpos($selector, "if ( ! empty( \$params['CheckMacValue'] ) )")
+    && false !== strpos($selector, "return CheckMacValue::verify( \$params, \$credentials['hash_key'], \$credentials['hash_iv'], 'md5' )")
     && false !== strpos($selector, 'merchant_trade_no')
     && false !== strpos($selector, 'logistics_subtype'),
-    'store callback must require signature and validate transient-bound identifiers'
+    'store callback must validate transient-bound identifiers and verify optional CheckMacValue when present'
 );
 
 v005_check(

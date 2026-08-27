@@ -11,6 +11,25 @@ final class HttpFormClient {
 	 * @return array{success:bool,outcome:string,body:string,params:array<string,string>,message:string}
 	 */
 	public function post( string $url, array $fields, int $timeout = 20 ): array {
+		return $this->post_with_parser( $url, $fields, $timeout, false );
+	}
+
+	/**
+	 * Send a request whose response uses ECPay's VerifiedEncodedStrResponse
+	 * decoder. That decoder preserves literal plus signs before CMV verification.
+	 *
+	 * @param array<string,mixed> $fields
+	 * @return array{success:bool,outcome:string,body:string,params:array<string,string>,message:string}
+	 */
+	public function post_verified( string $url, array $fields, int $timeout = 20 ): array {
+		return $this->post_with_parser( $url, $fields, $timeout, true );
+	}
+
+	/**
+	 * @param array<string,mixed> $fields
+	 * @return array{success:bool,outcome:string,body:string,params:array<string,string>,message:string}
+	 */
+	private function post_with_parser( string $url, array $fields, int $timeout, bool $verified_encoded ): array {
 		$response = wp_remote_post( $url, [
 			'timeout' => $timeout,
 			'body'    => $fields,
@@ -45,7 +64,9 @@ final class HttpFormClient {
 		}
 
 		$body   = (string) wp_remote_retrieve_body( $response );
-		$params = self::parse_body( $body );
+		$params = $verified_encoded
+			? self::parse_verified_body( $body )
+			: self::parse_body( $body );
 
 		return [
 			'success' => true,
@@ -60,6 +81,23 @@ final class HttpFormClient {
 	 * @return array<string,string>
 	 */
 	public static function parse_body( string $body ): array {
+		return self::parse_body_with_mode( $body, false );
+	}
+
+	/**
+	 * Parse a response covered by CheckMacValue using the official SDK's
+	 * VerifiedEncodedStrResponse plus-preservation rule.
+	 *
+	 * @return array<string,string>
+	 */
+	public static function parse_verified_body( string $body ): array {
+		return self::parse_body_with_mode( $body, true );
+	}
+
+	/**
+	 * @return array<string,string>
+	 */
+	private static function parse_body_with_mode( string $body, bool $preserve_literal_plus ): array {
 		$body = trim( $body );
 		if ( '' === $body ) {
 			return [];
@@ -86,19 +124,17 @@ final class HttpFormClient {
 				];
 			}
 
-			$params = [];
-			parse_str( html_entity_decode( $payload, ENT_QUOTES | ENT_HTML5, 'UTF-8' ), $params );
-			// 🔴 只收 scalar：query string 帶中括號時 parse_str 會生出巢狀陣列，
-			// strval(array) 是 Warning。非 scalar 的值對表單回應沒有意義，直接丟棄。
-			$params = self::scalarize( $params );
+			$params = self::parse_encoded_query(
+				html_entity_decode( $payload, ENT_QUOTES | ENT_HTML5, 'UTF-8' ),
+				$preserve_literal_plus
+			);
 			$params['_status_prefix'] = $matches[1];
 			return $params;
 		}
 
-		$params = [];
-		parse_str( $body, $params );
+		$params = self::parse_encoded_query( $body, $preserve_literal_plus );
 		if ( $params ) {
-			return self::scalarize( $params );
+			return $params;
 		}
 
 		foreach ( explode( '|', $body ) as $part ) {
@@ -110,6 +146,22 @@ final class HttpFormClient {
 		}
 
 		return $params;
+	}
+
+	/**
+	 * Parse one ECPay encoded-string response using the selected official SDK
+	 * decoder semantics. EncodedStrResponse treats plus as form-space;
+	 * VerifiedEncodedStrResponse preserves it before CheckMacValue verification.
+	 *
+	 * @return array<string,string>
+	 */
+	private static function parse_encoded_query( string $encoded, bool $preserve_literal_plus ): array {
+		$params = [];
+		parse_str( $preserve_literal_plus ? str_replace( '+', '%2B', $encoded ) : $encoded, $params );
+
+		// 只收 scalar：query string 帶中括號時 parse_str 會生出巢狀陣列，
+		// strval(array) 是 Warning。非 scalar 的值對表單回應沒有意義，直接丟棄。
+		return self::scalarize( $params );
 	}
 
 	/**

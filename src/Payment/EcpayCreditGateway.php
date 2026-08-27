@@ -709,24 +709,24 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		// 「綠界確認的交易編號」與「我們以為的交易編號」再也分不出來；而且它被寫
 		// 回 `trade_no`——指紋欄位——把比對基準一起改掉。
 		$raw_trade_no  = $result['data']['TradeNo'] ?? null;
-		$done_trade_no = is_string( $raw_trade_no ) ? trim( $raw_trade_no ) : '';
+		$done_trade_no = is_string( $raw_trade_no ) ? $raw_trade_no : '';
 
-		if ( '' === $done_trade_no ) {
-			// 金流已經動了，但回應沒有可驗證的交易編號 → 不得宣告成功。
-			YSLogger::error( 'ecpay', 'CRITICAL: 退款成功回應缺少 TradeNo，無法驗證', [
+		if ( '' === $done_trade_no || ! hash_equals( $trade_no, $done_trade_no ) ) {
+			// 金流可能已經動了，但回應無法綁回本次 TradeNo → 不得宣告成功。
+			YSLogger::error( 'ecpay', 'CRITICAL: 退款成功回應 TradeNo 缺失或不符，無法驗證', [
 				'order_id'   => $order_id,
 				'request_id' => $request_id,
 				'raw'        => is_scalar( $raw_trade_no ) ? (string) $raw_trade_no : gettype( $raw_trade_no ),
 			] );
 
 			self::note_attempt( $order_id, $request_id, [
-				'note' => '綠界回應缺少 TradeNo，無法驗證，已凍結待人工核定',
-			], $fingerprint, '缺 TradeNo 註記' );
+				'note' => '綠界回應 TradeNo 缺失或不符，無法驗證，已凍結待人工核定',
+			], $fingerprint, 'TradeNo 身分異常註記' );
 
 			return [
 				'success' => false,
 				'outcome' => 'indeterminate',
-				'message' => '綠界回應成功但未帶交易編號（TradeNo），無法驗證這筆退款；本單退款已凍結，請於綠界後台確認後人工核定。',
+				'message' => '綠界回應成功但交易編號（TradeNo）缺失或不符，無法驗證這筆退款；本單退款已凍結，請於綠界後台確認後人工核定。',
 			];
 		}
 

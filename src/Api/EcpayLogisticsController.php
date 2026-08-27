@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
+use YangSheep\Ecommerce\Security\YSWebhookGuard;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingDispatchAuthority;
 use YangSheep\Ecommerce\Services\Shipping\YSShippingPipelineService;
 use YangSheep\Ecommerce\Utils\YSLogger;
@@ -18,6 +19,9 @@ use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 final class EcpayLogisticsController {
+	/** Official retries continue for three days from the carrier status update. */
+	private const LOGISTICS_NOTIFY_REPLAY_TTL = 345600;
+
 	public static function register_routes(): void {
 		$controller = new self();
 		register_rest_route( 'ys-ecommerce/v1', '/ecpay/logistics-notify', [
@@ -60,6 +64,7 @@ final class EcpayLogisticsController {
 		if ( ! $this->verify( $params, $label_method ) ) {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
+		$params = $this->sanitize_params( $params );
 
 		// 🔴 「查不到」與「查不動」是兩件事。
 		//
@@ -88,67 +93,140 @@ final class EcpayLogisticsController {
 			$this->respond_text( '0|Logistics binding mismatch', 400 );
 		}
 
-		// Different signed status callbacks are not replay duplicates. They still mutate the same
-		// order projections, so the pipeline decision and every durable write must share Core's
-		// order-wide advisory serialization boundary.
-		$serialized = $this->with_notify_serialization(
-			$order_id,
-			function () use ( $params, $order_id ): array {
-				$locked_lookup = $this->find_label( $params );
-				$status        = (string) ( $locked_lookup['status'] ?? 'error' );
-
-				if ( 'mismatch' === $status ) {
-					return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
-				}
-				if ( 'not_found' === $status || 'pending' === $status ) {
-					return [ 'body' => '0|Label not persisted yet', 'status' => 503 ];
-				}
-				if ( 'found' !== $status ) {
-					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
-				}
-
-				$locked_label = $locked_lookup['label'];
-				if ( $order_id !== (int) ( $locked_label->order_id ?? 0 )
-					|| ! $this->binding_matches( $locked_label, $params ) ) {
-					return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
-				}
-
-				$authority_status = $this->callback_authority_status( $locked_label );
-				if ( 'stale' === $authority_status ) {
-					return [ 'body' => '1|OK', 'status' => 200 ];
-				}
-				if ( 'current' !== $authority_status ) {
-					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
-				}
-
-				// The lock can wait behind another callback. Drop any request-local order snapshot before
-				// the first transition decision so a later worker cannot project stale state backwards.
-				YSOrder::forget( $order_id );
-				$order = $this->find_order_by_label( $locked_label );
-				if ( null === $order ) {
-					return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
-				}
-
-				if ( ! $this->update_order_shipping( $order, $params, $locked_label ) ) {
-					return [ 'body' => '0|Persistence failed', 'status' => 503 ];
-				}
-
-				return [ 'body' => '1|OK', 'status' => 200 ];
-			}
+		// Reserve the exact signed delivery before entering any mutating path. The
+		// CMV covers the full callback; domain-separating and hashing it gives us a
+		// stable replay key without storing or logging the provider signature.
+		$replay_signature = hash(
+			'sha256',
+			'ecpay-logistics-v1|'
+				. (string) ( $params['MerchantID'] ?? '' )
+				. '|'
+				. strtoupper( (string) ( $params['CheckMacValue'] ?? '' ) )
 		);
+		$reservation = YSWebhookGuard::reserve( 'ecpay_logistics_notify', $replay_signature );
+		if ( ! $reservation->is_acquired() ) {
+			if ( $reservation->can_acknowledge() ) {
+				$this->respond_text( '1|OK' );
+			}
 
-		$release = (string) ( $serialized['serialization_release'] ?? '' );
-		$result  = $serialized['result'] ?? null;
-		if ( true !== ( $serialized['guard'] ?? false )
-			|| ! is_array( $result )
-			|| ! in_array( $release, [ 'released', 'session_closed', 'reentrant' ], true ) ) {
-			$this->respond_text( '0|Serialization unavailable', 503 );
+			// Another worker is still processing, or the replay store is uncertain.
+			// Neither state proves completion, so retain ECPay's retry opportunity.
+			$this->respond_text( '0|Replay unavailable', 503 );
 		}
 
-		$this->respond_text(
-			(string) ( $result['body'] ?? '0|Storage unavailable' ),
-			(int) ( $result['status'] ?? 503 )
-		);
+		$replay_token        = (string) $reservation->get_token();
+		$event_id            = hash( 'sha256', 'ecpay-logistics-event-v1|' . $replay_signature );
+		$settled             = false;
+		$pipeline_hook_event = [];
+		$release_replay      = static function () use ( $replay_signature, $replay_token, &$settled ): void {
+			if ( $settled ) {
+				return;
+			}
+			if ( ! YSWebhookGuard::release_replay( 'ecpay_logistics_notify', $replay_signature, $replay_token ) ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback replay reservation 釋放失敗' );
+			}
+			$settled = true;
+		};
+
+		try {
+			// Different signed status callbacks are not replay duplicates. They still mutate the same
+			// order projections, so the pipeline decision and every durable write must share Core's
+			// order-wide advisory serialization boundary.
+			$serialized = $this->with_notify_serialization(
+				$order_id,
+				function () use ( $params, $order_id, $event_id, &$pipeline_hook_event ): array {
+					$locked_lookup = $this->find_label( $params );
+					$status        = (string) ( $locked_lookup['status'] ?? 'error' );
+
+					if ( 'mismatch' === $status ) {
+						return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
+					}
+					if ( 'not_found' === $status || 'pending' === $status ) {
+						return [ 'body' => '0|Label not persisted yet', 'status' => 503 ];
+					}
+					if ( 'found' !== $status ) {
+						return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
+					}
+
+					$locked_label = $locked_lookup['label'];
+					if ( $order_id !== (int) ( $locked_label->order_id ?? 0 )
+						|| ! $this->binding_matches( $locked_label, $params ) ) {
+						return [ 'body' => '0|Logistics binding mismatch', 'status' => 400 ];
+					}
+
+					$authority_status = $this->callback_authority_status( $locked_label );
+					if ( 'stale' === $authority_status ) {
+						return [ 'body' => '1|OK', 'status' => 200 ];
+					}
+					if ( 'current' !== $authority_status ) {
+						return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
+					}
+
+					// The lock can wait behind another callback. Drop any request-local order snapshot before
+					// the first transition decision so a later worker cannot project stale state backwards.
+					YSOrder::forget( $order_id );
+					$order = $this->find_order_by_label( $locked_label );
+					if ( null === $order ) {
+						return [ 'body' => '0|Storage unavailable', 'status' => 503 ];
+					}
+
+					if ( ! $this->update_order_shipping( $order, $params, $locked_label, $event_id, $pipeline_hook_event ) ) {
+						return [ 'body' => '0|Persistence failed', 'status' => 503 ];
+					}
+
+					return [ 'body' => '1|OK', 'status' => 200 ];
+				}
+			);
+
+			$release = (string) ( $serialized['serialization_release'] ?? '' );
+			$result  = $serialized['result'] ?? null;
+			if ( true !== ( $serialized['guard'] ?? false )
+				|| ! is_array( $result )
+				|| ! in_array( $release, [ 'released', 'session_closed', 'reentrant' ], true ) ) {
+				$release_replay();
+				$this->respond_text( '0|Serialization unavailable', 503 );
+			}
+
+			$result_body   = (string) ( $result['body'] ?? '0|Storage unavailable' );
+			$result_status = (int) ( $result['status'] ?? 503 );
+			if ( $result_status < 200 || $result_status >= 300 ) {
+				$release_replay();
+				$this->respond_text( $result_body, $result_status );
+			}
+
+			// Replay completion is a required durable write. Publish no extension hook
+			// until it succeeds, otherwise a retry can repeat an irreversible listener.
+			if ( ! YSWebhookGuard::commit_replay(
+				'ecpay_logistics_notify',
+				$replay_signature,
+				$replay_token,
+				self::LOGISTICS_NOTIFY_REPLAY_TTL
+			) ) {
+				$release_replay();
+				$this->respond_text( '0|Replay commit failed', 503 );
+			}
+			$settled = true;
+		} catch ( \Throwable $e ) {
+			$release_replay();
+			YSLogger::error( 'ecpay', 'CRITICAL: 物流 callback 處理拋出例外（已要求重送）', [
+				'message' => $e->getMessage(),
+			] );
+			$this->respond_text( '0|Internal error', 500 );
+		}
+
+		// All provider projections and replay authority are now durable. Listener
+		// failures are advisory and must not make ECPay repeat the completed event.
+		if ( [] !== $pipeline_hook_event ) {
+			try {
+				YSShippingPipelineService::publish_advance_hook( $pipeline_hook_event );
+			} catch ( \Throwable $e ) {
+				YSLogger::error( 'ecpay', '物流 pipeline hook 發布例外（callback 已 durable）', [
+					'message' => $e->getMessage(),
+				] );
+			}
+		}
+
+		$this->respond_text( $result_body, $result_status );
 	}
 
 	/** @return array{guard:bool,reason:string,result:mixed,serialization_release:string} */
@@ -167,8 +245,8 @@ final class EcpayLogisticsController {
 	 * @return array{status:string,label:?object}
 	 */
 	private function find_label( array $params ): array {
-		$logistics_id = trim( (string) ( $params['AllPayLogisticsID'] ?? '' ) );
-		$trade_no      = trim( (string) ( $params['MerchantTradeNo'] ?? '' ) );
+		$logistics_id = (string) ( $params['AllPayLogisticsID'] ?? '' );
+		$trade_no      = (string) ( $params['MerchantTradeNo'] ?? '' );
 		if ( '' === $logistics_id || '' === $trade_no ) {
 			return [ 'status' => 'mismatch', 'label' => null ];
 		}
@@ -293,20 +371,20 @@ final class EcpayLogisticsController {
 		}
 
 		foreach ( [ 'MerchantTradeNo', 'LogisticsSubType' ] as $field ) {
-			if ( ! array_key_exists( $field, $params ) || '' === trim( (string) $params[ $field ] ) ) {
+			if ( ! array_key_exists( $field, $params ) || '' === (string) $params[ $field ] ) {
 				return false;
 			}
 		}
 
-		$stored_trade_no = trim( (string) ( $label->merchant_trade_no ?? '' ) );
-		if ( '' === $stored_trade_no || trim( (string) $params['MerchantTradeNo'] ) !== $stored_trade_no ) {
+		$stored_trade_no = (string) ( $label->merchant_trade_no ?? '' );
+		if ( '' === $stored_trade_no || (string) $params['MerchantTradeNo'] !== $stored_trade_no ) {
 			return false;
 		}
 
-		$stored_subtype   = trim( (string) ( $label->logistics_subtype ?? '' ) );
+		$stored_subtype   = (string) ( $label->logistics_subtype ?? '' );
 		$expected_subtype = '' !== $stored_subtype ? $stored_subtype : (string) $descriptor['logistics_subtype'];
 
-		return trim( (string) $params['LogisticsSubType'] ) === $expected_subtype;
+		return (string) $params['LogisticsSubType'] === $expected_subtype;
 	}
 
 	/**
@@ -390,13 +468,26 @@ final class EcpayLogisticsController {
 	 */
 	private function params( \WP_REST_Request $request ): array {
 		$out = [];
-		foreach ( $request->get_params() as $key => $value ) {
+		$source = method_exists( $request, 'get_body_params' )
+			? $request->get_body_params()
+			: $request->get_params();
+		foreach ( $source as $key => $value ) {
 			if ( is_array( $value ) ) {
 				continue;
 			}
-			$out[ (string) $key ] = sanitize_text_field( wp_unslash( (string) $value ) );
+			// WP REST has already unslashed request parameters. Preserve the resulting
+			// scalar bytes exactly until CheckMacValue verification is complete.
+			$out[ (string) $key ] = (string) $value;
 		}
 		return $out;
+	}
+
+	/** @param array<string,string> $params @return array<string,string> */
+	private function sanitize_params( array $params ): array {
+		return array_map(
+			static fn ( string $value ): string => sanitize_text_field( $value ),
+			$params
+		);
 	}
 
 	/**
@@ -419,7 +510,14 @@ final class EcpayLogisticsController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function update_order_shipping( object $order, array $params, object $label ): bool {
+	private function update_order_shipping(
+		object $order,
+		array $params,
+		object $label,
+		string $event_id,
+		array &$pipeline_hook_event
+	): bool {
+		$pipeline_hook_event = [];
 		// 🔴 追蹤碼**只**取託運單號（BookingNote）。
 		//
 		// 寄貨編號（CVSPaymentNo）是賣家交貨用的憑據、物流編號（AllPayLogisticsID）
@@ -441,11 +539,14 @@ final class EcpayLogisticsController {
 		//   success=false    不允許的轉換＝已知且重送也不會變 → 不寫狀態、照樣 ACK。
 		//   success=true     正常前進 → 狀態可以寫。
 		$status_advance_allowed = true;
+		$deferred_hook_event    = [];
 		if ( '' !== $status && class_exists( YSShippingPipelineService::class ) ) {
 			$advanced = YSShippingPipelineService::advance_from_carrier_status(
 				(int) $order->id,
 				$status,
-				'webhook_ecpay'
+				'webhook_ecpay',
+				[ 'event_id' => $event_id ],
+				false
 			);
 
 			if ( is_array( $advanced ) ) {
@@ -453,6 +554,9 @@ final class EcpayLogisticsController {
 					return false;
 				}
 				$status_advance_allowed = ! empty( $advanced['success'] );
+				if ( $status_advance_allowed && is_array( $advanced['hook_event'] ?? null ) ) {
+					$deferred_hook_event = $advanced['hook_event'];
+				}
 			}
 		}
 
@@ -531,7 +635,12 @@ final class EcpayLogisticsController {
 			}
 		}
 
-		return $this->sync_label( $label, $params, $tracking, $status, $status_advance_allowed );
+		if ( ! $this->sync_label( $label, $params, $tracking, $status, $status_advance_allowed ) ) {
+			return false;
+		}
+
+		$pipeline_hook_event = $deferred_hook_event;
+		return true;
 	}
 
 

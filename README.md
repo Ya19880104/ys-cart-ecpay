@@ -27,17 +27,21 @@ Standalone ECPay provider plugin for YS CART.
 
 - WordPress 6.2+
 - PHP 8.1+
-- **YS CART 2.57.0+** (hard requirement; on top of the 2.56.12 set — typed
+- **YS CART 2.58.0+** (hard requirement; on top of the 2.56.12 set — typed
   fulfillment, durable logistics query, saved-address provider identity,
-  encrypted-secret capability — 0.3.0 additionally requires the shared
-  `payment_detail` CAS service and stable payment operation keys)
+  encrypted-secret capability — the 2.58.0 pair contract additionally requires the shared
+  `payment_detail` CAS service, stable payment operation keys, typed replay
+  reservations, and deferred shipping pipeline hooks)
 
-### Why YS CART 2.57.0 is a hard requirement
+### Why YS CART 2.58.0 is a hard requirement
 
 This plugin does not carry its own writer for the order `payment_detail` column.
 It writes through the core's `YSPaymentDetailStore` compare-and-swap service and
 relies on the core's `YSPaymentDispatch` operation keys so that every payment
-attempt derives a stable transaction identity. Neither exists before 2.57.0.
+attempt derives a stable transaction identity. Logistics callbacks also reserve
+typed replay authority and defer the public pipeline hook until the provider's
+payment-detail, order, and label projections are durable. The complete capability
+set is available from 2.58.0.
 
 If the core is older, the plugin **registers no payment gateways and no shipping
 methods** and shows an admin notice instead. A provider that is registered but

@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased（需 YS CART core >= 2.58.0）
+
+### Fixed
+
+- 付款通知的 `SimulatePaid=1` 現在只回覆 `1|OK`，不再寫入真實交易身分或推進
+  paid lifecycle。
+- signed URL-encoded 回應依綠界官方 PHP SDK 使用
+  `VerifiedEncodedStrResponse` 的 literal `+` 保留規則；未簽章的 `DoAction` 回應仍依
+  一般 form decoder 將 `+` 解成空白，避免混用兩種協定語意。
+- CheckMacValue 輸入與 REST callback 改為保留官方實際簽署的 decoded scalar bytes：
+  不再 trim，也不再對 WordPress 已 unslash 的 body params 二次 unslash；欄位只在驗章
+  成功後、寫入或顯示前才清理。
+- `CreditDetail/QueryTrade/V2` 與 `DoAction` 回應改為 fail-closed 綁定請求交易身分與
+  金額；缺失或錯筆回應維持 indeterminate，不允許盲重送不可逆退款。
+- 物流 callback 改用 typed replay reservation 與 stable event id；所有 provider
+  projections 與 replay commit 完成後才發布 shipping pipeline hook，寫入失敗時零 hook。
+  已完成 replay 保留四天，涵蓋綠界官方三天重送窗口並多留一天緩衝。
+- 電子地圖回跳 URL 在加入 one-time result code 前不再做 display-context escape，保留
+  原本的多個 query parameters。
+
+### Changed
+
+- 最低核心版本提高為 **YS CART 2.58.0**，並 fail-closed 探測 order serialization、
+  typed replay reservation／token／commit／release、五參數 shipping pipeline advance
+  與 deferred hook capability；舊 gate transient namespace 同步升版，避免沿用先前的
+  false-green cache。
+
+### Tests
+
+- 新增付款模擬通知、物流 callback durability／replay 狀態機、ECPay 回應身分與 parser、
+  電子地圖 multi-query return URL 的可執行 regression，並補強 raw signed REST bytes 與
+  Core 2.58 capability gate oracle。
+
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 
 > 本節僅列**相對已發布 0.2.16** 的新內容。0.3.0 開發線早期實作的 C2C／低溫／

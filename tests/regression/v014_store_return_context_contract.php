@@ -58,7 +58,7 @@ $check(
 
 $check(
 	'checkout callback redirects to caller page instead of hard-coded checkout',
-	strpos( $selector, '$checkout_url = esc_url( $store_info[\'return_url\'] ?? self::checkout_url() );' ) !== false
+	strpos( $selector, '$checkout_url = esc_url_raw( $store_info[\'return_url\'] ?? self::checkout_url() );' ) !== false
 		&& strpos( $selector, 'window.location.replace' ) !== false
 );
 

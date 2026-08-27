@@ -22,8 +22,9 @@
  *
  * ## 為什麼 bootstrap 要有版本 gate
  *
- * 本外掛沒有自己的 payment_detail 寫入器，全部走核心 2.57.0 的
- * `YSPaymentDetailStore`，並依賴 `YSPaymentDispatch` 的 ambient guard。核心太舊時
+ * 本外掛沒有自己的 payment_detail 寫入器，全部走核心的
+ * `YSPaymentDetailStore`，並依賴 `YSPaymentDispatch`、typed replay reservation 與
+ * deferred shipping hook。核心太舊時
  * 註冊 gateway 只會得到一個「收得到錢、寫不了帳」的 provider——比明顯缺席危險得多。
  *
  * Run: php tests/regression/v022_core_sync_and_bootstrap_gate.php
@@ -336,13 +337,13 @@ namespace {
 
     $bootstrap_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/ys-cart-ecpay.php' );
     $assert(
-        str_contains( $bootstrap_src, "define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.57.0' );" ),
-        '(h) 宣告的最低核心版本是 2.57.0'
+        str_contains( $bootstrap_src, "define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );" ),
+        '(h) 宣告的最低核心版本是 2.58.0（typed replay＋deferred shipping hook）'
     );
 
     // 模擬 bootstrap 的常數（測試 process 不載入主檔；上一個斷言已證明主檔
     // 定義的就是這個值）。
-    define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.57.0' );
+    define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );
 
     // 核心常數不存在（外掛單獨啟用、或核心未載入）→ met=false／core_missing，
     // 不得當成「可能沒問題」。
@@ -370,23 +371,32 @@ namespace {
         '(h3) 🔴 gate 不符 → admin_notices＋return 先於 init()，gateway／物流／REST／CLI 一律不註冊'
     );
 
-    // 核心太舊（2.56.12 < 2.57.0）→ met=false／core_too_old，訊息帶出所需版本。
+    // 核心太舊（2.56.12 < 2.58.0）→ met=false／core_too_old，訊息帶出所需版本。
     define( 'YS_ECOMMERCE_VERSION', '2.56.12' );
     $gate_old = Plugin::core_requirements();
     $assert(
         false === $gate_old['met']
         && 'core_too_old' === $gate_old['reason']
-        && str_contains( $gate_old['message'], '2.57.0' ),
+        && str_contains( $gate_old['message'], '2.58.0' ),
         '(h4) 核心太舊 → core_too_old 且訊息帶出所需版本'
     );
 
-    // 版本足夠時的放行路徑：define 不可重定義，無法在同一 process 內模擬 2.57.0；
+    // 版本足夠時的放行路徑：define 不可重定義，無法在同一 process 內模擬 2.58.0；
     // 以來源斷言版本比較確實以 YS_CART_ECPAY_REQUIRES_CORE 為準（'<' 擋下、否則續行）。
     $plugin_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Plugin.php' );
     $assert(
         str_contains( $plugin_src, "defined( 'YS_CART_ECPAY_REQUIRES_CORE' ) ? YS_CART_ECPAY_REQUIRES_CORE" )
         && str_contains( $plugin_src, "version_compare( (string) YS_ECOMMERCE_VERSION, \$required, '<' )" ),
         '(h5) 版本比較以 YS_CART_ECPAY_REQUIRES_CORE 為準'
+    );
+
+    $assert(
+        str_contains( $plugin_src, "method_exists( '\\YangSheep\\Ecommerce\\Security\\YSWebhookGuard', 'reserve' )" )
+        && str_contains( $plugin_src, "method_exists( '\\YangSheep\\Ecommerce\\Security\\YSWebhookGuard', 'commit_replay' )" )
+        && str_contains( $plugin_src, "method_exists( '\\YangSheep\\Ecommerce\\Security\\YSReplayReservation', 'get_token' )" )
+        && str_contains( $plugin_src, "method_exists( '\\YangSheep\\Ecommerce\\Services\\Shipping\\YSShippingDispatchAuthority', 'with_order_serialization' )" )
+        && str_contains( $plugin_src, "method_exists( '\\YangSheep\\Ecommerce\\Services\\Shipping\\YSShippingPipelineService', 'publish_advance_hook' )" ),
+        '(h6) runtime capability gate 要求完整 typed replay、order serialization 與 deferred hook，不能 false-green'
     );
 
     // ══ #2G：MerchantTradeNo 由穩定 operation key 導出 ═══════════════════════

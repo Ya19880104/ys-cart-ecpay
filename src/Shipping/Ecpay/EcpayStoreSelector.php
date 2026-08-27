@@ -556,6 +556,7 @@ final class EcpayStoreSelector {
 		if ( ! self::verify_map_payload( $params, $map_data ) ) {
 			wp_die( 'Invalid map callback payload.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
+		$params = self::sanitize_params( $params );
 
 		$store_id = trim( (string) ( $params['CVSStoreID'] ?? '' ) );
 		if ( '' === $store_id ) {
@@ -665,13 +666,26 @@ final class EcpayStoreSelector {
 	 */
 	private static function params( \WP_REST_Request $request ): array {
 		$out = [];
-		foreach ( $request->get_params() as $key => $value ) {
+		$source = method_exists( $request, 'get_body_params' )
+			? $request->get_body_params()
+			: $request->get_params();
+		foreach ( $source as $key => $value ) {
 			if ( is_array( $value ) ) {
 				continue;
 			}
-			$out[ (string) $key ] = sanitize_text_field( wp_unslash( (string) $value ) );
+			// WP REST has already unslashed request parameters. Preserve the resulting
+			// scalar bytes exactly for optional CheckMacValue verification.
+			$out[ (string) $key ] = (string) $value;
 		}
 		return $out;
+	}
+
+	/** @param array<string,string> $params @return array<string,string> */
+	private static function sanitize_params( array $params ): array {
+		return array_map(
+			static fn ( string $value ): string => sanitize_text_field( $value ),
+			$params
+		);
 	}
 
 	/**
@@ -922,7 +936,7 @@ final class EcpayStoreSelector {
 		// 這裡分開帶，並且只放在 headless 用得到的地方。
 		$json_data    = wp_json_encode( $store_info );
 		$origin       = esc_url( home_url() );
-		$checkout_url = esc_url( $store_info['return_url'] ?? self::checkout_url() );
+		$checkout_url = esc_url_raw( $store_info['return_url'] ?? self::checkout_url() );
 		$context      = (string) ( $store_info['context'] ?? 'checkout' );
 
 		if ( '' !== $result_code ) {

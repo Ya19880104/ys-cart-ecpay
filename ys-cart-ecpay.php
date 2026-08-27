@@ -40,11 +40,11 @@ spl_autoload_register(
 );
 
 /**
- * v0.3.0 pair contract: shared payment_detail CAS (YSPaymentDetailStore), stable
- * payment operation keys, refund finalization sync — on top of the 2.56.12
- * typed fulfillment / saved-CVS authority / durable query / address identity set.
+ * Pair contract: shared payment_detail CAS, stable payment operation keys,
+ * typed replay reservation and deferred shipping hooks. The latter two prevent
+ * a logistics callback from publishing effects before all projections persist.
  */
-define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.57.0' );
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );
 
 add_action(
 	'plugins_loaded',

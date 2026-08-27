@@ -181,7 +181,7 @@ namespace YangSheep\YSCartEcpay\Payment {
                 : [];
 
             $next = array_shift(self::$do_action_results);
-            return $next ?? ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => 'ECPAY-RESP-9'], 'message' => ''];
+            return $next ?? ['success' => true, 'indeterminate' => false, 'data' => ['TradeNo' => $tn], 'message' => ''];
         }
 
         public static function do_action_count(): int
@@ -594,8 +594,8 @@ namespace {
     $seed();
     EcpayPaymentClient::$close = [ 'state' => 'to_close', 'message' => '' ];
     EcpayPaymentClient::$do_action_results = [
-        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'ECPAY-E' ], 'message' => '' ],
-        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'ECPAY-N' ], 'message' => '' ],
+        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'TN-1' ], 'message' => '' ],
+        [ 'success' => true, 'indeterminate' => false, 'data' => [ 'TradeNo' => 'TN-1' ], 'message' => '' ],
     ];
     $r     = $refund();
     $entry = $ledger();
@@ -636,8 +636,8 @@ namespace {
         [] === $missing_fields
         && 'ok' === ( $results[0]['transport'] ?? '' )
         && 'ok' === ( $results[1]['transport'] ?? '' )
-        && 'ECPAY-E' === ( $results[0]['response_trade_no'] ?? '' )
-        && 'ECPAY-N' === ( $results[1]['response_trade_no'] ?? '' )
+        && 'TN-1' === ( $results[0]['response_trade_no'] ?? '' )
+        && 'TN-1' === ( $results[1]['response_trade_no'] ?? '' )
         // executed 是**這一步之前**已完成的步驟；attempted 含這一步。
         && '' === ( $results[0]['executed'] ?? 'x' )
         && 'E' === ( $results[0]['attempted'] ?? '' )

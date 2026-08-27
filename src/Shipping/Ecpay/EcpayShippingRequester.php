@@ -70,7 +70,7 @@ final class EcpayShippingRequester {
 			];
 		}
 
-		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
+		$result = $this->http->post_verified( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
 		if ( ! $result['success'] ) {
 			// 🔴 傳輸層說不出「對方有沒有收到」，因此一律往上傳 indeterminate。
 			// 缺 outcome 時也當 indeterminate——缺欄位不是「明確失敗」。
@@ -726,7 +726,7 @@ final class EcpayShippingRequester {
 			return $this->indeterminate_result( '綠界設定維護窗與本次查詢重疊，本次未送出查詢請求，請稍後再試。' );
 		}
 
-		$result = $this->http->post( Settings::logistics_endpoint( EcpayShippingCatalog::query_path(), $method_id ), $fields );
+		$result = $this->http->post_verified( Settings::logistics_endpoint( EcpayShippingCatalog::query_path(), $method_id ), $fields );
 		if ( ! $result['success'] ) {
 			return $this->indeterminate_result( (string) $result['message'], (string) $result['body'] );
 		}
