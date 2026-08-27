@@ -816,7 +816,10 @@ final class Plugin {
 	}
 
 	public function ecpay_store_result( \WP_REST_Request $request ): \WP_REST_Response {
-		$params     = YSRequestParser::params( $request );
+		// This is a GET endpoint. Core's shared storefront parser intentionally reads
+		// JSON/form bodies only, so using it here silently discarded both `code` and
+		// `cart_scope` from the documented query string and made every claim fail.
+		$params     = $request->get_query_params();
 		$scope      = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
 		$principal  = EcpayStoreSelector::current_principal( $scope );
 		$code       = sanitize_text_field( (string) ( $params['code'] ?? '' ) );
