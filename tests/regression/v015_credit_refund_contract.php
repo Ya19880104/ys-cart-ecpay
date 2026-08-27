@@ -194,6 +194,7 @@ namespace {
     require_once $core . 'YSPaymentDispatch.php';
     require_once dirname(__DIR__, 2) . '/src/Support/DetailWriteOutcome.php';
     require_once dirname(__DIR__, 2) . '/src/Support/OrderPaymentDetail.php';
+    require_once dirname(__DIR__, 2) . '/src/Support/Utf8Text.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/CoreRefundAuthorization.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayGatewayBase.php';
     require_once dirname(__DIR__, 2) . '/src/Payment/EcpayCreditGateway.php';

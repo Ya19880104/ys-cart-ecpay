@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
+use YangSheep\YSCartEcpay\Support\Utf8Text;
 
 /**
  * 退款 attempt 人工核定 CLI（v0.3.0，CODEX 終審 F4）
@@ -212,8 +213,8 @@ final class EcpayRefundAttemptCommand {
 			$text = (string) wp_json_encode( $value );
 		}
 
-		if ( mb_strlen( $text ) > 300 ) {
-			return mb_substr( $text, 0, 300 ) . '…(truncated)';
+		if ( Utf8Text::length( $text ) > 300 ) {
+			return Utf8Text::truncate( $text, 300 ) . '…(truncated)';
 		}
 
 		return '' === $text ? '-' : $text;

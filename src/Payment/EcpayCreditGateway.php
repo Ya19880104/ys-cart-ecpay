@@ -9,6 +9,7 @@ use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\Utf8Text;
 
 final class EcpayCreditGateway extends EcpayGatewayBase {
 	public function get_id(): string {
@@ -598,7 +599,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 				'attempted' => implode( ',', $attempted ),
 				'executed'  => implode( ',', $executed ),
 				'rtn_code'  => (string) ( $result['data']['RtnCode'] ?? '' ),
-				'rtn_msg'   => mb_substr( (string) ( $result['message'] ?? '' ), 0, 300 ),
+				'rtn_msg'   => Utf8Text::truncate( (string) ( $result['message'] ?? '' ), 300 ),
 				'response_trade_no' => is_string( $result['data']['TradeNo'] ?? null )
 					? (string) $result['data']['TradeNo']
 					: '',

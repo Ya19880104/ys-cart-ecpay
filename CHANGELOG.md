@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- 在沒有可選 PHP `mbstring` extension 的 WordPress 主機上，不再因付款、物流或退款
+  字串長度限制而 fatal；共用 UTF-8 fallback 仍以完整 code point 截斷。
 - 付款通知的 `SimulatePaid=1` 現在只回覆 `1|OK`，不再寫入真實交易身分或推進
   paid lifecycle。
 - signed URL-encoded 回應依綠界官方 PHP SDK 使用
@@ -31,7 +33,8 @@
 
 - 新增付款模擬通知、物流 callback durability／replay 狀態機、ECPay 回應身分與 parser、
   電子地圖 multi-query return URL 的可執行 regression，並補強 raw signed REST bytes 與
-  Core 2.58 capability gate oracle。
+  Core 2.58 capability gate oracle；另以停用所有 php.ini extensions 的子程序驗證
+  `mbstring` fallback。
 
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 

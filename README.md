@@ -27,6 +27,8 @@ Standalone ECPay provider plugin for YS CART.
 
 - WordPress 6.2+
 - PHP 8.1+
+- PHP `mbstring` is recommended but not required; the provider includes a UTF-8-safe
+  fallback for ECPay field-length limits.
 - **YS CART 2.58.0+** (hard requirement; on top of the 2.56.12 set — typed
   fulfillment, durable logistics query, saved-address provider identity,
   encrypted-secret capability — the 2.58.0 pair contract additionally requires the shared

@@ -10,6 +10,7 @@ use YangSheep\YSCartEcpay\Support\HttpFormClient;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
+use YangSheep\YSCartEcpay\Support\Utf8Text;
 
 /**
  * 綠界物流建單／列印
@@ -263,10 +264,10 @@ final class EcpayShippingRequester {
 			'LogisticsType'     => $logistics_type,
 			'LogisticsSubType'  => $this->method->get_logistics_subtype(),
 			'GoodsAmount'       => (string) $amount,
-			'GoodsName'         => mb_substr( wp_strip_all_tags( (string) ( $order_data['product_name'] ?? 'YS CART Order' ) ), 0, 50 ),
-			'SenderName'        => mb_substr( (string) ( $order_data['sender_name'] ?? Settings::get( Settings::SENDER_KEYS['name'], '' ) ), 0, 10 ),
+			'GoodsName'         => Utf8Text::truncate( wp_strip_all_tags( (string) ( $order_data['product_name'] ?? 'YS CART Order' ) ), 50 ),
+			'SenderName'        => Utf8Text::truncate( (string) ( $order_data['sender_name'] ?? Settings::get( Settings::SENDER_KEYS['name'], '' ) ), 10 ),
 			'SenderCellPhone'   => (string) ( $order_data['sender_phone'] ?? Settings::get( Settings::SENDER_KEYS['phone'], '' ) ),
-			'ReceiverName'      => mb_substr( (string) ( $order_data['receiver_name'] ?? '' ), 0, 10 ),
+			'ReceiverName'      => Utf8Text::truncate( (string) ( $order_data['receiver_name'] ?? '' ), 10 ),
 			'ReceiverCellPhone' => (string) ( $order_data['receiver_phone'] ?? '' ),
 			'ServerReplyURL'    => rest_url( 'ys-ecommerce/v1/ecpay/logistics-notify' ),
 			// 🔴 代收與否由**訂單實際的付款方式**決定，不是物流方式的能力，

@@ -9,6 +9,7 @@ use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
+use YangSheep\YSCartEcpay\Support\Utf8Text;
 
 final class EcpayPaymentClient {
 	private int $last_http_status = 0;
@@ -59,7 +60,7 @@ final class EcpayPaymentClient {
 			'MerchantTradeDate' => current_time( 'Y/m/d H:i:s' ),
 			'PaymentType'       => 'aio',
 			'TotalAmount'       => (string) $amount,
-			'TradeDesc'         => mb_substr( 'YS CART order ' . (string) ( $order->order_number ?? $order->id ?? '' ), 0, 200 ),
+			'TradeDesc'         => Utf8Text::truncate( 'YS CART order ' . (string) ( $order->order_number ?? $order->id ?? '' ), 200 ),
 			'ItemName'          => $item_name,
 			'ReturnURL'         => rest_url( 'ys-ecommerce/v1/ecpay/notify' ),
 			'OrderResultURL'    => rest_url( 'ys-ecommerce/v1/ecpay/return' ),
@@ -584,7 +585,7 @@ final class EcpayPaymentClient {
 		$base = 'YS CART Order ' . (string) ( $order->order_number ?? $order->id ?? '' );
 		$base = wp_strip_all_tags( $base );
 		$base = preg_replace( '/[\x00-\x1F\x7F]/u', '', $base ) ?: $base;
-		$base = mb_substr( $base, 0, 190 );
+		$base = Utf8Text::truncate( $base, 190 );
 
 		return '' !== trim( $base ) ? $base : 'YS CART Order';
 	}
