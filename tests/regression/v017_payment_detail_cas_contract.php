@@ -48,85 +48,9 @@ namespace {
         return '2026-08-11 00:00:00';
     }
 
-    final class FakeWpdb
-    {
-        public string $prefix = 'wp_';
-        public string $last_error = '';
+    require_once __DIR__ . '/fixtures/payment_detail_wpdb_adapter.php';
 
-        /** @var list<string> */
-        public array $queries = [];
-        /** 目前欄位值；null ＝ SQL NULL；false ＝ 查無此列。 */
-        public string|null|false $value = null;
-        public string $read_error = '';
-        public string $write_error = '';
-        /** UPDATE 要回傳的固定值（null ＝ 依實際 CAS 判定）。 */
-        public mixed $force_update_result = null;
-        /** 每次讀取後、寫入前，模擬其他 writer 改動欄位。 */
-        public mixed $concurrent_writer = null;
-        public int $reads = 0;
-        public int $updates = 0;
-
-        public function prepare(string $sql, ...$args): string
-        {
-            foreach ($args as $a) {
-                $rep = is_int($a) ? (string) $a : "'" . str_replace("'", "''", (string) $a) . "'";
-                $sql = preg_replace('/%[ds]/', $rep, $sql, 1) ?? $sql;
-            }
-            return $sql;
-        }
-
-        public function get_row(string $sql)
-        {
-            ++$this->reads;
-            if ('' !== $this->read_error) {
-                $this->last_error = $this->read_error;
-                return null;
-            }
-            if (false === $this->value) {
-                return null; // 查無此列
-            }
-            $row = (object) ['payment_detail' => $this->value];
-            if (null !== $this->concurrent_writer) {
-                ($this->concurrent_writer)($this);
-            }
-            return $row;
-        }
-
-        public function query(string $sql)
-        {
-            ++$this->updates;
-            $this->queries[] = $sql;
-
-            if ('' !== $this->write_error) {
-                $this->last_error = $this->write_error;
-                return false;
-            }
-            if (null !== $this->force_update_result) {
-                return $this->force_update_result;
-            }
-
-            // 真實 CAS 判定：WHERE 條件必須與目前值相符。
-            if (str_contains($sql, 'payment_detail IS NULL')) {
-                if (null !== $this->value) {
-                    return 0;
-                }
-            } else {
-                if (!preg_match("/AND payment_detail = '(.*)'\$/s", $sql, $m)) {
-                    return 0;
-                }
-                if (str_replace("''", "'", $m[1]) !== (string) $this->value) {
-                    return 0;
-                }
-            }
-
-            if (!preg_match("/SET payment_detail = '(.*?)', updated_at = /s", $sql, $set)) {
-                return 0;
-            }
-            $this->value = str_replace("''", "'", $set[1]);
-
-            return 1;
-        }
-    }
+    final class FakeWpdb extends PaymentDetailWpdbAdapter {}
 }
 
 namespace YangSheep\Ecommerce\Models {
@@ -205,6 +129,16 @@ namespace {
         return $wpdb;
     };
 
+    $core_main = (string) file_get_contents($core_root . '/ys-cart.php');
+    preg_match("/define\(\s*'YS_ECOMMERCE_VERSION',\s*'([^']+)'/", $core_main, $version_match);
+    $core_version = (string) ($version_match[1] ?? '0.0.0');
+    $expected_predicate = version_compare($core_version, '2.58.0', '>=')
+        ? 'canonical_text'
+        : 'legacy';
+    $expected_sql_fragment = 'canonical_text' === $expected_predicate
+        ? 'CAST( payment_detail AS CHAR ) = \'{"a":1}\''
+        : 'payment_detail = \'{"a":1}\'';
+
     // (0) 反自欺：受測的是核心 production 檔
     $rc = new \ReflectionClass(Store::class);
     $assert(
@@ -222,8 +156,10 @@ namespace {
         R::UPDATED === $r->get_outcome()
         && '{"a":1,"b":2}' === $w->value
         && 1 === $w->updates
-        && str_contains($w->queries[0], 'AND payment_detail = \'{"a":1}\''),
-        '(a) 正常寫入 → updated，WHERE 以舊 raw 為條件'
+        && '{"a":1}' === $w->last_payment_detail_preimage
+        && $expected_predicate === $w->last_payment_detail_predicate
+        && str_contains($w->queries[0], $expected_sql_fragment),
+        '(a) 正常寫入 → updated，WHERE 以該 Core 版本的 exact raw JSON 述詞為條件'
     );
 
     // (b) 併發落敗 → 重讀重算後成功，對方欄位保留

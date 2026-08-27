@@ -52,62 +52,9 @@ namespace {
         return $text;
     }
 
-    final class FakeWpdb
-    {
-        public string $prefix = 'wp_';
-        public string $last_error = '';
-        public string|null|false $value = null;
-        /** 寫入前的攔截器：可模擬併發改寫或注入寫入錯誤。 */
-        public mixed $before_write = null;
-        public string $write_error = '';
-        public int $updates = 0;
+    require_once __DIR__ . '/fixtures/payment_detail_wpdb_adapter.php';
 
-        public function prepare(string $sql, ...$args): string
-        {
-            foreach ($args as $a) {
-                $rep = is_int($a) ? (string) $a : "'" . str_replace("'", "''", (string) $a) . "'";
-                $sql = preg_replace('/%[ds]/', $rep, $sql, 1) ?? $sql;
-            }
-            return $sql;
-        }
-
-        public function get_row(string $sql)
-        {
-            if (false === $this->value) {
-                return null;
-            }
-            return (object) ['payment_detail' => $this->value];
-        }
-
-        public function query(string $sql)
-        {
-            ++$this->updates;
-            if (null !== $this->before_write) {
-                ($this->before_write)($this, $sql);
-            }
-            if ('' !== $this->write_error) {
-                $this->last_error = $this->write_error;
-                return false;
-            }
-            if (str_contains($sql, 'payment_detail IS NULL')) {
-                if (null !== $this->value) {
-                    return 0;
-                }
-            } else {
-                if (!preg_match("/AND payment_detail = '(.*)'\$/s", $sql, $m)) {
-                    return 0;
-                }
-                if (str_replace("''", "'", $m[1]) !== (string) $this->value) {
-                    return 0;
-                }
-            }
-            if (!preg_match("/SET payment_detail = '(.*?)', updated_at = /s", $sql, $set)) {
-                return 0;
-            }
-            $this->value = str_replace("''", "'", $set[1]);
-            return 1;
-        }
-    }
+    final class FakeWpdb extends PaymentDetailWpdbAdapter {}
 }
 
 namespace YangSheep\Ecommerce\Gateways {
