@@ -5,9 +5,13 @@
 ### Fixed
 
 - headless `GET /ecpay/store-result` 現在從 query string 讀取 one-time code 與 cart
-  scope；先前誤用只解析 JSON／form body 的共用 parser，合法提領一律回 400。該端點同時
-  只收 query string 裡的純量值：`?code[]=…` 不再被轉成字面值 `Array` 拿去比對，
-  `?cart_scope[]=…` 也不再捏造出 `array` 這個 scope 而綁到另一個 principal。
+  scope；先前誤用只解析 JSON／form body 的共用 parser，合法提領一律回 400。
+- headless `GET /ecpay/store-result` 的參數**形狀**現在在解析身分之前就被檢查：`code` 或
+  `cart_scope` 有提供但非純量、或 `code` 清理後為空，一律直接回 400，不解析 principal、
+  不動一次性提領碼。先前只是把非純量「丟掉」再照常提領——而 `?code=<有效提領碼>&cart_scope[]=…`
+  會讓 scope 靜默降成 `default`，對登入者與 headless 訪客而言 principal 仍然相符，於是那張
+  **有效**的提領碼被畸形請求消耗掉並回 200，顧客只能重選門市。被拒絕的回應沿用提領層既有
+  訊息，並維持 `Cache-Control: no-store, private`。
 - 在沒有可選 PHP `mbstring` extension 的 WordPress 主機上，不再因付款、物流或退款
   字串長度限制而 fatal；共用 UTF-8 fallback 仍以完整 code point 截斷。
 - 付款通知的 `SimulatePaid=1` 現在只回覆 `1|OK`，不再寫入真實交易身分或推進
@@ -53,8 +57,10 @@
   同時釘住 `/Express/Create` 用一般 decoder、`/Helper/QueryLogisticsTradeInfo` 用
   verified decoder，任一條被換成另一個 decoder 就會變紅；同時保留 transport-error、
   numeric-prefix、identity 與必填欄位的既有 fail-closed oracle。
-- `v029` 增補 headless store-result 的非純量 query 契約：無 PHP warning、HTTP 400、
-  不以捏造的識別碼或 scope 觸發提領。
+- `v029` 增補 headless store-result 的參數形狀契約，並改為量測 **principal／claim 的呼叫
+  次數**而不是引數值——只斷言引數的話，「被呼叫但引數是空字串」與「根本沒被呼叫」完全同形。
+  涵蓋 array code、array scope、兩者皆 array、缺 code、空 code、whitespace-only code、
+  `null`（釘住 `array_key_exists` 而非 `isset`）與 `code='0'`（釘住 `'' ===` 而非 `empty()`）。
 
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 

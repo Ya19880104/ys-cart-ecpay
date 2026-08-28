@@ -687,6 +687,14 @@ final class Plugin {
 			]
 		);
 
+		// 🔴 這條路由**不得**替 `code` / `cart_scope` 宣告 `args` 的 `sanitize_callback`。
+		//
+		// WP 在 dispatch 前會把 sanitize 後的值寫回 `$request->params[...]`，而
+		// `sanitize_text_field()` 對陣列輸入回空字串——於是 `?cart_scope[]=x` 會以
+		// 純量 `''` 抵達 handler，`ecpay_store_result()` 的形狀閘門永遠不會觸發，
+		// 請求靜默降成 default 並提領。看起來是「加強驗證」的改動會直接把
+		// v029 釘住的那個缺陷放回來，而測試的 request stub 沒有 args pipeline，
+		// 不會變紅。
 		register_rest_route(
 			$namespace,
 			'/ecpay/store-result',
@@ -819,16 +827,44 @@ final class Plugin {
 		// This is a GET endpoint. Core's shared storefront parser intentionally reads
 		// JSON/form bodies only, so using it here silently discarded both `code` and
 		// `cart_scope` from the documented query string and made every claim fail.
+		$query = $request->get_query_params();
+
+		// 🔴 形狀要在**身分之前**驗完，而且是直接驗 raw query bag。
 		//
-		// 🔴 讀 query bag 就等於直接收下呼叫端送的**形狀**。`?code[]=…` 會走到
-		// `(string)` 轉型：PHP 8 發 warning，而且把識別碼捏造成字面值 `Array`；
-		// `?cart_scope[]=…` 更糟——捏造出 `array` 這個合法 scope，於是綁到**另一個**
-		// principal。非純量一律丟掉，與已簽章的 callback controller 同一條紀律。
-		$params     = self::scalar_query_params( $request );
-		$scope      = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
-		$principal  = EcpayStoreSelector::current_principal( $scope );
-		$code       = sanitize_text_field( (string) ( $params['code'] ?? '' ) );
-		$claimed    = EcpayStoreSelector::claim_result_code( $code, $principal );
+		// 「把非純量丟掉、然後照常解析 principal 並提領」不是 fail-closed：
+		//
+		//     code=<有效的一次性提領碼>&cart_scope[]=…
+		//
+		// 丟掉畸形的 scope 之後，它會靜默降成 `default`，於是我們拿
+		// `principal:default` 去碰一張**有效**的提領碼——只要那張碼本來就是在
+		// default scope 下發的，這個畸形請求就會把它消耗掉，而顧客那一邊得重選門市。
+		//
+		// 非純量不是「奇怪的值」，是**另一種型別**：呼叫端送錯形狀，就不該由我們
+		// 猜一個 scope 替它把提領碼用掉。提供了就必須是純量，否則直接 400。
+		// 🔴 必須用 `array_key_exists()` 而不是 `isset()`：`is_scalar( null )` 是 false，
+		// 但 `isset()` 對 null 也是 false——用 isset 的話 `cart_scope => null` 會整個
+		// 跳過這道閘，再被 `(string) null` 變成 ''、降成 default，然後照樣提領。
+		// 契約由 v029 的 null case 釘住。
+		foreach ( [ 'code', 'cart_scope' ] as $field ) {
+			if ( array_key_exists( $field, $query ) && ! is_scalar( $query[ $field ] ) ) {
+				return self::store_result_rejected();
+			}
+		}
+
+		// 缺提領碼同樣不必解析身分——沒有東西可以提領。
+		//
+		// 判準是 `'' === $code` 而**不是** `empty( $code )`：`sanitize_text_field( '0' )`
+		// 回 `'0'`，而 `empty( '0' )` 為 true。用 empty 會把 `?code=0` 這個**有送值**的
+		// 請求歸到「沒送提領碼」，兩種實作對同一個輸入給出不同結果。契約由 v029 的
+		// `code => '0'` case 釘住。
+		$code = sanitize_text_field( (string) ( $query['code'] ?? '' ) );
+		if ( '' === $code ) {
+			return self::store_result_rejected();
+		}
+
+		$scope     = self::sanitize_cart_scope( (string) ( $query['cart_scope'] ?? 'default' ) );
+		$principal = EcpayStoreSelector::current_principal( $scope );
+		$claimed   = EcpayStoreSelector::claim_result_code( $code, $principal );
 
 		if ( null !== $claimed['error'] ) {
 			$response = YSRestResponder::error( 'store_result_invalid', (string) $claimed['error'], 400 );
@@ -840,23 +876,20 @@ final class Plugin {
 	}
 
 	/**
-	 * 只收 query string 裡的純量值。
+	 * 形狀不合格的提領請求：400，且**沒有**解析過身分、沒有碰過提領碼。
 	 *
-	 * 非純量（`?code[]=…`）不是「奇怪的值」，是**另一種型別**——把它轉成字串會
-	 * 得到一個捏造的識別碼，而那個識別碼會被當成真的拿去比對。丟掉才是正解。
+	 * 🔴 訊息刻意重用 `claim_result_code()` 既有的那一句，不另外寫新字串。
+	 * 這個端點在 permission 之前就會回應，新增一種只有「形狀錯」才看得到的訊息
+	 * 等於免費送給呼叫端一個新的判別位元；沿用同一句話，前置拒絕與提領層拒絕
+	 * 在外部看起來完全一樣。
 	 *
-	 * @return array<string,string>
+	 * 仍然帶 `no-store, private`——被拒絕的回應同樣不該被任何中介快取。
 	 */
-	private static function scalar_query_params( \WP_REST_Request $request ): array {
-		$out = [];
-		foreach ( $request->get_query_params() as $key => $value ) {
-			if ( ! is_scalar( $value ) ) {
-				continue;
-			}
-			$out[ (string) $key ] = (string) $value;
-		}
+	private static function store_result_rejected(): \WP_REST_Response {
+		$response = YSRestResponder::error( 'store_result_invalid', '缺少提領碼或無法辨識身分。', 400 );
+		$response->header( 'Cache-Control', 'no-store, private' );
 
-		return $out;
+		return $response;
 	}
 
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {
