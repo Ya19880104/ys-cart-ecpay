@@ -116,22 +116,28 @@ The same rule applies to all three public boundaries:
 | `POST /stores/ecpay/reauthorize` | `400` `invalid_saved_store_request` — no principal, no saved-store token |
 
 **Only the two high-level helpers validate before sending** — they share one
-validator, so the mistake surfaces in development rather than mid-checkout. The
-legacy raw helpers post their payload as-is for ABI compatibility; the server
-rejects non-canonical values from them identically (fail-closed either way):
+validator, so the mistake surfaces in development rather than mid-checkout.
 
-| SDK helper | `cart_scope` validated client-side? | What the destination does with a non-canonical scope |
+The legacy raw helpers post their payload as-is for ABI compatibility, and none
+of them enforces a destination by itself: what the server does with a
+non-canonical scope is decided entirely by the actual destination the caller
+chose. `requestMapForm()` is a plain-POST alias that
+accepts whatever URL the caller supplies —
+only if the caller points it at one of the three ECPay public boundaries does
+that destination answer with the exact canonical `400`:
+
+| SDK helper | `cart_scope` validated client-side? | What happens server-side with a non-canonical scope |
 |---|---|---|
 | `requestStoreMapForm()` | **Yes** — rejects before any network call | (never sent) |
 | `claimStoreResult()` | **Yes** — same shared validator | (never sent) |
-| `requestMapForm()` (legacy raw POST) | No — payload sent as-is | Hits the ECPay map-url boundary → exact `400`, fail-closed |
+| `requestMapForm()` (legacy raw POST) | No — plain-POST alias, payload sent as-is to any caller-supplied URL | Whatever that URL's endpoint decides; an ECPay public boundary answers exact `400`, anything else follows its own rules |
 | `checkout()` | No — not scope-aware | Posts to Core `/checkout/process`, which **normalises a non-canonical scope to `default`** instead of rejecting; call `isCanonicalCartScope()` first if you need strictness |
 | `submitForm()` | No — not scope-aware | Posts to whatever `actionUrl` the caller supplies; follows the destination's rules entirely |
 | `isCanonicalCartScope()` / `cartScopePattern` | The published rule itself, for your own UI gating | — |
 
 The exact-400 fail-closed promise is a property of the **three ECPay public
-boundaries** (map-url, store-result, reauthorize), not of every endpoint an SDK
-helper can reach.
+boundaries** (map-url, store-result, reauthorize), not of any SDK helper and
+not of every endpoint a helper can reach.
 
 ```js
 YsCartEcpay.isCanonicalCartScope('headless_1'); // true

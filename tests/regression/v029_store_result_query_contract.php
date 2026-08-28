@@ -282,10 +282,10 @@ namespace {
     // 邊只好重選門市。三種形狀分開測，避免像先前那樣兩個參數同時給 array，把
     // 「scalar code + array scope」這條路徑整個遮蔽掉。
     //
-    // 🔴 本檔釘住的性質**僅限**：「`code`／`cart_scope` 為非純量，或 `code` sanitize
-    // 後為空」時不解析身分、不提領。它**不是**通用的 no-claim——任何非空純量的
-    // code 仍會走到 claim_result_code()，只是被那裡的 `/^[A-Za-z0-9]{32}$/` 早退擋在
-    // transient I/O 之前。不要把這裡的綠燈讀成「所有畸形輸入都不會碰提領碼」。
+    // 🔴 本檔釘住的性質：`code` 必須**原樣**符合鑄造格式 exact `^[A-Za-z0-9]{32}$`、
+    // `cart_scope` 必須 canonical——任一不符，就在 principal 解析、rate-limit 計量與
+    // claim **之前**被 generic 400 拒絕（Round 3 起）。「任何非空純量 code 都會走到
+    // claim」是修正前的舊行為，已由下方的不可鑄造形狀 cases 反轉並釘死。
     $assert_rejected_without_touching_identity(
         $run(['code' => [$code], 'cart_scope' => 'headless_1']),
         'array code with a valid scalar scope'

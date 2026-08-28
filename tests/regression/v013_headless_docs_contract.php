@@ -99,19 +99,46 @@ $check(
 
 // ── 🔴 Truth-lock：server 端「exact canonical 400」只屬於 ECPay 的三條 boundary ──
 //
-// `requestMapForm`（raw POST 到 ECPay map-url）命中 ECPay boundary，non-canonical
-// 確實是 exact 400。但 `checkout()` 送的是 **Core** `/checkout/process`——Core 的
-// `YSCheckoutController::read_cart_scope()` 對非 canonical 值做 `sanitize_key` 後
-// **降成 default**，不是 400；`submitForm()` 更是送到呼叫端給的任意 actionUrl。
-// 把這三個 helper 一起寫成「server rejects identically」就是把不存在的防線寫成
-// 存在——這句舊措辭永久禁止回歸。
+// 沒有任何 raw helper 能**自行**保證 destination enforcement：`requestMapForm` 只是
+// `postJson` 的 alias（sdk 匯出表 `requestMapForm: postJson`），接受呼叫端給的**任意
+// URL**、原樣送出——只有當呼叫端確實把 URL 指向某條 ECPay public boundary 時，那個
+// **destination** 才提供 exact canonical 400。`checkout()` 送 **Core** `/checkout/process`
+// ——Core 的 `YSCheckoutController::read_cart_scope()` 對非 canonical 值 `sanitize_key`
+// 後**降成 default**，不是 400；`submitForm()` 送呼叫端給的任意 actionUrl。
+//
+// 上一輪的 truth-lock 只鎖了 README，docs 的同一句 broad promise 存活、還把
+// requestMapForm 寫成「命中 ECPay boundary」的無條件句——本段把**兩份文件**的
+// 全稱句型與無條件 destination 句型一起永久禁止。
+$broad_banned = static function (string $text): bool {
+    return ! str_contains($text, 'rejects non-canonical values from them')
+        && ! str_contains($text, 'identically')
+        && ! str_contains($text, 'Hits the ECPay map-url boundary');
+};
+
 $check(
     'README does not claim identical server-side rejection for non-ECPay destinations',
-    ! str_contains($readme, 'the server rejects non-canonical values from them')
-        && ! str_contains($readme, 'identically')
+    $broad_banned($readme)
         && str_contains($readme, 'requestMapForm')
         && str_contains($readme, 'not scope-aware')
         && str_contains($readme, 'normalises')
+);
+
+$check(
+    'Docs carry no broad identical-rejection or unconditional-destination promise',
+    $broad_banned($docs)
+);
+
+$check(
+    'Docs state that raw-helper server behaviour is decided entirely by the actual destination',
+    str_contains($docs, 'accepts whatever URL the caller supplies')
+        && str_contains($docs, 'decided entirely by the actual destination')
+        && str_contains($docs, 'only if the caller points it at')
+);
+
+$check(
+    'README makes the requestMapForm promise conditional on the caller-chosen destination',
+    str_contains($readme, 'when the caller points it at')
+        && ! str_contains($readme, 'hits the ECPay map-url boundary, so')
 );
 
 $check(
@@ -165,7 +192,10 @@ ok('non-string rejected', api.isCanonicalCartScope(0) === false && api.isCanonic
 
 // 兩條路徑都必須在**發出任何請求之前**就 reject。fetch 被換成會爆的樁：
 // 只要 validator 沒擋住，這裡就會冒出 'NETWORK' 而不是 cart_scope 錯誤。
-g.fetch = () => { throw new Error('NETWORK'); };
+// 樁必須放在 globalThis——SDK 的 postJson 呼叫 bare `fetch`，在 Node 下解析到
+// globalThis 的原生實作，window 樁攔不到。
+globalThis.fetch = () => { throw new Error('NETWORK'); };
+g.fetch = globalThis.fetch;
 const bad = { cart_scope: 'HEADLESS_1' };
 const code = 'AbCdEf0123456789AbCdEf0123456789';
 
@@ -178,6 +208,26 @@ Promise.allSettled([
     ok(name + ' rejects a non-canonical scope before any network call',
       s.status === 'rejected' && /already be canonical/.test(String(s.reason && s.reason.message)));
   });
+
+  // 文件的 truth 基準：requestMapForm 只是 postJson 的 alias——不驗 scope、不鎖
+  // destination。對一個**任意非 ECPay** URL 帶非 canonical scope 呼叫它，必須
+  // 「原樣送出」：fetch 被呼叫、URL 正是呼叫端給的、payload 裡的 HEADLESS_1
+  // 一個 byte 都沒被改。這實證「沒有任何 raw helper 自行保證 destination
+  // enforcement」，也就是文件那句 conditional wording 的依據。
+  // SDK 的 postJson 呼叫的是 bare `fetch`，在 Node 下解析到 globalThis.fetch
+  //（原生實作），不是我們的 window 樁——必須覆蓋 globalThis 才攔得到。
+  const sent = [];
+  globalThis.fetch = (url, init) => {
+    sent.push({ url: String(url), body: String(init && init.body) });
+    return Promise.resolve({ json: () => Promise.resolve({}) });
+  };
+  return api.requestMapForm('https://arbitrary.example/not-ecpay', { cart_scope: 'HEADLESS_1' }).then(() => {
+    ok('requestMapForm posts as-is to whatever URL the caller supplies',
+      sent.length === 1
+        && sent[0].url === 'https://arbitrary.example/not-ecpay'
+        && sent[0].body.indexOf('"cart_scope":"HEADLESS_1"') !== -1);
+  });
+}).then(() => {
   console.log(results.join('\n'));
   process.exit(results.some((r) => r.startsWith('FAIL')) ? 1 : 0);
 });

@@ -109,9 +109,11 @@ is consumed. The two high-level SDK helpers — `requestStoreMapForm()` and
 validator, published as `YsCartEcpay.isCanonicalCartScope()`.
 
 The remaining helpers post their payload as-is for ABI compatibility, and the
-exact-400 promise above only covers the three ECPay public boundaries. The raw
-`requestMapForm()` hits the ECPay map-url boundary, so a non-canonical scope
-from it still fails closed with 400. `checkout()` and `submitForm()` are
+exact-400 promise above only covers the three ECPay public boundaries — no raw
+helper enforces a destination by itself. `requestMapForm()` is a plain-POST
+alias that accepts any caller-supplied URL; when the caller points it at the
+ECPay map-url boundary, that destination fails closed with 400, and any other
+destination follows its own rules. `checkout()` and `submitForm()` are
 not scope-aware and follow their destination's own rules instead: `checkout()`
 posts to the Core `/checkout/process` endpoint, whose parser normalises a
 non-canonical `cart_scope` to `default` rather than rejecting it, and
