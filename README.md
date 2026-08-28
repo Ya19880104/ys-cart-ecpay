@@ -106,10 +106,18 @@ server never normalises or downgrades it, so `HEADLESS_1`, `my-scope`, `''`,
 any principal is resolved, any map session is opened, or any one-time result code
 is consumed. The two high-level SDK helpers — `requestStoreMapForm()` and
 `claimStoreResult()` — enforce the same rule before sending and share one
-validator, published as `YsCartEcpay.isCanonicalCartScope()`. The legacy raw
-helpers (`requestMapForm`, `checkout`, `submitForm`) post their payload as-is
-for ABI compatibility; the server rejects non-canonical values from them
-identically. See `docs/headless.md` for the full helper table.
+validator, published as `YsCartEcpay.isCanonicalCartScope()`.
+
+The remaining helpers post their payload as-is for ABI compatibility, and the
+exact-400 promise above only covers the three ECPay public boundaries. The raw
+`requestMapForm()` hits the ECPay map-url boundary, so a non-canonical scope
+from it still fails closed with 400. `checkout()` and `submitForm()` are
+not scope-aware and follow their destination's own rules instead: `checkout()`
+posts to the Core `/checkout/process` endpoint, whose parser normalises a
+non-canonical `cart_scope` to `default` rather than rejecting it, and
+`submitForm()` posts wherever the caller points it. A caller that needs the
+strict behaviour on those paths must call `isCanonicalCartScope()` first. See
+`docs/headless.md` for the full helper table.
 
 ## Release
 

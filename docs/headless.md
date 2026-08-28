@@ -120,13 +120,18 @@ validator, so the mistake surfaces in development rather than mid-checkout. The
 legacy raw helpers post their payload as-is for ABI compatibility; the server
 rejects non-canonical values from them identically (fail-closed either way):
 
-| SDK helper | `cart_scope` validated client-side? |
-|---|---|
-| `requestStoreMapForm()` | **Yes** — rejects before any network call |
-| `claimStoreResult()` | **Yes** — same shared validator |
-| `requestMapForm()` (legacy raw POST) | No — payload sent as-is; server still returns `400` |
-| `checkout()` / `submitForm()` | No — not scope-aware; server-side gates apply |
-| `isCanonicalCartScope()` / `cartScopePattern` | The published rule itself, for your own UI gating |
+| SDK helper | `cart_scope` validated client-side? | What the destination does with a non-canonical scope |
+|---|---|---|
+| `requestStoreMapForm()` | **Yes** — rejects before any network call | (never sent) |
+| `claimStoreResult()` | **Yes** — same shared validator | (never sent) |
+| `requestMapForm()` (legacy raw POST) | No — payload sent as-is | Hits the ECPay map-url boundary → exact `400`, fail-closed |
+| `checkout()` | No — not scope-aware | Posts to Core `/checkout/process`, which **normalises a non-canonical scope to `default`** instead of rejecting; call `isCanonicalCartScope()` first if you need strictness |
+| `submitForm()` | No — not scope-aware | Posts to whatever `actionUrl` the caller supplies; follows the destination's rules entirely |
+| `isCanonicalCartScope()` / `cartScopePattern` | The published rule itself, for your own UI gating | — |
+
+The exact-400 fail-closed promise is a property of the **three ECPay public
+boundaries** (map-url, store-result, reauthorize), not of every endpoint an SDK
+helper can reach.
 
 ```js
 YsCartEcpay.isCanonicalCartScope('headless_1'); // true
@@ -146,9 +151,12 @@ claim. Requests that pass the shape gates but carry no identifiable principal
 rate-limit quota.
 
 Requests with a valid code, scope **and** principal are then throttled through
-the core rate limiter using two buckets, mirroring `map-url`: a per-actor bucket
-derived from the principal hash (`ecpay_store_result_actor_*`, 12/60) plus the
-shared IP bucket (`ecpay_store_result_ip`, 60/60). Ordering is contractual:
+the core rate limiter using two buckets, mirroring `map-url`. The core limiter
+appends the client IP to every action key, so the first bucket
+(`ecpay_store_result_actor_*`, 12/60) is scoped **per (principal, IP) pair** —
+it is a fine-grained limit, not a cross-IP cap on one actor. The second bucket
+(`ecpay_store_result_ip`, 60/60) is per-IP and carries the overall cap for that
+address. Ordering is contractual:
 shape → principal → metering → claim. A malformed or unidentifiable request
 never spends quota; a throttled response is `429` `rate_limited`, performs **no
 claim**, and still carries `Cache-Control: no-store, private`. If the core rate

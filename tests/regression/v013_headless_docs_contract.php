@@ -97,6 +97,31 @@ $check(
         && ! str_contains($readme, 'The SDK enforces the same rule')
 );
 
+// ── 🔴 Truth-lock：server 端「exact canonical 400」只屬於 ECPay 的三條 boundary ──
+//
+// `requestMapForm`（raw POST 到 ECPay map-url）命中 ECPay boundary，non-canonical
+// 確實是 exact 400。但 `checkout()` 送的是 **Core** `/checkout/process`——Core 的
+// `YSCheckoutController::read_cart_scope()` 對非 canonical 值做 `sanitize_key` 後
+// **降成 default**，不是 400；`submitForm()` 更是送到呼叫端給的任意 actionUrl。
+// 把這三個 helper 一起寫成「server rejects identically」就是把不存在的防線寫成
+// 存在——這句舊措辭永久禁止回歸。
+$check(
+    'README does not claim identical server-side rejection for non-ECPay destinations',
+    ! str_contains($readme, 'the server rejects non-canonical values from them')
+        && ! str_contains($readme, 'identically')
+        && str_contains($readme, 'requestMapForm')
+        && str_contains($readme, 'not scope-aware')
+        && str_contains($readme, 'normalises')
+);
+
+$check(
+    'Docs scope the exact-400 promise to the ECPay boundary and describe checkout/submitForm truthfully',
+    ! str_contains($docs, 'not scope-aware; server-side gates apply')
+        && str_contains($docs, 'follows the destination')
+        && str_contains($docs, 'normalises a non-canonical scope to `default`')
+        && str_contains($docs, 'call `isCanonicalCartScope()` first')
+);
+
 $check(
     'Docs publish the store-result ordering contract (shape → principal → metering → claim)',
     str_contains($docs, 'shape → principal → metering → claim')

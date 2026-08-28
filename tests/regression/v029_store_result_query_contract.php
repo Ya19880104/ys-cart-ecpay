@@ -367,9 +367,25 @@ namespace {
         is_array($route) && ! array_key_exists('args', $route),
         'store-result declares no args pipeline that could reshape code/cart_scope before the handler'
     );
+    // 🔴 `is_callable` 不是 custody：`'__return_true'`（無條件放行）與
+    // `[YSRestAuth::class,'permission_logged_in_write']`（把公開提領端點鎖成登入限定）
+    // 都 is_callable——前者拆掉 auth 邊界、後者讓 headless 訪客整條 claim 流程死掉，
+    // 而舊斷言對兩者都綠。permission 與 handler 都必須**逐項精確**。
+    $pc = is_array($route) ? ($route['permission_callback'] ?? null) : null;
     $assert(
-        is_array($route) && isset($route['permission_callback']) && is_callable($route['permission_callback'], true),
-        'store-result keeps a permission callback'
+        is_array($pc)
+            && 2 === count($pc)
+            && \YangSheep\Ecommerce\Api\Storefront\YSRestAuth::class === ($pc[0] ?? null)
+            && 'permission_customer_or_guest' === ($pc[1] ?? null),
+        'store-result permission callback is exactly [YSRestAuth::class, permission_customer_or_guest]'
+    );
+    $cb = is_array($route) ? ($route['callback'] ?? null) : null;
+    $assert(
+        is_array($cb)
+            && 2 === count($cb)
+            && ($cb[0] ?? null) instanceof \YangSheep\YSCartEcpay\Plugin
+            && 'ecpay_store_result' === ($cb[1] ?? null),
+        'store-result handler callback points exactly at Plugin::ecpay_store_result'
     );
     $assert(
         is_array($route)

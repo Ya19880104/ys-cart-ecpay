@@ -72,9 +72,12 @@
   的請求（匿名且無 guest token）同樣拿 generic 400 且**不計量**——Core 的 `get_client_ip()`
   在 CDN／反向代理後全站共用一個 IP bucket，替辨識不出的呼叫端計量等於讓匿名垃圾流量
   阻塞正常 claim。
-- 上述節流複用 Core 既有的 `YSRateLimiter`，改為 **actor ＋ IP 雙 bucket**、與姊妹端點
-  `ecpay_map_url()` 同構：actor bucket 由 principal 的 SHA-256 導出（12/60，key 不受攻擊者
-  控制）、共享 IP bucket 保留（`ecpay_store_result_ip`，60/60）；**不另建**任何平行儲存。
+- 上述節流複用 Core 既有的 `YSRateLimiter`，改為雙 bucket、與姊妹端點 `ecpay_map_url()`
+  同構。第一個 bucket 的 action 名稱由 principal 的 SHA-256 導出（12/60）——外部輸入
+  **不能直接注入** action 名稱（恆為固定前綴＋hash 導出後綴）；而 Core 的 `check()` 會再把
+  client IP 拼進儲存 key，因此它實際是 **per-(principal, IP)** 的細粒度上限，不是跨 IP 的
+  單一 actor cap，且訪客可藉輪換 guest token 換得新 bucket。**該 IP 的整體 cap 由保留的
+  per-IP bucket 承擔**（`ecpay_store_result_ip`，60/60）；**不另建**任何平行儲存。
   429 之後**不提領**。限流器不可用時 fail-safe 為放行，並由 v031 在一個真的沒有該類別的
   子程序中證明。
 - headless 文件與 README 的 SDK 驗證宣稱**縮限至實際範圍**：只有 `requestStoreMapForm()`
