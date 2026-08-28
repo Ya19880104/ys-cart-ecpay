@@ -71,7 +71,18 @@ final class EcpayShippingRequester {
 			];
 		}
 
-		$result = $this->http->post_verified( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
+		// 🔴 建單走**一般** form decoder，不是 VerifiedEncodedStr。
+		//
+		// 官方 SDK 對 `/Express/Create` 用的是 `PostWithCmvStrResponseService`
+		// （`example/Logistics/Domestic/CreateCvs.php`、`CreateHome.php`），
+		// literal `+` 保留規則只適用於 `PostWithCmvVerifiedEncodedStrResponseService`
+		// 的 `/Helper/QueryLogisticsTradeInfo`（見 query_status()）。
+		//
+		// 兩者共用同一個 decoder 的後果不是「解出來不好看」：建單回應帶空白的欄位
+		// （`UpdateStatusDate` 等）會被解成 literal `+`，CheckMacValue 於是驗不過，
+		// 綠界那邊已經成立的單在本站永遠停在 indeterminate。契約見
+		// tests/regression/v030_logistics_response_decoder_routing.php。
+		$result = $this->http->post( Settings::logistics_endpoint( '/Express/Create', $method_id ), $fields );
 		if ( ! $result['success'] ) {
 			// 🔴 傳輸層說不出「對方有沒有收到」，因此一律往上傳 indeterminate。
 			// 缺 outcome 時也當 indeterminate——缺欄位不是「明確失敗」。

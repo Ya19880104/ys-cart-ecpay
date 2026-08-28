@@ -240,10 +240,15 @@ final class EcpayPaymentClient {
 	/**
 	 * 信用卡交易關帳狀態查詢（CreditDetail/QueryTrade/V2）— query-first 退款分流用
 	 *
-	 * @deferred-live-verification：欄位名（CreditRefundId=gwsr 授權單號）、回應
-	 * JSON 結構（RtnValue.status：已授權／要關帳／已關帳…）依綠界文件實作，
-	 * 確切契約須以受控正式商店實測鎖定（gate G-Q）。未知/未映射狀態一律回
-	 * `unknown`——caller 必須拒絕操作（fail-closed）。
+	 * 回應 schema 依綠界官方現行文件（https://developers.ecpay.com.tw/2894/）：
+	 * 成功時 `RtnMsg` 為空值，`RtnValue` 內含 `TradeID`、`amount`、`clsamt`、
+	 * `authtime`、`status` 與 `close_data[]`（`status`／`sno`／`amount`／`datetime`）。
+	 * 下方的 identity gate 就是照這份 schema 做 fail-closed 綁定。
+	 *
+	 * @deferred-live-verification：**真實的關帳狀態流轉與重試行為**（哪一種交易
+	 * 會落在已授權／要關帳／已關帳／操作取消，以及分期／紅利／銀聯的例外）仍須
+	 * 以受控正式商店實測鎖定（gate G-Q）；綠界測試環境無等價服務。未知/未映射
+	 * 狀態一律回 `unknown`——caller 必須拒絕操作（fail-closed）。
 	 *
 	 * @param string $gwsr   綠界授權單號（QueryTradeInfo 回應的 gwsr）
 	 * @param int    $amount 交易金額（元）
@@ -384,8 +389,14 @@ final class EcpayPaymentClient {
 	 * 綠界端可能已生效——caller 必須維持 pending、禁止盲重送；只有 RtnCode 明確
 	 * 非 1 才是 provider 明確拒絕（可重試）。
 	 *
-	 * @deferred-live-verification：payload 與回應依綠界文件實作；stage 環境
-	 * DoAction 官方明載不可用，驗證一律走受控正式商店（docs/credit-refund-sandbox-gate.md）。
+	 * 回應 schema 依綠界官方現行文件（https://developers.ecpay.com.tw/2885/）：
+	 * URL-encoded key=value，欄位為 `MerchantID`、`MerchantTradeNo`、`TradeNo`、
+	 * `RtnCode`、`RtnMsg`。因此這裡用一般 form decoder（官方 SDK 亦為
+	 * `PostWithCmvEncodedStrResponseService`），並以那三個欄位做 identity 綁定。
+	 *
+	 * @deferred-live-verification：**真實的 action 結果、狀態流轉與重試行為**
+	 * （R／N／E 各自在真交易上的回應碼與後續狀態）仍未驗證——stage 環境官方明載
+	 * DoAction 不可用，驗證一律走受控正式商店（docs/credit-refund-sandbox-gate.md）。
 	 *
 	 * @param string $merchant_trade_no 商店訂單編號（建單時的 MerchantTradeNo）
 	 * @param string $trade_no          綠界交易編號（付款回調存的 TradeNo）

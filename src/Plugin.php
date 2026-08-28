@@ -819,7 +819,12 @@ final class Plugin {
 		// This is a GET endpoint. Core's shared storefront parser intentionally reads
 		// JSON/form bodies only, so using it here silently discarded both `code` and
 		// `cart_scope` from the documented query string and made every claim fail.
-		$params     = $request->get_query_params();
+		//
+		// 🔴 讀 query bag 就等於直接收下呼叫端送的**形狀**。`?code[]=…` 會走到
+		// `(string)` 轉型：PHP 8 發 warning，而且把識別碼捏造成字面值 `Array`；
+		// `?cart_scope[]=…` 更糟——捏造出 `array` 這個合法 scope，於是綁到**另一個**
+		// principal。非純量一律丟掉，與已簽章的 callback controller 同一條紀律。
+		$params     = self::scalar_query_params( $request );
 		$scope      = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
 		$principal  = EcpayStoreSelector::current_principal( $scope );
 		$code       = sanitize_text_field( (string) ( $params['code'] ?? '' ) );
@@ -832,6 +837,26 @@ final class Plugin {
 		}
 		$response->header( 'Cache-Control', 'no-store, private' );
 		return $response;
+	}
+
+	/**
+	 * 只收 query string 裡的純量值。
+	 *
+	 * 非純量（`?code[]=…`）不是「奇怪的值」，是**另一種型別**——把它轉成字串會
+	 * 得到一個捏造的識別碼，而那個識別碼會被當成真的拿去比對。丟掉才是正解。
+	 *
+	 * @return array<string,string>
+	 */
+	private static function scalar_query_params( \WP_REST_Request $request ): array {
+		$out = [];
+		foreach ( $request->get_query_params() as $key => $value ) {
+			if ( ! is_scalar( $value ) ) {
+				continue;
+			}
+			$out[ (string) $key ] = (string) $value;
+		}
+
+		return $out;
 	}
 
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {

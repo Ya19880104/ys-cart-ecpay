@@ -89,6 +89,14 @@ namespace {
      * ECPay's verified encoded response service preserves literal plus signs
      * before decoding. RFC3986 keeps spaces distinct as %20 in this fixture.
      *
+     * 這個 helper 模擬的是 **VerifiedEncodedStr 的線上形狀**：literal `+` 原樣、
+     * 空白以 %20 表示。它刻意只服務官方指定 verified decoder 的端點
+     * （QueryTradeInfo / QueryPaymentInfo / QueryLogisticsTradeInfo）。
+     *
+     * 🔴 「哪一條路由該用哪一個 decoder」不在本檔涵蓋範圍，也不能用這個 fixture
+     * 推論——那是 v030_logistics_response_decoder_routing.php 的契約，它以互斥的
+     * 一對線上形狀同時釘住 Create=plain 與 Query=verified。
+     *
      * @param array<string,string> $fields
      */
     $encoded = static function (array $fields): string {

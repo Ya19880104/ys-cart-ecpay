@@ -18,6 +18,16 @@ final class HttpFormClient {
 	 * Send a request whose response uses ECPay's VerifiedEncodedStrResponse
 	 * decoder. That decoder preserves literal plus signs before CMV verification.
 	 *
+	 * 官方 SDK 的原文就是 `parse_str( str_replace( '+', '%2B', $response ), $parsed )`
+	 * （`Ecpay\Sdk\Response\VerifiedEncodedStrResponse::toArray()`），這裡與它逐字一致。
+	 *
+	 * 🔴 **只有官方指定 `PostWithCmvVerifiedEncodedStrResponseService` 的端點可以用它**：
+	 *   - AIO `/Cashier/QueryTradeInfo/V5`、`/Cashier/QueryPaymentInfo`
+	 *   - 國內物流 `/Helper/QueryLogisticsTradeInfo`
+	 * 建單（`/Express/Create`）與 `DoAction` 官方用的是一般 decoder，套錯會讓
+	 * CheckMacValue 驗不過。路由契約見
+	 * tests/regression/v030_logistics_response_decoder_routing.php。
+	 *
 	 * @param array<string,mixed> $fields
 	 * @return array{success:bool,outcome:string,body:string,params:array<string,string>,message:string}
 	 */

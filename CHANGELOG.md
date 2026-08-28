@@ -5,19 +5,31 @@
 ### Fixed
 
 - headless `GET /ecpay/store-result` 現在從 query string 讀取 one-time code 與 cart
-  scope；先前誤用只解析 JSON／form body 的共用 parser，合法提領一律回 400。
+  scope；先前誤用只解析 JSON／form body 的共用 parser，合法提領一律回 400。該端點同時
+  只收 query string 裡的純量值：`?code[]=…` 不再被轉成字面值 `Array` 拿去比對，
+  `?cart_scope[]=…` 也不再捏造出 `array` 這個 scope 而綁到另一個 principal。
 - 在沒有可選 PHP `mbstring` extension 的 WordPress 主機上，不再因付款、物流或退款
   字串長度限制而 fatal；共用 UTF-8 fallback 仍以完整 code point 截斷。
 - 付款通知的 `SimulatePaid=1` 現在只回覆 `1|OK`，不再寫入真實交易身分或推進
   paid lifecycle。
-- signed URL-encoded 回應依綠界官方 PHP SDK 使用
-  `VerifiedEncodedStrResponse` 的 literal `+` 保留規則；未簽章的 `DoAction` 回應仍依
-  一般 form decoder 將 `+` 解成空白，避免混用兩種協定語意。
+- 回應解碼改為**逐端點**對齊綠界官方 PHP SDK，不再依「有沒有簽章」一刀切：官方指定
+  `PostWithCmvVerifiedEncodedStrResponseService` 的端點（AIO `QueryTradeInfo`、國內物流
+  `QueryLogisticsTradeInfo`）使用 `VerifiedEncodedStrResponse` 的 literal `+` 保留規則；
+  官方指定一般 decoder 的端點（`CreditDetail/DoAction`、國內物流 `/Express/Create`）
+  維持將 `+` 解成空白。
+- 國內物流建單 `/Express/Create` 的回應解碼回到官方的一般 form decoder。先前一併套用
+  literal `+` 保留規則，會讓回應中帶空白的簽署欄位（如 `UpdateStatusDate`）解成
+  `2026/08/28+12:00:00`，CheckMacValue 因此驗不過——綠界端其實已經成立物流單，本站卻
+  一律判定 `indeterminate`，超商／宅配建單等同全面停擺且不會自動重試。
 - CheckMacValue 輸入與 REST callback 改為保留官方實際簽署的 decoded scalar bytes：
   不再 trim，也不再對 WordPress 已 unslash 的 body params 二次 unslash；欄位只在驗章
   成功後、寫入或顯示前才清理。
 - `CreditDetail/QueryTrade/V2` 與 `DoAction` 回應改為 fail-closed 綁定請求交易身分與
-  金額；缺失或錯筆回應維持 indeterminate，不允許盲重送不可逆退款。
+  金額；缺失或錯筆回應維持 indeterminate，不允許盲重送不可逆退款。綁定的欄位依綠界
+  官方現行文件（QueryTrade/V2：成功時 `RtnMsg` 為空、`RtnValue.TradeID`／`amount`／
+  `close_data`；DoAction：URL-encoded 的 `MerchantID`／`MerchantTradeNo`／`TradeNo`／
+  `RtnCode`／`RtnMsg`）。真實退款 action 的結果、狀態流轉與重試行為仍為
+  live-deferred——綠界測試環境不提供 DoAction，且自動退款預設關閉。
 - 物流 callback 改用 typed replay reservation 與 stable event id；所有 provider
   projections 與 replay commit 完成後才發布 shipping pipeline hook，寫入失敗時零 hook。
   已完成 replay 保留四天，涵蓋綠界官方三天重送窗口並多留一天緩衝。
@@ -37,6 +49,12 @@
   電子地圖 multi-query return URL 的可執行 regression，並補強 raw signed REST bytes 與
   Core 2.58 capability gate oracle；另以停用所有 php.ini extensions 的子程序驗證
   `mbstring` fallback，並覆蓋 headless store-result 的 query-only ownership claim。
+- 新增 requester 邊界的物流回應 decoder 路由契約（`v030`）：以**互斥**的一對線上形狀
+  同時釘住 `/Express/Create` 用一般 decoder、`/Helper/QueryLogisticsTradeInfo` 用
+  verified decoder，任一條被換成另一個 decoder 就會變紅；同時保留 transport-error、
+  numeric-prefix、identity 與必填欄位的既有 fail-closed oracle。
+- `v029` 增補 headless store-result 的非純量 query 契約：無 PHP warning、HTTP 400、
+  不以捏造的識別碼或 scope 觸發提領。
 
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 
