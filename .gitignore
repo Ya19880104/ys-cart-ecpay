@@ -20,5 +20,7 @@
 /vendor/**/tests/
 /vendor/**/composer.json
 /vendor/**/composer.lock
-/tests
-/tests/
+# Regression owners and fixtures are release evidence and must be tracked.
+# Keep only generated test output ignored through an explicit subpath.
+/tests/.out/
+!/tests/regression/v033_h0_custody_owner_contract.php

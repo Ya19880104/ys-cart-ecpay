@@ -1,0 +1,361 @@
+{
+  "schema": "ys-h0-path-owner/v1",
+  "sot_id": "ys-cart-h0-runtime-custody-v1",
+  "canonicalization": {
+    "path_separator": "/",
+    "encoding": "strict-utf-8-no-bom",
+    "text_eol": "lf",
+    "case_sensitive": true,
+    "self_hash_form": "recursively-key-sorted-minified-json-utf8-lf-with-manifest_sha256-empty"
+  },
+  "repositories": {
+    "core": {
+      "main": "ys-cart.php",
+      "outer_loader": [
+        "ys-cart.php"
+      ],
+      "local_owner": "tests/regression/v25940_h0_custody_owner_contract.php"
+    },
+    "ecpay": {
+      "main": "ys-cart-ecpay.php",
+      "outer_loader": [
+        "ys-cart-ecpay.php",
+        "vendor/autoload.php"
+      ],
+      "local_owner": "tests/regression/v033_h0_custody_owner_contract.php"
+    },
+    "shipping": {
+      "main": "ys-cart-shipping-date.php",
+      "outer_loader": [
+        "ys-cart-shipping-date.php",
+        "vendor/autoload.php",
+        "src/Activator.php",
+        "src/Plugin.php"
+      ],
+      "local_owner": "tests/regression/v100_h0_custody_owner_contract.php"
+    }
+  },
+  "frozen_inputs": {
+    "package_2_0_5": {
+      "logical_root": "fixture:package-2.0.5",
+      "file_count": 23,
+      "external_manifest_file_sha256": "35df9c9f7177a961b0a0de411f411f5561cd314759a45f09ec55f29fbf187148"
+    },
+    "shipping_reviewed_d703ca97": {
+      "logical_root": "fixture:shipping-d703ca97-hub-profile",
+      "file_count": 18,
+      "external_manifest_file_sha256": "a9cbde0f206d3e1459df1543c8db911f0fd7223f2df3508c2a77d261dff7c5a7"
+    },
+    "php_7_4": {
+      "version": "7.4.33",
+      "executable_sha256": "4b06073dd8230421ba701a677dd8b1aa23ed55706663d3fdf996702b557f83b2"
+    }
+  },
+  "gates": {
+    "F_LOCAL_CUSTODY": {
+      "phase": "focused",
+      "owners": {
+        "core": "tests/regression/v25940_h0_custody_owner_contract.php",
+        "ecpay": "tests/regression/v033_h0_custody_owner_contract.php",
+        "shipping": "tests/regression/v100_h0_custody_owner_contract.php"
+      }
+    },
+    "F_PROFILE_IDENTITY": {
+      "phase": "focused",
+      "owner": "core:tests/regression/v25941_h0_profile_inventory_red.php"
+    },
+    "F_LOAD_ORDER": {
+      "phase": "focused",
+      "owner": "core:tests/regression/v25942_h0_load_order_red.php"
+    },
+    "F_SCHEMA_FENCE": {
+      "phase": "focused",
+      "owner": "core:tests/regression/v25943_h0_schema_fence_contract.php"
+    },
+    "Z_PACKAGE_PARITY": {
+      "phase": "final"
+    },
+    "Z_RELEASE_IDENTITY": {
+      "phase": "final"
+    },
+    "Z_CROSS_H0": {
+      "phase": "final"
+    },
+    "Z_WHOLE_REVIEW": {
+      "phase": "final"
+    }
+  },
+  "path_sets": {
+    "shared_runtime": {
+      "core": [
+        {
+          "kind": "prefix",
+          "value": "vendor/yangsheep/ys-plugin-hub-client/"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "prefix",
+          "value": "vendor/yangsheep/ys-plugin-hub-client/"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "prefix",
+          "value": "vendor/yangsheep/ys-plugin-hub-client/"
+        }
+      ]
+    },
+    "outer_bootstrap": {
+      "core": [
+        {
+          "kind": "exact",
+          "value": "ys-cart.php"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "exact",
+          "value": "ys-cart-ecpay.php"
+        },
+        {
+          "kind": "exact",
+          "value": "vendor/autoload.php"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "exact",
+          "value": "ys-cart-shipping-date.php"
+        },
+        {
+          "kind": "exact",
+          "value": "vendor/autoload.php"
+        },
+        {
+          "kind": "exact",
+          "value": "src/Activator.php"
+        },
+        {
+          "kind": "exact",
+          "value": "src/Plugin.php"
+        }
+      ]
+    },
+    "builder_policy": {
+      "core": [
+        {
+          "kind": "exact",
+          "value": "bin/build-release.php"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "exact",
+          "value": "bin/build-release.php"
+        },
+        {
+          "kind": "exact",
+          "value": "bin/release-policy.php"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "exact",
+          "value": "bin/build-release.php"
+        },
+        {
+          "kind": "exact",
+          "value": "bin/release-manifest.php"
+        }
+      ]
+    },
+    "h0_evidence": {
+      "core": [
+        {
+          "kind": "prefix",
+          "value": "tests/fixtures/h0/"
+        },
+        {
+          "kind": "prefix",
+          "value": "tests/regression/v2594"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "prefix",
+          "value": "tests/fixtures/h0/"
+        },
+        {
+          "kind": "prefix",
+          "value": "tests/regression/v033_h0_"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "prefix",
+          "value": "tests/fixtures/h0/"
+        },
+        {
+          "kind": "prefix",
+          "value": "tests/regression/v100_h0_"
+        },
+        {
+          "kind": "exact",
+          "value": "tests/suite_manifest.php"
+        },
+        {
+          "kind": "exact",
+          "value": "tests/regression/v100_runner_completeness_contract.php"
+        }
+      ]
+    },
+    "line_ending_policy": {
+      "core": [
+        {
+          "kind": "exact",
+          "value": ".gitattributes"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "exact",
+          "value": ".gitattributes"
+        },
+        {
+          "kind": "exact",
+          "value": ".gitignore"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "exact",
+          "value": ".gitattributes"
+        }
+      ]
+    },
+    "version_identity": {
+      "core": [
+        {
+          "kind": "exact",
+          "value": "ys-cart.php"
+        }
+      ],
+      "ecpay": [
+        {
+          "kind": "exact",
+          "value": "ys-cart-ecpay.php"
+        }
+      ],
+      "shipping": [
+        {
+          "kind": "exact",
+          "value": "ys-cart-shipping-date.php"
+        }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "shared-runtime-custody",
+      "path_set": "shared_runtime",
+      "required_focused": [
+        "F_LOCAL_CUSTODY",
+        "F_PROFILE_IDENTITY",
+        "F_LOAD_ORDER",
+        "F_SCHEMA_FENCE"
+      ],
+      "required_final": [
+        "Z_PACKAGE_PARITY",
+        "Z_CROSS_H0",
+        "Z_WHOLE_REVIEW"
+      ]
+    },
+    {
+      "id": "outer-bootstrap-custody",
+      "path_set": "outer_bootstrap",
+      "required_focused": [
+        "F_LOCAL_CUSTODY",
+        "F_LOAD_ORDER"
+      ],
+      "required_final": [
+        "Z_RELEASE_IDENTITY",
+        "Z_CROSS_H0",
+        "Z_WHOLE_REVIEW"
+      ]
+    },
+    {
+      "id": "builder-policy-custody",
+      "path_set": "builder_policy",
+      "required_focused": [
+        "F_LOCAL_CUSTODY"
+      ],
+      "required_final": [
+        "Z_PACKAGE_PARITY",
+        "Z_RELEASE_IDENTITY",
+        "Z_WHOLE_REVIEW"
+      ]
+    },
+    {
+      "id": "h0-evidence-custody",
+      "path_set": "h0_evidence",
+      "required_focused": [
+        "F_LOCAL_CUSTODY"
+      ],
+      "required_final": [
+        "Z_CROSS_H0",
+        "Z_WHOLE_REVIEW"
+      ]
+    },
+    {
+      "id": "line-ending-policy-custody",
+      "path_set": "line_ending_policy",
+      "required_focused": [
+        "F_LOCAL_CUSTODY"
+      ],
+      "required_final": [
+        "Z_PACKAGE_PARITY",
+        "Z_CROSS_H0"
+      ]
+    },
+    {
+      "id": "version-identity-custody",
+      "path_set": "version_identity",
+      "required_focused": [
+        "F_LOCAL_CUSTODY",
+        "F_PROFILE_IDENTITY",
+        "F_LOAD_ORDER"
+      ],
+      "required_final": [
+        "Z_RELEASE_IDENTITY",
+        "Z_PACKAGE_PARITY",
+        "Z_CROSS_H0",
+        "Z_WHOLE_REVIEW"
+      ]
+    }
+  ],
+  "automatic_escalations": [
+    {
+      "id": "version-or-identity-change",
+      "required_focused": [
+        "F_LOCAL_CUSTODY",
+        "F_PROFILE_IDENTITY",
+        "F_LOAD_ORDER"
+      ],
+      "required_final": [
+        "Z_RELEASE_IDENTITY",
+        "Z_PACKAGE_PARITY",
+        "Z_CROSS_H0",
+        "Z_WHOLE_REVIEW"
+      ]
+    }
+  ],
+  "correction_policy": {
+    "same_blocker_max_unsuccessful_rounds": 3,
+    "after_limit": "freeze-reproduction-and-transfer-to-claude-or-fable5"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "manifest_sha256": "d80fe6fa6194fb1ecee1c4c53fbf26cd7020fdfc55514d55732022e3675a7e16"
+  }
+}
