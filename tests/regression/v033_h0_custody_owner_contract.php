@@ -446,6 +446,53 @@ ys_h0_check(
     'every on-disk regression PHP owner is tracked',
     implode( ',', $untracked_tests )
 );
+$tracked_fixtures = ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/fixtures/h0' ) );
+$tracked_fixture_set = array();
+foreach ( explode( "\0", $tracked_fixtures['out'] ) as $path ) {
+    if ( '' !== $path ) {
+        $tracked_fixture_set[ str_replace( '\\', '/', $path ) ] = true;
+    }
+}
+$disk_fixture_paths = array();
+$fixture_root = $repo . DIRECTORY_SEPARATOR . 'tests' . DIRECTORY_SEPARATOR . 'fixtures' . DIRECTORY_SEPARATOR . 'h0';
+if ( is_dir( $fixture_root ) ) {
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator( $fixture_root, FilesystemIterator::SKIP_DOTS )
+    );
+    foreach ( $iterator as $file ) {
+        if ( $file->isFile() ) {
+            $full = str_replace( '\\', '/', $file->getPathname() );
+            $base = rtrim( str_replace( '\\', '/', realpath( $repo ) ), '/' ) . '/';
+            $disk_fixture_paths[] = substr( $full, strlen( $base ) );
+        }
+    }
+}
+sort( $disk_fixture_paths, SORT_STRING );
+$fixture_problems = array();
+foreach ( $disk_fixture_paths as $path ) {
+    if ( ! isset( $tracked_fixture_set[ $path ] ) ) {
+        $fixture_problems[] = $path . ':untracked';
+        continue;
+    }
+    $ignored = ys_h0_command( $repo, array( 'check-ignore', '--no-index', '--', $path ) );
+    if ( 1 !== $ignored['code'] ) {
+        $fixture_problems[] = $path . ':ignored';
+        continue;
+    }
+    $authority = ys_h0_authority_bytes( $repo, $source, $path );
+    $absolute = $repo . DIRECTORY_SEPARATOR . str_replace( '/', DIRECTORY_SEPARATOR, $path );
+    $worktree = is_file( $absolute ) ? file_get_contents( $absolute ) : false;
+    if ( ! $authority['ok'] || ! is_string( $worktree ) ||
+        ! hash_equals( ys_h0_normalized_sha( $authority['bytes'] ), ys_h0_normalized_sha( $worktree ) ) ) {
+        $fixture_problems[] = $path . ':authority-drift';
+    }
+}
+ys_h0_check(
+    0 === $tracked_fixtures['code'] && array() === $fixture_problems,
+    'every H0 fixture is tracked, unignored, and equal to selected authority',
+    implode( ',', $fixture_problems )
+);
+
 
 if ( 'ecpay' === $alias ) {
     $ignore_blob = ys_h0_authority_bytes( $repo, $source, '.gitignore' );
