@@ -72,9 +72,15 @@
       "phase": "focused",
       "owner": "core:tests/cross-h0/v25942_h0_load_order_red.php"
     },
-    "F_SCHEMA_FENCE": {
+    "F_SCHEMA_CAPABILITY_CURRENT_RED": {
       "phase": "focused",
       "owner": "core:tests/cross-h0/v25943_h0_schema_fence_contract.php"
+    },
+    "F_SCHEMA_FENCE": {
+      "phase": "focused",
+      "state": "deferred",
+      "owner": "core:tests/cross-h0/v25947_h0_schema_fence_behavior_contract_red.php",
+      "prerequisite": "frozen-query-budget-and-live-db-fault-harness"
     },
     "Z_PACKAGE_PARITY": {
       "phase": "final"
@@ -275,6 +281,7 @@
         "F_LOCAL_CUSTODY",
         "F_PROFILE_IDENTITY",
         "F_LOAD_ORDER",
+        "F_SCHEMA_CAPABILITY_CURRENT_RED",
         "F_SCHEMA_FENCE"
       ],
       "required_final": [
@@ -368,6 +375,6 @@
   },
   "integrity": {
     "algorithm": "sha256",
-    "manifest_sha256": "5e6489a8da592e0a99508c150c9d91dde94e7e98be68b9228aeffa329433d386"
+    "manifest_sha256": "122f4d97b45d44d03cbc3761480874ed6629942973d5dbd183834688a5e022a3"
   }
 }
