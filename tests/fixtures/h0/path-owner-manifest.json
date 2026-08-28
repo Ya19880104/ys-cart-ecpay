@@ -46,9 +46,13 @@
       "file_count": 18,
       "external_manifest_file_sha256": "a9cbde0f206d3e1459df1543c8db911f0fd7223f2df3508c2a77d261dff7c5a7"
     },
-    "php_7_4": {
-      "version": "7.4.33",
-      "executable_sha256": "4b06073dd8230421ba701a677dd8b1aa23ed55706663d3fdf996702b557f83b2"
+    "php_8_1": {
+      "version": "8.1.31",
+      "executable_sha256": "bc475b6b92fd785e079356e83f3cb040d0e5d9d2a66b0f09906347fd6dbd457e"
+    },
+    "php_8_2": {
+      "version": "8.2.30",
+      "executable_sha256": "be439ac9d985347121142e2a077f0f1cd0d1e40f80edaaa76fc4e0f8414c42cd"
     }
   },
   "gates": {
@@ -62,15 +66,15 @@
     },
     "F_PROFILE_IDENTITY": {
       "phase": "focused",
-      "owner": "core:tests/regression/v25941_h0_profile_inventory_red.php"
+      "owner": "core:tests/cross-h0/v25941_h0_profile_inventory_red.php"
     },
     "F_LOAD_ORDER": {
       "phase": "focused",
-      "owner": "core:tests/regression/v25942_h0_load_order_red.php"
+      "owner": "core:tests/cross-h0/v25942_h0_load_order_red.php"
     },
     "F_SCHEMA_FENCE": {
       "phase": "focused",
-      "owner": "core:tests/regression/v25943_h0_schema_fence_contract.php"
+      "owner": "core:tests/cross-h0/v25943_h0_schema_fence_contract.php"
     },
     "Z_PACKAGE_PARITY": {
       "phase": "final"
@@ -177,8 +181,16 @@
           "value": "tests/fixtures/h0/"
         },
         {
+          "kind": "exact",
+          "value": "tests/regression/v25940_h0_custody_owner_contract.php"
+        },
+        {
+          "kind": "exact",
+          "value": "tests/regression/v25944_h0_cross_runner_completeness.php"
+        },
+        {
           "kind": "prefix",
-          "value": "tests/regression/v2594"
+          "value": "tests/cross-h0/"
         }
       ],
       "ecpay": [
@@ -356,6 +368,6 @@
   },
   "integrity": {
     "algorithm": "sha256",
-    "manifest_sha256": "d80fe6fa6194fb1ecee1c4c53fbf26cd7020fdfc55514d55732022e3675a7e16"
+    "manifest_sha256": "5e6489a8da592e0a99508c150c9d91dde94e7e98be68b9228aeffa329433d386"
   }
 }

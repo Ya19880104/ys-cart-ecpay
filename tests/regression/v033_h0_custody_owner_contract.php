@@ -3,12 +3,12 @@
  * YS CART Update 11 H0 source-custody owner.
  *
  * This file is intentionally byte-identical in Core, ECPay, and Shipping Date.
- * The caller supplies the repository alias, root, source authority, and this
- * copy's repository-relative owner path.
+ * A dedicated cross runner supplies exact arguments. A repository's ordinary
+ * zero-argument regression runner may use the safe local HEAD defaults below.
  */
 
-if ( PHP_VERSION_ID < 70400 ) {
-    fwrite( STDERR, "PHP 7.4 or newer is required.\n" );
+if ( PHP_VERSION_ID < 80100 ) {
+    fwrite( STDERR, "PHP 8.1 or newer is required.\n" );
     exit( 2 );
 }
 
@@ -28,6 +28,21 @@ $alias      = isset( $options['alias'] ) ? (string) $options['alias'] : '';
 $source     = isset( $options['source'] ) ? (string) $options['source'] : '';
 $owner_path = isset( $options['owner-path'] ) ? (string) $options['owner-path'] : '';
 $cross_path = isset( $options['cross'] ) ? (string) $options['cross'] : '';
+
+if ( array() === $options ) {
+    $repo   = dirname( __DIR__, 2 );
+    $source = 'head';
+    if ( is_file( $repo . '/ys-cart.php' ) ) {
+        $alias      = 'core';
+        $owner_path = 'tests/regression/v25940_h0_custody_owner_contract.php';
+    } elseif ( is_file( $repo . '/ys-cart-ecpay.php' ) ) {
+        $alias      = 'ecpay';
+        $owner_path = 'tests/regression/v033_h0_custody_owner_contract.php';
+    } elseif ( is_file( $repo . '/ys-cart-shipping-date.php' ) ) {
+        $alias      = 'shipping';
+        $owner_path = 'tests/regression/v100_h0_custody_owner_contract.php';
+    }
+}
 
 $failures = array();
 $passes   = 0;
@@ -424,10 +439,12 @@ ys_h0_check(
     'executing owner bytes equal selected authority owner blob'
 );
 
-$tracked_tests = ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/regression/*.php' ) );
+$tracked_tests = 'head' === $source
+    ? ys_h0_command( $repo, array( 'ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', 'tests/regression' ) )
+    : ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/regression/*.php' ) );
 $tracked_test_set = array();
 foreach ( explode( "\0", $tracked_tests['out'] ) as $path ) {
-    if ( '' !== $path ) {
+    if ( '' !== $path && '.php' === substr( $path, -4 ) ) {
         $tracked_test_set[ str_replace( '\\', '/', $path ) ] = true;
     }
 }
@@ -446,7 +463,36 @@ ys_h0_check(
     'every on-disk regression PHP owner is tracked',
     implode( ',', $untracked_tests )
 );
-$tracked_fixtures = ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/fixtures/h0' ) );
+$tracked_cross = 'head' === $source
+    ? ys_h0_command( $repo, array( 'ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', 'tests/cross-h0' ) )
+    : ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/cross-h0/*.php' ) );
+$tracked_cross_set = array();
+foreach ( explode( "\0", $tracked_cross['out'] ) as $path ) {
+    if ( '' !== $path && '.php' === substr( $path, -4 ) ) {
+        $tracked_cross_set[ str_replace( '\\', '/', $path ) ] = true;
+    }
+}
+$disk_cross_paths = array();
+$cross_root = $repo . DIRECTORY_SEPARATOR . 'tests' . DIRECTORY_SEPARATOR . 'cross-h0';
+if ( is_dir( $cross_root ) ) {
+    foreach ( glob( $cross_root . DIRECTORY_SEPARATOR . '*.php' ) as $path ) {
+        $disk_cross_paths[] = 'tests/cross-h0/' . basename( $path );
+    }
+}
+$untracked_cross = array();
+foreach ( $disk_cross_paths as $path ) {
+    if ( ! isset( $tracked_cross_set[ $path ] ) ) {
+        $untracked_cross[] = $path;
+    }
+}
+ys_h0_check(
+    0 === $tracked_cross['code'] && array() === $untracked_cross,
+    'every on-disk cross-H0 PHP owner is tracked',
+    implode( ',', $untracked_cross )
+);
+$tracked_fixtures = 'head' === $source
+    ? ys_h0_command( $repo, array( 'ls-tree', '-r', '-z', '--name-only', 'HEAD', '--', 'tests/fixtures/h0' ) )
+    : ys_h0_command( $repo, array( 'ls-files', '-z', '--', 'tests/fixtures/h0' ) );
 $tracked_fixture_set = array();
 foreach ( explode( "\0", $tracked_fixtures['out'] ) as $path ) {
     if ( '' !== $path ) {
