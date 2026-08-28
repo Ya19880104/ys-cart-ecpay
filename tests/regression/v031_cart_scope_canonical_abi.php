@@ -125,6 +125,8 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
         public static int $map_calls = 0;
         public static int $token_calls = 0;
         public static string $scope = 'NOT-CALLED';
+        /** true＝模擬「解析過了、但辨識不出任何 principal」（匿名且無 guest token）。 */
+        public static bool $anonymous = false;
 
         public static function reset(): void {
             self::$principal_calls = 0;
@@ -141,7 +143,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
         public static function current_principal(string $scope): string {
             ++self::$principal_calls;
             self::$scope = $scope;
-            return 'u:7';
+            return self::$anonymous ? '' : 'u:7';
         }
 
         public static function claim_result_code(string $code, string $principal): array {
@@ -265,9 +267,10 @@ namespace {
     $assert(
         429 === $limited['response']->get_status()
             && 'rate_limited' === ($limited['response']->data['code'] ?? '')
+            && 1 === EcpayStoreSelector::$principal_calls
             && 0 === EcpayStoreSelector::$claim_calls
             && 'no-store, private' === ($limited['response']->headers['Cache-Control'] ?? ''),
-        'store-result throttles before it consumes a one-time claim'
+        'store-result throttles after principal resolution and before any claim'
     );
     YSRateLimiter::$allow = true;
 
@@ -278,10 +281,48 @@ namespace {
         'a malformed store-result request does not spend rate-limit quota'
     );
 
-    $well_formed = $store_result(['code' => $CODE, 'cart_scope' => 'headless_1']);
+    // 🔴 非空但不可能是鑄造出來的 code（不符 `^[A-Za-z0-9]{32}$`）同樣零身分、零計量、
+    // 零提領——舊實作讓它先花掉共享 IP 配額、再進 claim 層做一次必然失敗的 transient
+    // 讀取；反向代理下這種垃圾請求可以把全站共用的 bucket 燒光，阻塞正常 claim。
+    foreach (['zzz' => 'zzz', '31-char' => substr($CODE, 0, 31), 'punctuated' => substr($CODE, 0, 31) . '-'] as $label => $bad) {
+        $invalid_code = $store_result(['code' => $bad, 'cart_scope' => 'headless_1']);
+        $assert(
+            400 === $invalid_code['response']->get_status()
+                && 0 === EcpayStoreSelector::sensitive_calls()
+                && [] === YSRateLimiter::$calls
+                && [] === $invalid_code['warnings']
+                && 'no-store, private' === ($invalid_code['response']->headers['Cache-Control'] ?? ''),
+            "store-result rejects an unmintable nonempty code ({$label}) with zero principal, zero metering, zero claim"
+        );
+    }
+
+    // 🔴 principal 解析不出來（匿名且無 guest token）＝generic 400，**且不計量**。
+    // 計量在 principal 之後才有意義：辨識不出的呼叫端沒有 actor bucket 可言，而替它
+    // 記到共享 IP bucket 上，等於讓匿名垃圾流量替所有正常顧客把配額燒掉。
+    EcpayStoreSelector::$anonymous = true;
+    $no_principal = $store_result(['code' => $CODE, 'cart_scope' => 'headless_1']);
+    EcpayStoreSelector::$anonymous = false;
     $assert(
-        [] !== YSRateLimiter::$calls && 200 === $well_formed['response']->get_status(),
-        'a well-formed store-result request is metered through the Core rate limiter'
+        400 === $no_principal['response']->get_status()
+            && 1 === EcpayStoreSelector::$principal_calls
+            && 0 === EcpayStoreSelector::$claim_calls
+            && [] === YSRateLimiter::$calls
+            && [] === $no_principal['warnings']
+            && 'no-store, private' === ($no_principal['response']->headers['Cache-Control'] ?? ''),
+        'an unidentifiable principal is rejected with zero metering and zero claim'
+    );
+
+    // 🔴 計量的**形狀**也要釘住：actor bucket（由 principal 導出）先於共享 IP bucket，
+    // 各恰一次。actor key 只可能在 principal 之後存在，這個斷言因此同時證明
+    // 「limiter 在 principal 之後」與「IP bucket 仍在、沒被 actor bucket 取代」。
+    $well_formed = $store_result(['code' => $CODE, 'cart_scope' => 'headless_1']);
+    $expected_actor = 'ecpay_store_result_actor_' . substr(hash('sha256', 'u:7'), 0, 24);
+    $assert(
+        200 === $well_formed['response']->get_status()
+            && 2 === count(YSRateLimiter::$calls)
+            && 0 === strpos((string) YSRateLimiter::$calls[0], $expected_actor)
+            && 0 === strpos((string) YSRateLimiter::$calls[1], 'ecpay_store_result_ip'),
+        'a well-formed store-result request is metered through the actor bucket then the shared IP bucket'
     );
 
     // ─────────────────────────────────────────────────────────────────────────

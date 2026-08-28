@@ -115,8 +115,18 @@ The same rule applies to all three public boundaries:
 | `GET /ecpay/store-result` | `400` `store_result_invalid` — no principal, no claim; still `Cache-Control: no-store, private` |
 | `POST /stores/ecpay/reauthorize` | `400` `invalid_saved_store_request` — no principal, no saved-store token |
 
-The SDK enforces the identical rule **before** sending, so the mistake surfaces in
-development rather than mid-checkout. Both helpers share one validator:
+**Only the two high-level helpers validate before sending** — they share one
+validator, so the mistake surfaces in development rather than mid-checkout. The
+legacy raw helpers post their payload as-is for ABI compatibility; the server
+rejects non-canonical values from them identically (fail-closed either way):
+
+| SDK helper | `cart_scope` validated client-side? |
+|---|---|
+| `requestStoreMapForm()` | **Yes** — rejects before any network call |
+| `claimStoreResult()` | **Yes** — same shared validator |
+| `requestMapForm()` (legacy raw POST) | No — payload sent as-is; server still returns `400` |
+| `checkout()` / `submitForm()` | No — not scope-aware; server-side gates apply |
+| `isCanonicalCartScope()` / `cartScopePattern` | The published rule itself, for your own UI gating |
 
 ```js
 YsCartEcpay.isCanonicalCartScope('headless_1'); // true
@@ -128,13 +138,21 @@ await YsCartEcpay.claimStoreResult(apiBase, code, { cart_scope: 'my-scope' });
 // rejects with the same error
 ```
 
-`GET /ecpay/store-result` is additionally throttled through the core rate limiter
-(`ecpay_store_result_ip`, the same 60/60 budget as `ecpay_map_ip`). Throttling runs
-*after* the shape gate, so a malformed request never spends a legitimate shopper's
-quota, and *before* the claim, so a public GET cannot amplify transient reads. A
-throttled response is `429` `rate_limited` and still carries
-`Cache-Control: no-store, private`. If the core rate limiter is unavailable the
-endpoint fails safe and still serves the claim.
+`GET /ecpay/store-result` additionally requires the `code` to already match the
+minted format (`/^[A-Za-z0-9]{32}$/` — the exact shape the callback issues); any
+other value is a `400` with zero principal resolution, zero metering and zero
+claim. Requests that pass the shape gates but carry no identifiable principal
+(anonymous, no guest token) get the same generic `400` without spending any
+rate-limit quota.
+
+Requests with a valid code, scope **and** principal are then throttled through
+the core rate limiter using two buckets, mirroring `map-url`: a per-actor bucket
+derived from the principal hash (`ecpay_store_result_actor_*`, 12/60) plus the
+shared IP bucket (`ecpay_store_result_ip`, 60/60). Ordering is contractual:
+shape → principal → metering → claim. A malformed or unidentifiable request
+never spends quota; a throttled response is `429` `rate_limited`, performs **no
+claim**, and still carries `Cache-Control: no-store, private`. If the core rate
+limiter is unavailable the endpoint fails safe and still serves the claim.
 
 ## Store selection token (v0.2.12, required at checkout)
 

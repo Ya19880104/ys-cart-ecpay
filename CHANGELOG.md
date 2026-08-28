@@ -65,11 +65,22 @@
   （`/^[A-Za-z0-9]{24}$/`，即鑄造端 `wp_generate_password( 24, false, false )` 的形狀），
   再碰任何 transient 或送出任何 header。`?key[]=x` 不再觸發 array-to-string warning，也不再
   以捏造的識別碼做 transient 讀取與刪除；錯誤訊息維持既有那一句，不洩漏 transient 識別資訊。
-- 公開的 `GET /ecpay/store-result` 加上節流，複用 Core 既有的 `YSRateLimiter`
-  （`ecpay_store_result_ip`，與姊妹端點 `ecpay_map_ip` 同樣的 60/60），**不另建**任何平行儲存。
-  節流位在形狀閘門**之後**（畸形請求不消耗合法配額）、身分與提領**之前**（公開 GET 不放大
-  transient 讀取）。限流器不可用時 fail-safe 為放行，並由 v031 在一個真的沒有該類別的子程序
-  中證明。
+- 公開的 `GET /ecpay/store-result` 的守門順序成為契約：**形狀 → 身分 → 計量 → 提領**。
+  `code` 必須**原樣**符合鑄造格式 `/^[A-Za-z0-9]{32}$/`（callback 簽發的確切形狀）——任何
+  其他非空值先前仍會解析身分、花掉共享限流配額、再進提領層做一次必然失敗的 transient
+  讀取；現在一律在最前面以 generic 400 拒絕，零身分、零計量、零提領。解析不出 principal
+  的請求（匿名且無 guest token）同樣拿 generic 400 且**不計量**——Core 的 `get_client_ip()`
+  在 CDN／反向代理後全站共用一個 IP bucket，替辨識不出的呼叫端計量等於讓匿名垃圾流量
+  阻塞正常 claim。
+- 上述節流複用 Core 既有的 `YSRateLimiter`，改為 **actor ＋ IP 雙 bucket**、與姊妹端點
+  `ecpay_map_url()` 同構：actor bucket 由 principal 的 SHA-256 導出（12/60，key 不受攻擊者
+  控制）、共享 IP bucket 保留（`ecpay_store_result_ip`，60/60）；**不另建**任何平行儲存。
+  429 之後**不提領**。限流器不可用時 fail-safe 為放行，並由 v031 在一個真的沒有該類別的
+  子程序中證明。
+- headless 文件與 README 的 SDK 驗證宣稱**縮限至實際範圍**：只有 `requestStoreMapForm()`
+  與 `claimStoreResult()` 兩個高階 helper 在送出前驗證 `cart_scope`（共用同一個 validator）；
+  legacy raw helper（`requestMapForm` 等）為 ABI 相容原樣送出、由伺服器 fail-closed。
+  `docs/headless.md` 新增 SDK helper 驗證範圍表。
 - 最低核心版本提高為 **YS CART 2.58.0**，並 fail-closed 探測 order serialization、
   typed replay reservation／token／commit／release、五參數 shipping pipeline advance
   與 deferred hook capability；舊 gate transient namespace 同步升版，避免沿用先前的

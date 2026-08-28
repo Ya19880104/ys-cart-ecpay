@@ -72,6 +72,26 @@ namespace YangSheep\YSCartEcpay\Support {
     }
 }
 
+namespace YangSheep\Ecommerce\Security {
+    /**
+     * Mirrors Core `YSRateLimiter::check( string $action, int $max, int $window ): bool`.
+     *
+     * 🔴 計量順序是本檔的核心契約之一：限流 bucket 是**共享資源**（Core 的
+     * `get_client_ip()` 在 CDN 後全站共用一個 IP bucket），因此「誰有資格花配額」
+     * 必須被釘住——形狀不合格、或解析不出 principal 的請求，一次都不准計量。
+     */
+    final class YSRateLimiter {
+        /** @var list<string> */
+        public static array $calls = [];
+        public static bool $allow = true;
+
+        public static function check(string $action, int $max = 30, int $window = 60): bool {
+            self::$calls[] = $action . '|' . $max . '|' . $window;
+            return self::$allow;
+        }
+    }
+}
+
 namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
     /**
      * 🔴 這個 double 必須量 **呼叫次數**，不是只記最後一次的引數。
@@ -87,6 +107,8 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
         public static string $principal = '';
         public static int $current_principal_calls = 0;
         public static int $claim_calls = 0;
+        /** 設成非 null（例如 ''）可模擬「解析過身分但辨識不出任何 principal」。 */
+        public static ?string $forced_principal = null;
 
         public static function reset(): void {
             self::$scope = 'NOT-CALLED';
@@ -94,12 +116,13 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
             self::$principal = 'NOT-CALLED';
             self::$current_principal_calls = 0;
             self::$claim_calls = 0;
+            self::$forced_principal = null;
         }
 
         public static function current_principal(string $scope): string {
             ++self::$current_principal_calls;
             self::$scope = $scope;
-            return 'principal:' . $scope;
+            return null === self::$forced_principal ? 'principal:' . $scope : self::$forced_principal;
         }
 
         public static function claim_result_code(string $code, string $principal): array {
@@ -141,8 +164,12 @@ namespace {
      *
      * @param array<string,mixed> $query
      */
-    $run = static function (array $query) use ($selector): array {
+    $limiter = \YangSheep\Ecommerce\Security\YSRateLimiter::class;
+
+    $run = static function (array $query, ?string $forced_principal = null) use ($selector, $limiter): array {
         $selector::reset();
+        $selector::$forced_principal = $forced_principal;
+        $limiter::$calls = [];
         $warnings = [];
         set_error_handler(static function (int $errno, string $errstr) use (&$warnings): bool {
             $warnings[] = $errstr;
@@ -156,10 +183,11 @@ namespace {
             'warnings'        => $warnings,
             'principal_calls' => $selector::$current_principal_calls,
             'claim_calls'     => $selector::$claim_calls,
+            'rate_calls'      => $limiter::$calls,
         ];
     };
 
-    /** 每一個被拒絕的形狀都必須同時滿足這五件事。 */
+    /** 每一個被拒絕的形狀都必須同時滿足這六件事：形狀錯＝零身分、零計量、零提領。 */
     $assert_rejected_without_touching_identity = static function (array $result, string $case) use ($assert): void {
         $response = $result['response'];
         $assert([] === $result['warnings'], "{$case}: raises no PHP warning");
@@ -168,6 +196,7 @@ namespace {
             "{$case}: is rejected with HTTP 400"
         );
         $assert(0 === $result['principal_calls'], "{$case}: resolves no principal");
+        $assert([] === $result['rate_calls'], "{$case}: spends no rate-limit quota");
         $assert(0 === $result['claim_calls'], "{$case}: consumes no one-time claim");
         $assert(
             'no-store, private' === ($response->headers['Cache-Control'] ?? ''),
@@ -187,6 +216,55 @@ namespace {
     $assert(
         1 === $valid['principal_calls'] && 1 === $valid['claim_calls'],
         'a valid request resolves the principal once and claims once'
+    );
+
+    // ── 🔴 計量順序：principal 有效之後、claim 之前，actor ＋ IP 兩個 bucket 都要過 ──
+    //
+    // actor bucket 的 key 從 principal 的 SHA-256 導出（與 ecpay_map_url() 同一個
+    // 派生法），所以它只可能在 principal 解析**之後**存在——這個斷言同時釘住
+    // 「limiter 在 principal 之後」與「IP bucket 沒有被 actor bucket 取代」。
+    $expected_actor = 'ecpay_store_result_actor_' . substr(hash('sha256', 'principal:headless_1'), 0, 24) . '|12|60';
+    $assert(
+        [$expected_actor, 'ecpay_store_result_ip|60|60'] === $valid['rate_calls'],
+        'a valid request is metered through the actor bucket then the shared IP bucket, exactly once each'
+    );
+
+    // ── 🔴 429 之後**不得**提領：限流是 claim 的前置條件，不是事後記帳 ─────────────
+    $limiter::$allow = false;
+    $throttled = $run(['code' => $code, 'cart_scope' => 'headless_1']);
+    $limiter::$allow = true;
+    $assert(
+        429 === $throttled['response']->get_status()
+            && 'rate_limited' === ($throttled['response']->data['code'] ?? '')
+            && 1 === $throttled['principal_calls']
+            && 0 === $throttled['claim_calls']
+            && 'no-store, private' === ($throttled['response']->headers['Cache-Control'] ?? ''),
+        'a throttled request returns 429 after principal resolution and performs zero claims'
+    );
+
+    // ── 🔴 principal 解析不出來＝與既有安全邊界同一句 generic 400 ────────────────
+    //
+    // 解析「已經跑了」（principal_calls=1）但結果是空——此時 rate limiter 與 claim
+    // 都不得執行：計量一個辨識不出的呼叫端，等於讓匿名垃圾流量燒掉 CDN 後**全站
+    // 共用**的 IP bucket，反向代理下可阻塞正常 claim；而 claim 層對空 principal 的
+    // 拒絕又會多做一次 transient 讀取。
+    $anonymous = $run(['code' => $code, 'cart_scope' => 'headless_1'], '');
+    $assert(
+        400 === $anonymous['response']->get_status()
+            && 'store_result_invalid' === ($anonymous['response']->data['code'] ?? '')
+            && '缺少提領碼或無法辨識身分。' === ($anonymous['response']->data['message'] ?? ''),
+        'an unidentifiable principal gets the same generic 400 as every other early rejection'
+    );
+    $assert(
+        1 === $anonymous['principal_calls']
+            && [] === $anonymous['rate_calls']
+            && 0 === $anonymous['claim_calls'],
+        'an unidentifiable principal spends no rate-limit quota and consumes no claim'
+    );
+    $assert(
+        'no-store, private' === ($anonymous['response']->headers['Cache-Control'] ?? '')
+            && [] === $anonymous['warnings'],
+        'the unidentifiable-principal rejection stays private, non-cacheable and warning-free'
     );
 
     // ── 🔴 形狀必須在身分之前被拒 ───────────────────────────────────────────────
@@ -251,19 +329,26 @@ namespace {
         'null cart scope'
     );
 
-    // ── 「sanitize 後為空」是 `'' === $code`，不是 `empty($code)` ────────────────
+    // ── 🔴 code 必須先過**鑄造格式**（exact `^[A-Za-z0-9]{32}$`），不是只驗非空 ────
     //
-    // `sanitize_text_field('0')` 回 `'0'`，而 `empty('0')` 為 true。兩種寫法都能宣稱
-    // 符合「sanitize 後為空就 400」，但對 `?code=0` 給出的結果完全不同：嚴格比較會
-    // 把它當成**有送值**、照常解析身分並提領（最後由提領層拒絕），empty() 則會在
-    // 形狀層就擋掉且完全不呼叫。這裡釘住嚴格比較這一側。
-    $zero_code = $run(['code' => '0', 'cart_scope' => 'headless_1']);
-    $assert(
-        400 === $zero_code['response']->get_status()
-            && 1 === $zero_code['principal_calls']
-            && 1 === $zero_code['claim_calls'],
-        'a supplied code of "0" is treated as supplied, not as empty'
-    );
+    // 提領碼的鑄造端是 `generate_result_code()`：恆為 32 個 `[A-Za-z0-9]`。任何不符
+    // 這個格式的非空值——`'0'`、`'zzz'`、31 或 33 字元、帶標點——**永遠不可能**是一張
+    // 真的提領碼，卻在舊契約下照樣解析 principal、花共享限流配額、再進 claim 層做一次
+    // 必然失敗的 transient 讀取。舊的 v029 甚至把「`'0'` 走到 principal/claim」鎖成
+    // 綠色契約；本段把它反轉：不符鑄造格式＝形狀錯＝零身分、零計量、零提領。
+    foreach ([
+        'zero'                  => '0',
+        'short word'            => 'zzz',
+        '31 characters'         => substr($code, 0, 31),
+        '33 characters'         => $code . 'A',
+        'punctuated 32'         => substr($code, 0, 31) . '-',
+        'valid with trailing newline' => $code . "\n",
+    ] as $label => $bad_code) {
+        $assert_rejected_without_touching_identity(
+            $run(['code' => $bad_code, 'cart_scope' => 'headless_1']),
+            "a nonempty code that cannot be a minted code ({$label})"
+        );
+    }
 
     // ── 🔴 Route custody：捕捉 register_rest_route 的 exact config ────────────────
     //

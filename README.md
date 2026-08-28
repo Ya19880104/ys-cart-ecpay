@@ -104,8 +104,12 @@ sent, or be omitted entirely — only an omitted scope falls back to `default`. 
 server never normalises or downgrades it, so `HEADLESS_1`, `my-scope`, `''`,
 `null`, an array, or anything longer than 32 characters returns HTTP 400 before
 any principal is resolved, any map session is opened, or any one-time result code
-is consumed. The SDK enforces the same rule before sending and publishes it as
-`YsCartEcpay.isCanonicalCartScope()`. See `docs/headless.md`.
+is consumed. The two high-level SDK helpers — `requestStoreMapForm()` and
+`claimStoreResult()` — enforce the same rule before sending and share one
+validator, published as `YsCartEcpay.isCanonicalCartScope()`. The legacy raw
+helpers (`requestMapForm`, `checkout`, `submitForm`) post their payload as-is
+for ABI compatibility; the server rejects non-canonical values from them
+identically. See `docs/headless.md` for the full helper table.
 
 ## Release
 

@@ -44,6 +44,13 @@ final class Plugin {
 	 */
 	private const CART_SCOPE_ERROR = '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。';
 
+	/**
+	 * 一次性提領碼的**鑄造格式**——與 `EcpayStoreSelector::generate_result_code()`
+	 * 產出的形狀完全一致（32 個 `[A-Za-z0-9]`）。`D` 修飾詞讓 `$` 不吃尾端換行：
+	 * 沒有它，`…AbCdEf01\n` 也會通過，而鑄造端從不產生帶換行的碼。
+	 */
+	private const RESULT_CODE_PATTERN = '/^[A-Za-z0-9]{32}$/D';
+
 	private const REGISTERED_GATEWAY_IDS = [
 		'ys_ec_ecpay_credit',
 		'ys_ec_ecpay_atm',
@@ -868,12 +875,17 @@ final class Plugin {
 		// default scope 下發的，這個畸形請求就會把它消耗掉，而顧客那一邊得重選門市。
 		//
 		// 非純量不是「奇怪的值」，是**另一種型別**：呼叫端送錯形狀，就不該由我們
-		// 猜一個 scope 替它把提領碼用掉。提供了就必須是純量，否則直接 400。
-		// 🔴 必須用 `array_key_exists()` 而不是 `isset()`：`is_scalar( null )` 是 false，
-		// 但 `isset()` 對 null 也是 false——用 isset 的話 `cart_scope => null` 會整個
-		// 跳過這道閘，再被 `(string) null` 變成 ''、降成 default，然後照樣提領。
-		// 契約由 v029 的 null case 釘住。
-		if ( array_key_exists( 'code', $query ) && ! is_scalar( $query['code'] ) ) {
+		// 猜一個 scope 替它把提領碼用掉。
+		//
+		// 🔴 code 驗的是**鑄造格式**（exact `^[A-Za-z0-9]{32}$`，精確全字串），不是
+		// 「非空」。鑄造端是 `generate_result_code()`：恆為 32 個英數字。任何不符的
+		// 值——缺席、null、陣列、空白、`'0'`、`'zzz'`、31/33 字元、帶標點——**永遠不
+		// 可能**是一張真的提領碼；只驗非空的話，這類垃圾請求仍會解析身分、花掉共享
+		// 限流配額、再進提領層做一次必然失敗的 transient 讀取。直接對 raw string 驗，
+		// 不先 sanitize（sanitize 會把 `…%0A` trim 成合法長度，而鑄造端從不產生那種值）。
+		// `?? null` 同時涵蓋缺席與明給 null——兩者都不是字串，一律拒絕。
+		$code = $query['code'] ?? null;
+		if ( ! is_string( $code ) || 1 !== preg_match( self::RESULT_CODE_PATTERN, $code ) ) {
 			return self::store_result_rejected();
 		}
 
@@ -884,36 +896,33 @@ final class Plugin {
 			return self::store_result_rejected();
 		}
 
-		// 缺提領碼同樣不必解析身分——沒有東西可以提領。
+		// 🔴 順序是契約：形狀 → 身分 → 計量 → 提領（v029／v031 釘住）。
 		//
-		// 判準是 `'' === $code` 而**不是** `empty( $code )`：`sanitize_text_field( '0' )`
-		// 回 `'0'`，而 `empty( '0' )` 為 true。用 empty 會把 `?code=0` 這個**有送值**的
-		// 請求歸到「沒送提領碼」，兩種實作對同一個輸入給出不同結果。契約由 v029 的
-		// `code => '0'` case 釘住。
-		$code = sanitize_text_field( (string) ( $query['code'] ?? '' ) );
-		if ( '' === $code ) {
+		// 身分解析在計量**之前**：辨識不出 principal 的請求（匿名且無 guest token）
+		// 沒有 actor bucket 可言，而 Core 的 `get_client_ip()` 在 CDN／反向代理後全站
+		// 共用一個 IP bucket——替這種請求計量，等於讓匿名垃圾流量把正常顧客的共享
+		// 配額燒光、阻塞合法 claim。拒絕沿用同一句 generic 400，不多洩漏任何判別位元。
+		$principal = EcpayStoreSelector::current_principal( $scope );
+		if ( '' === $principal ) {
 			return self::store_result_rejected();
 		}
 
-		// 🔴 節流放在**形狀閘門之後、身分與提領之前**。
-		//
-		// 放在前面的話，畸形請求會消耗合法使用者的配額（而畸形請求本來就不需要
-		// 任何 DB 讀取）；放在後面則擋不住這個公開 GET 對 transient 的未計量放大。
+		// 🔴 計量在身分之後、提領之前：actor（由 principal 導出）＋共享 IP 兩個 bucket
+		// 都要過。429 之後**不得**提領——限流是 claim 的前置條件，不是事後記帳。
 		//
 		// 限流器缺席時 fail-safe 為**放行**：這是顧客結帳路徑上的一次性提領，
 		// 沒有限流器就整條擋掉會讓 headless 站完全選不了門市；而本端點本身已由
 		// 32 字元不可猜的提領碼與 principal 綁定守著。ECPay 宣告的最低核心是
 		// 2.58.0，該版本一定有 YSRateLimiter；缺席只可能出現在不受支援的組合。
 		// 契約由 v031 的子程序案例釘住（在完全沒有 YSRateLimiter 的執行環境重跑）。
-		if ( ! self::store_result_within_rate_limit() ) {
+		if ( ! self::store_result_within_rate_limit( $principal ) ) {
 			$limited = YSRestResponder::error( 'rate_limited', '提領請求過於頻繁，請稍後再試。', 429 );
 			$limited->header( 'Cache-Control', 'no-store, private' );
 
 			return $limited;
 		}
 
-		$principal = EcpayStoreSelector::current_principal( $scope );
-		$claimed   = EcpayStoreSelector::claim_result_code( $code, $principal );
+		$claimed = EcpayStoreSelector::claim_result_code( $code, $principal );
 
 		if ( null !== $claimed['error'] ) {
 			$response = YSRestResponder::error( 'store_result_invalid', (string) $claimed['error'], 400 );
@@ -942,24 +951,34 @@ final class Plugin {
 	}
 
 	/**
-	 * 公開提領端點的節流閘門。
+	 * 公開提領端點的節流閘門——只在 principal 已解析成功後呼叫。
 	 *
-	 * 複用 Core 既有的 `YSRateLimiter`（與 `ecpay_map_url()` 同一個 API），**不另建**
-	 * 任何平行的共用儲存。限流器不可用時 fail-safe 為放行——理由見呼叫端註解。
+	 * 複用 Core 既有的 `YSRateLimiter`（與 `ecpay_map_url()` 同一個 API 與同一套
+	 * bucket 派生法），**不另建**任何平行的共用儲存。限流器不可用時 fail-safe 為
+	 * 放行——理由見呼叫端註解。
 	 */
-	private static function store_result_within_rate_limit(): bool {
+	private static function store_result_within_rate_limit( string $principal ): bool {
 		if ( ! class_exists( YSRateLimiter::class ) || ! method_exists( YSRateLimiter::class, 'check' ) ) {
 			return true;
 		}
 
-		// 🔴 上限刻意與姊妹端點 `ecpay_map_ip` 相同（60/60）。
+		// 🔴 actor ＋ IP 兩個 bucket，與姊妹端點 `ecpay_map_url()` 同構：
 		//
-		// Core 的 `YSRateLimiter::check()` 不讀 `ACTION_DEFAULTS`——上限由呼叫端給定；
-		// 而 `get_client_ip()` 預設只回 `REMOTE_ADDR`（除非站方註冊
-		// `ys_ec_trusted_proxies`），因此 **CDN／反向代理後所有顧客共用同一個 bucket**。
-		// 提領一定發生在選店之後，其自然速率不可能高於 map-url，所以沿用同一個既有
-		// 上限既不會比現況更容易誤傷，也不需要為此新增一組要另行調校的數字。
-		return (bool) YSRateLimiter::check( 'ecpay_store_result_ip', 60, 60 );
+		//   - actor bucket 的 key 由 principal 的 SHA-256 導出（同 map-url 的
+		//     `ecpay_map_actor_*` 派生法，12/60）——它**只可能在 principal 之後**存在，
+		//     bucket key 因此不受攻擊者控制。
+		//   - 共享 IP bucket（60/60，同 `ecpay_map_ip`）必須保留：Core 的
+		//     `get_client_ip()` 預設只回 `REMOTE_ADDR`（除非站方註冊
+		//     `ys_ec_trusted_proxies`），CDN／反向代理後全站共用一個 bucket——只靠
+		//     guest actor bucket 的話，攻擊者換一個 token 就換一個 bucket，IP 層就沒有
+		//     任何上限了。
+		//
+		// 兩個 check 都先執行再合併判定（不 short-circuit），讓兩個 bucket 的計量
+		// 一致——與 map-url 現行行為相同。
+		$actor_allowed = (bool) YSRateLimiter::check( 'ecpay_store_result_actor_' . substr( hash( 'sha256', $principal ), 0, 24 ), 12, 60 );
+		$ip_allowed    = (bool) YSRateLimiter::check( 'ecpay_store_result_ip', 60, 60 );
+
+		return $actor_allowed && $ip_allowed;
 	}
 
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {

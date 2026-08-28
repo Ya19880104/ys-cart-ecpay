@@ -78,6 +78,32 @@ $check(
         && str_contains($sdk, '/^[a-z0-9_]{1,32}$/')
 );
 
+// ── SDK 驗證範圍的措辭必須**精確**，不得過度宣稱 ────────────────────────────
+//
+// 只有兩個高階 helper（requestStoreMapForm／claimStoreResult）在送出前驗證；
+// legacy raw helper（requestMapForm＝原樣 POST）為了 ABI 相容不驗，靠伺服器
+// fail-closed。文件寫成「整個 SDK 都會驗」就是把不存在的防線寫成存在。
+$check(
+    'Docs scope the client-side validation claim to the two high-level helpers only',
+    str_contains($docs, 'Only the two high-level helpers validate before sending')
+        && str_contains($docs, '`requestMapForm()` (legacy raw POST) | No')
+        && ! str_contains($docs, 'The SDK enforces the identical rule')
+);
+
+$check(
+    'README scopes the client-side validation claim the same way',
+    str_contains($readme, 'The two high-level SDK helpers')
+        && str_contains($readme, 'post their payload as-is')
+        && ! str_contains($readme, 'The SDK enforces the same rule')
+);
+
+$check(
+    'Docs publish the store-result ordering contract (shape → principal → metering → claim)',
+    str_contains($docs, 'shape → principal → metering → claim')
+        && str_contains($docs, 'ecpay_store_result_actor_')
+        && str_contains($docs, 'ecpay_store_result_ip')
+);
+
 $check(
     'Docs publish the canonical cart_scope ABI and its fail-closed errors',
     str_contains($docs, '`cart_scope` is a canonical ABI (fail-closed)')
