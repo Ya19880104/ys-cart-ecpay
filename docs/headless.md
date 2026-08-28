@@ -90,6 +90,52 @@ cookie is `SameSite=Lax`. The owner therefore comes from the same-origin map
 request and is copied from the map session; the browser-carried callback does not
 get to choose the owner.
 
+## `cart_scope` is a canonical ABI (fail-closed)
+
+`cart_scope` must match `/^[a-z0-9_]{1,32}$/` **exactly as sent**, or be omitted
+entirely. Only a completely omitted `cart_scope` falls back to `default`.
+
+The server never normalises and never downgrades it. `HEADLESS_1` is not accepted
+as `headless_1`, `my-scope` is not accepted, and `!!!`, `''`, `null`, an array or a
+value longer than 32 characters are not quietly turned into `default`. Every one of
+those returns **HTTP 400** before the server resolves any principal, opens a map
+session, mints a selection token, or consumes a one-time result code.
+
+This is deliberate fail-closed hardening. Normalising a non-canonical scope would
+bind the request to a *different* shopping session: `current_principal()` returns
+the logged-in user id before it ever reads the scope, and the headless
+`X-YS-Guest-Token` branch ignores the scope entirely — so a normalised scope would
+consume the shopper's real one-time code under the wrong identity.
+
+The same rule applies to all three public boundaries:
+
+| Route | On a non-canonical `cart_scope` |
+|---|---|
+| `POST /stores/ecpay/map-url` | `400` `invalid_cart_scope` — no principal, no map session, no signed form |
+| `GET /ecpay/store-result` | `400` `store_result_invalid` — no principal, no claim; still `Cache-Control: no-store, private` |
+| `POST /stores/ecpay/reauthorize` | `400` `invalid_saved_store_request` — no principal, no saved-store token |
+
+The SDK enforces the identical rule **before** sending, so the mistake surfaces in
+development rather than mid-checkout. Both helpers share one validator:
+
+```js
+YsCartEcpay.isCanonicalCartScope('headless_1'); // true
+YsCartEcpay.isCanonicalCartScope('HEADLESS_1'); // false — rejected, not lowercased
+
+await YsCartEcpay.requestStoreMapForm(apiBase, shippingId, paymentMethod, { cart_scope: 'HEADLESS_1' });
+// rejects before any network call
+await YsCartEcpay.claimStoreResult(apiBase, code, { cart_scope: 'my-scope' });
+// rejects with the same error
+```
+
+`GET /ecpay/store-result` is additionally throttled through the core rate limiter
+(`ecpay_store_result_ip`, the same 60/60 budget as `ecpay_map_ip`). Throttling runs
+*after* the shape gate, so a malformed request never spends a legitimate shopper's
+quota, and *before* the claim, so a public GET cannot amplify transient reads. A
+throttled response is `429` `rate_limited` and still carries
+`Cache-Control: no-store, private`. If the core rate limiter is unavailable the
+endpoint fails safe and still serves the claim.
+
 ## Store selection token (v0.2.12, required at checkout)
 
 The store id in the payload is just a string the browser can edit. The server

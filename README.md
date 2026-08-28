@@ -99,6 +99,14 @@ then `resultCodeFromLocation()` + `claimStoreResult()` and the absolute-API
 `checkout()` helper. Cookie-authenticated writes can set `X-WP-Nonce` through
 `setWpNonce()`.
 
+`cart_scope` is a canonical ABI: it must match `/^[a-z0-9_]{1,32}$/` exactly as
+sent, or be omitted entirely — only an omitted scope falls back to `default`. The
+server never normalises or downgrades it, so `HEADLESS_1`, `my-scope`, `''`,
+`null`, an array, or anything longer than 32 characters returns HTTP 400 before
+any principal is resolved, any map session is opened, or any one-time result code
+is consumed. The SDK enforces the same rule before sending and publishes it as
+`YsCartEcpay.isCanonicalCartScope()`. See `docs/headless.md`.
+
 ## Release
 
 ```bash

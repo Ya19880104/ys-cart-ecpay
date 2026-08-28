@@ -25,8 +25,21 @@ final class EcpayPrintController {
 			wp_die( esc_html__( 'Permission denied.', 'ys-cart-ecpay' ), 403 );
 		}
 
-		$key = sanitize_text_field( wp_unslash( (string) ( $_GET['key'] ?? '' ) ) );
-		if ( '' === $key ) {
+		// 🔴 key 的**確切格式**要在碰任何 transient 或送出任何 header 之前驗完。
+		//
+		// 舊版直接 `(string)` 轉型：`?key[]=x` 會發 array-to-string warning（而且是在輸出
+		// 之前），並以捏造出來的識別碼 `Array` 去對 transient 做讀取**與無條件刪除**。
+		// key 又沒有格式檢查，於是任何輸入都變成一次 transient 往返。
+		//
+		// 真實格式由鑄造端決定：`EcpayShippingRequester` 用
+		// `wp_generate_password( 24, false, false )`，即 24 個 `[A-Za-z0-9]`。
+		// 錯誤訊息維持既有那一句，不回顯 key、也不回顯 transient 名稱。
+		// 驗的是 **unslash 後的原值**，不先 sanitize：這條 regex 比任何 sanitizer 都嚴格，
+		// 讓閘門成為唯一權威。先 `sanitize_text_field()` 的話，`…01%0A` 會被 trim 成合法
+		// 長度而通過——但鑄造端從來不會產生帶換行的 key。
+		$raw_key = $_GET['key'] ?? null; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$key     = is_string( $raw_key ) ? wp_unslash( $raw_key ) : null;
+		if ( ! is_string( $key ) || 1 !== preg_match( '/^[A-Za-z0-9]{24}$/D', $key ) ) {
 			wp_die( esc_html__( 'Missing print payload.', 'ys-cart-ecpay' ), 400 );
 		}
 

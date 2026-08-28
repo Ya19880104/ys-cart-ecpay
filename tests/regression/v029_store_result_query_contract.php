@@ -31,6 +31,13 @@ namespace {
         public function get_status(): int { return $this->status; }
         public function header(string $name, string $value): void { $this->headers[$name] = $value; }
     }
+
+    /** Records the EXACT route config the plugin registers. */
+    $GLOBALS['v029_routes'] = [];
+    function register_rest_route(string $namespace, string $route, array $args = []): bool {
+        $GLOBALS['v029_routes'][$namespace . $route] = $args;
+        return true;
+    }
 }
 
 namespace YangSheep\Ecommerce\Api\Storefront {
@@ -44,11 +51,24 @@ namespace YangSheep\Ecommerce\Api\Storefront {
 
     final class YSRestResponder {
         public static function error(string $code, string $message, int $status = 400): \WP_REST_Response {
-            return new \WP_REST_Response(['success' => false, 'code' => $code], $status);
+            return new \WP_REST_Response(['success' => false, 'code' => $code, 'message' => $message], $status);
         }
         public static function success(string $code, string $message, array $data = []): \WP_REST_Response {
             return new \WP_REST_Response(['success' => true, 'code' => $code, 'data' => $data], 200);
         }
+    }
+
+    final class YSRestAuth {
+        public static function permission_customer_or_guest(): bool { return true; }
+        public static function permission_customer_or_guest_write(): bool { return true; }
+        public static function permission_logged_in_write(): bool { return true; }
+    }
+}
+
+namespace YangSheep\YSCartEcpay\Support {
+    final class ShippingMethodOperability {
+        public static function has_operable_method(): bool { return true; }
+        public static function is_operable(string $method_id): bool { return true; }
     }
 }
 
@@ -95,6 +115,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 }
 
 namespace {
+    require_once dirname(__DIR__, 2) . '/src/Support/CartScope.php';
     require_once dirname(__DIR__, 2) . '/src/Plugin.php';
 
     $passed = 0;
@@ -242,6 +263,51 @@ namespace {
             && 1 === $zero_code['principal_calls']
             && 1 === $zero_code['claim_calls'],
         'a supplied code of "0" is treated as supplied, not as empty'
+    );
+
+    // ── 🔴 Route custody：捕捉 register_rest_route 的 exact config ────────────────
+    //
+    // 形狀閘門讀的是 raw query bag，因此它的正確性取決於**路由沒有先幫我們洗過形狀**。
+    // WP 會在 dispatch 前把 `args` 的 `sanitize_callback` 結果寫回 `params`，而
+    // `sanitize_text_field()` 對陣列回空字串——只要有人替 `code`／`cart_scope` 宣告
+    // sanitize_callback，`?cart_scope[]=x` 就會以純量 `''` 抵達 handler，閘門永遠不觸發，
+    // 而請求 stub 沒有 args pipeline、任何行為測試都看不出來。所以這件事只能由
+    // **註冊設定本身**來釘。
+    (new \YangSheep\YSCartEcpay\Plugin())->register_storefront_routes('ys-ecommerce/v1');
+    $route = $GLOBALS['v029_routes']['ys-ecommerce/v1/ecpay/store-result'] ?? null;
+
+    $assert(is_array($route), 'the store-result route is registered');
+    $assert('GET' === ($route['methods'] ?? null), 'store-result stays a GET route');
+    $assert(
+        is_array($route) && ! array_key_exists('args', $route),
+        'store-result declares no args pipeline that could reshape code/cart_scope before the handler'
+    );
+    $assert(
+        is_array($route) && isset($route['permission_callback']) && is_callable($route['permission_callback'], true),
+        'store-result keeps a permission callback'
+    );
+    $assert(
+        is_array($route)
+            && [] === array_diff(array_keys($route), ['methods', 'callback', 'permission_callback']),
+        'store-result registers exactly methods/callback/permission_callback and nothing else'
+    );
+
+    // ── 🔴 exact early error code + message + no-store ──────────────────────────
+    //
+    // 前置拒絕刻意沿用提領層既有那一句，不新增字串：這個端點在 permission 之前就會
+    // 回應，多一種只有「形狀錯」看得到的訊息等於白送一個判別位元給呼叫端。
+    $early = $run(['code' => [$code], 'cart_scope' => 'headless_1']);
+    $assert(
+        'store_result_invalid' === ($early['response']->data['code'] ?? ''),
+        'early rejection reuses the exact store_result_invalid code'
+    );
+    $assert(
+        '缺少提領碼或無法辨識身分。' === ($early['response']->data['message'] ?? ''),
+        'early rejection reuses the exact claim-layer message and introduces no new oracle'
+    );
+    $assert(
+        'no-store, private' === ($early['response']->headers['Cache-Control'] ?? ''),
+        'early rejection still carries no-store, private'
     );
 
     $source = (string)file_get_contents(dirname(__DIR__, 2) . '/src/Plugin.php');

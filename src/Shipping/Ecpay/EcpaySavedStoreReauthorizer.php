@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
 use YangSheep\Ecommerce\Models\YSCustomer;
+use YangSheep\YSCartEcpay\Support\CartScope;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
 /**
@@ -29,6 +30,30 @@ final class EcpaySavedStoreReauthorizer {
 			return self::failure( 'authentication_required', '請先登入再使用已儲存的取貨門市。', 401 );
 		}
 
+		// 🔴 形狀在**認證之後、任何資料庫讀取之前**驗完。
+		//
+		// 認證仍排第一（不對未登入者洩漏請求是否合法），但形狀不合格的請求不該再往下
+		// 觸發 customer/address 查詢、門市目錄查詢、身分解析或 token 鑄造。
+		//
+		// 🔴 `array_key_exists()` 而非 `isset()`。
+		//
+		// `isset()` 對 `null` 回 false，於是「有送這個欄位、但送了 null」會被誤判成
+		// 「沒送」，整個跳過形狀檢查，再被 `(string) null` 變成 `''`——`cart_scope`
+		// 因此降成 `default`，然後拿那個身分去鑄 saved-store token。有提供就必須是
+		// 純量，缺一不可。
+		foreach ( [ 'address_id', 'shipping_id', 'payment_method', 'cart_scope' ] as $field ) {
+			if ( array_key_exists( $field, $params ) && ! is_scalar( $params[ $field ] ) ) {
+				return self::failure( 'invalid_saved_store_request', '已儲存門市的重新授權資料格式錯誤。', 400 );
+			}
+		}
+
+		// `cart_scope` 走 canonical ABI：有提供就必須已經是 canonical，只有完全未提供
+		// 才用 default（見 CartScope）。正規化後改綁到另一個 scope 是被禁止的。
+		$cart_scope = CartScope::resolve( $params );
+		if ( null === $cart_scope ) {
+			return self::failure( 'invalid_saved_store_request', '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。', 400 );
+		}
+
 		if ( ! class_exists( YSCustomer::class ) || ! method_exists( YSCustomer::class, 'find_by_user_id' ) ) {
 			return self::failure( 'saved_store_not_found', '找不到可用的收件地址。', 404 );
 		}
@@ -39,16 +64,9 @@ final class EcpaySavedStoreReauthorizer {
 			return self::failure( 'saved_store_not_found', '找不到可用的收件地址。', 404 );
 		}
 
-		foreach ( [ 'address_id', 'shipping_id', 'payment_method', 'cart_scope' ] as $field ) {
-			if ( isset( $params[ $field ] ) && ! is_scalar( $params[ $field ] ) ) {
-				return self::failure( 'invalid_saved_store_request', '已儲存門市的重新授權資料格式錯誤。', 400 );
-			}
-		}
-
 		$address_id    = absint( $params['address_id'] ?? 0 );
 		$shipping_id  = sanitize_text_field( wp_unslash( (string) ( $params['shipping_id'] ?? '' ) ) );
 		$payment      = sanitize_text_field( wp_unslash( (string) ( $params['payment_method'] ?? '' ) ) );
-		$cart_scope   = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
 		$descriptor   = EcpayShippingCatalog::get( $shipping_id );
 
 		if ( $address_id <= 0 || '' === $shipping_id || '' === $payment ) {
@@ -166,15 +184,6 @@ final class EcpaySavedStoreReauthorizer {
 		$row = $wpdb->get_row( $sql, ARRAY_A );
 
 		return is_array( $row ) ? $row : null;
-	}
-
-	private static function sanitize_cart_scope( string $scope ): string {
-		$scope = sanitize_key( $scope );
-		if ( '' === $scope || ! preg_match( '/^[a-z0-9_]{1,32}$/', $scope ) ) {
-			return 'default';
-		}
-
-		return $scope;
 	}
 
 	/** @return array{success:bool,code:string,message:string,status:int,data:array<string,mixed>} */

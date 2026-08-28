@@ -11,6 +11,47 @@
   /** 核心既有的訪客身分 header（headless 前端可能在另一個 origin，沒有 cookie）。 */
   var GUEST_TOKEN_HEADER = 'X-YS-Guest-Token';
 
+  /**
+   * 🔴 `cart_scope` 的 canonical ABI —— 與伺服器端 `CartScope` **同一條規則**。
+   *
+   * 伺服器只接受「已經是 canonical 的字串」，或「整個省略」。它**不會**幫你把
+   * `HEADLESS_1` 正規化成 `headless_1`，也**不會**把 `!!!` 默默降成 `default`——
+   * 那等於用另一個 scope 的身分去動敏感資源（消耗一次性提領碼、簽發 map session、
+   * 鑄出 saved-store token）。送非 canonical 值一律拿到 HTTP 400。
+   *
+   * SDK 在送出前用同一條規則擋下來，讓你在開發期就看到錯誤，而不是在使用者的
+   * 結帳流程中間收到一個沒頭沒尾的 400。map 與 claim 兩條路徑共用這一份。
+   */
+  var CART_SCOPE_PATTERN = /^[a-z0-9_]{1,32}$/;
+
+  var CART_SCOPE_ERROR =
+    'cart_scope must already be canonical (/^[a-z0-9_]{1,32}$/) or be omitted entirely. ' +
+    'The server never normalises or downgrades it.';
+
+  /**
+   * 判斷並取出 canonical scope。
+   *
+   * @param {object} [options] 呼叫端傳入的選項物件
+   * @returns {{ok: boolean, value: string}} `value` 為空字串代表「未提供」，由伺服器套用 default
+   */
+  function canonicalCartScope(options) {
+    if (!options || !Object.prototype.hasOwnProperty.call(options, 'cart_scope')) {
+      return { ok: true, value: '' };
+    }
+
+    var scope = options.cart_scope;
+    if (typeof scope !== 'string' || !CART_SCOPE_PATTERN.test(scope)) {
+      return { ok: false, value: '' };
+    }
+
+    return { ok: true, value: scope };
+  }
+
+  /** 公開同一條判準，讓呼叫端可以在 UI 上先擋。 */
+  function isCanonicalCartScope(scope) {
+    return typeof scope === 'string' && CART_SCOPE_PATTERN.test(scope);
+  }
+
   var guestToken = '';
   var wpNonce = '';
 
@@ -90,13 +131,18 @@
       ));
     }
 
+    var scope = canonicalCartScope(options);
+    if (!scope.ok) {
+      return Promise.reject(new Error(CART_SCOPE_ERROR));
+    }
+
     var payload = {
       shipping_id: shippingId,
       payment_method: paymentMethod
     };
 
-    if (options && options.cart_scope) {
-      payload.cart_scope = options.cart_scope;
+    if (scope.value !== '') {
+      payload.cart_scope = scope.value;
     }
     if (options && options.return_url) {
       payload.return_url = options.return_url;
@@ -125,9 +171,14 @@
     if (typeof code !== 'string' || !/^[A-Za-z0-9]{32}$/.test(code)) {
       return Promise.reject(new Error('claimStoreResult() requires a 32-character result code.'));
     }
+    var scope = canonicalCartScope(options);
+    if (!scope.ok) {
+      return Promise.reject(new Error(CART_SCOPE_ERROR));
+    }
+
     var query = '?code=' + encodeURIComponent(code);
-    if (options && options.cart_scope) {
-      query += '&cart_scope=' + encodeURIComponent(options.cart_scope);
+    if (scope.value !== '') {
+      query += '&cart_scope=' + encodeURIComponent(scope.value);
     }
     return fetch(apiUrl(apiBase, ROUTES.storeResult) + query, {
       method: 'GET',
@@ -182,6 +233,9 @@
     selectionTokenField: 'ecpay_store_token',
     /** 訪客身分 header 名稱（與核心一致）。 */
     guestTokenHeader: GUEST_TOKEN_HEADER,
+    /** `cart_scope` canonical ABI —— 與伺服器端 CartScope 同一條規則。 */
+    cartScopePattern: CART_SCOPE_PATTERN,
+    isCanonicalCartScope: isCanonicalCartScope,
     setGuestToken: setGuestToken,
     setWpNonce: setWpNonce,
     requestStoreMapForm: requestStoreMapForm,

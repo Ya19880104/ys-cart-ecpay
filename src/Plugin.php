@@ -28,12 +28,21 @@ use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySavedStoreReauthorizer;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
+use YangSheep\YSCartEcpay\Support\CartScope;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 use YangSheep\YSCartEcpay\Support\ShippingMethodOperability;
 
 final class Plugin {
 	private static ?self $instance = null;
+
+	/**
+	 * 送了非 canonical `cart_scope` 時的固定訊息。
+	 *
+	 * 刻意在三條 public boundary 共用同一句，讓呼叫端拿到一致、可對照文件的錯誤，
+	 * 同時不因「錯在哪一種形狀」而多洩漏一個判別位元。
+	 */
+	private const CART_SCOPE_ERROR = '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。';
 
 	private const REGISTERED_GATEWAY_IDS = [
 		'ys_ec_ecpay_credit',
@@ -747,11 +756,30 @@ final class Plugin {
 			return YSRestResponder::error( 'provider_disabled', '綠界物流尚未啟用。' );
 		}
 
-		$params      = YSRequestParser::params( $request );
+		$params = YSRequestParser::params( $request );
+
+		// 🔴 形狀要在任何 string cast 與身分解析之前驗完。
+		//
+		// `YSRequestParser::params()` 完全不過濾型別，而下面每一行都直接 `(string)`／
+		// `sanitize_*`：送 `{"cart_scope":["headless_1"]}` 會發 array-to-string warning、
+		// 變成字串 `Array`，再被正規化成一個**合法但錯誤**的 scope，然後據此解析
+		// principal 並簽發 map session 與 signed form。
+		foreach ( [ 'shipping_id', 'context', 'order_id', 'return_url', 'payment_method' ] as $field ) {
+			if ( array_key_exists( $field, $params ) && ! is_scalar( $params[ $field ] ) ) {
+				return YSRestResponder::error( 'invalid_map_request', '選店請求的參數格式不正確。', 400 );
+			}
+		}
+
+		// `cart_scope` 走 canonical ABI：有提供就必須**已經是** canonical，
+		// 只有完全未提供才用 default。詳見 CartScope。
+		$cart_scope = CartScope::resolve( $params );
+		if ( null === $cart_scope ) {
+			return YSRestResponder::error( 'invalid_cart_scope', self::CART_SCOPE_ERROR, 400 );
+		}
+
 		$shipping_id = sanitize_text_field( $params['shipping_id'] ?? '' );
 		$context     = sanitize_key( $params['context'] ?? 'checkout' );
 		$order_id    = absint( $params['order_id'] ?? 0 );
-		$cart_scope  = self::sanitize_cart_scope( (string) ( $params['cart_scope'] ?? 'default' ) );
 		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
 		$principal   = EcpayStoreSelector::current_principal( $cart_scope );
 		if ( '' === $principal ) {
@@ -845,10 +873,15 @@ final class Plugin {
 		// 但 `isset()` 對 null 也是 false——用 isset 的話 `cart_scope => null` 會整個
 		// 跳過這道閘，再被 `(string) null` 變成 ''、降成 default，然後照樣提領。
 		// 契約由 v029 的 null case 釘住。
-		foreach ( [ 'code', 'cart_scope' ] as $field ) {
-			if ( array_key_exists( $field, $query ) && ! is_scalar( $query[ $field ] ) ) {
-				return self::store_result_rejected();
-			}
+		if ( array_key_exists( 'code', $query ) && ! is_scalar( $query['code'] ) ) {
+			return self::store_result_rejected();
+		}
+
+		// `cart_scope` 走 canonical ABI（見 CartScope）：非純量、非 canonical、`null`
+		// 一律拒絕；只有完全未提供才用 default。**不得**正規化後改綁到另一個 scope。
+		$scope = CartScope::resolve( $query );
+		if ( null === $scope ) {
+			return self::store_result_rejected();
 		}
 
 		// 缺提領碼同樣不必解析身分——沒有東西可以提領。
@@ -862,7 +895,23 @@ final class Plugin {
 			return self::store_result_rejected();
 		}
 
-		$scope     = self::sanitize_cart_scope( (string) ( $query['cart_scope'] ?? 'default' ) );
+		// 🔴 節流放在**形狀閘門之後、身分與提領之前**。
+		//
+		// 放在前面的話，畸形請求會消耗合法使用者的配額（而畸形請求本來就不需要
+		// 任何 DB 讀取）；放在後面則擋不住這個公開 GET 對 transient 的未計量放大。
+		//
+		// 限流器缺席時 fail-safe 為**放行**：這是顧客結帳路徑上的一次性提領，
+		// 沒有限流器就整條擋掉會讓 headless 站完全選不了門市；而本端點本身已由
+		// 32 字元不可猜的提領碼與 principal 綁定守著。ECPay 宣告的最低核心是
+		// 2.58.0，該版本一定有 YSRateLimiter；缺席只可能出現在不受支援的組合。
+		// 契約由 v031 的子程序案例釘住（在完全沒有 YSRateLimiter 的執行環境重跑）。
+		if ( ! self::store_result_within_rate_limit() ) {
+			$limited = YSRestResponder::error( 'rate_limited', '提領請求過於頻繁，請稍後再試。', 429 );
+			$limited->header( 'Cache-Control', 'no-store, private' );
+
+			return $limited;
+		}
+
 		$principal = EcpayStoreSelector::current_principal( $scope );
 		$claimed   = EcpayStoreSelector::claim_result_code( $code, $principal );
 
@@ -890,6 +939,27 @@ final class Plugin {
 		$response->header( 'Cache-Control', 'no-store, private' );
 
 		return $response;
+	}
+
+	/**
+	 * 公開提領端點的節流閘門。
+	 *
+	 * 複用 Core 既有的 `YSRateLimiter`（與 `ecpay_map_url()` 同一個 API），**不另建**
+	 * 任何平行的共用儲存。限流器不可用時 fail-safe 為放行——理由見呼叫端註解。
+	 */
+	private static function store_result_within_rate_limit(): bool {
+		if ( ! class_exists( YSRateLimiter::class ) || ! method_exists( YSRateLimiter::class, 'check' ) ) {
+			return true;
+		}
+
+		// 🔴 上限刻意與姊妹端點 `ecpay_map_ip` 相同（60/60）。
+		//
+		// Core 的 `YSRateLimiter::check()` 不讀 `ACTION_DEFAULTS`——上限由呼叫端給定；
+		// 而 `get_client_ip()` 預設只回 `REMOTE_ADDR`（除非站方註冊
+		// `ys_ec_trusted_proxies`），因此 **CDN／反向代理後所有顧客共用同一個 bucket**。
+		// 提領一定發生在選店之後，其自然速率不可能高於 map-url，所以沿用同一個既有
+		// 上限既不會比現況更容易誤傷，也不需要為此新增一組要另行調校的數字。
+		return (bool) YSRateLimiter::check( 'ecpay_store_result_ip', 60, 60 );
 	}
 
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {
@@ -972,15 +1042,6 @@ final class Plugin {
 		}
 
 		return null;
-	}
-
-	private static function sanitize_cart_scope( string $scope ): string {
-		$scope = sanitize_key( $scope );
-		if ( '' === $scope || ! preg_match( '/^[a-z0-9_]{1,32}$/', $scope ) ) {
-			return 'default';
-		}
-
-		return $scope;
 	}
 
 	/**

@@ -36,9 +36,14 @@ $check(
 
 // 合流後（0.2.15 main）：build_map_form_data 多收 $payment_method（代收模式
 // 仲裁用）——return context 語意不變。
+//
+// 🔴 2026-08-28：`cart_scope` 改走 canonical ABI，判準集中到 `CartScope::resolve()`
+// （取代先前三份各自漂移的 `sanitize_cart_scope()` 私有副本）。這條斷言原本釘的是舊
+// 實作的**拼寫**；return context 的語意沒有變，因此這裡跟著改釘新的權威來源，而不是
+// 放寬。完整的 canonical 行為契約在 v031。
 $check(
 	'map route accepts return_url/cart_scope and passes them to selector',
-	strpos( $plugin, "\$cart_scope  = self::sanitize_cart_scope" ) !== false
+	strpos( $plugin, "\$cart_scope = CartScope::resolve( \$params )" ) !== false
 		&& strpos( $plugin, "\$return_url  = esc_url_raw" ) !== false
 		&& preg_match( '/build_map_form_data\(\s*\$shipping_id,\s*\$context,\s*\$order_id,\s*\$cart_scope,\s*\$return_url,\s*\$payment_method\s*\)/s', $plugin ) === 1
 );

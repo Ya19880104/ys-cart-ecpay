@@ -42,6 +42,34 @@
 
 ### Changed
 
+- 🔴 **`cart_scope` 成為 canonical ABI（破壞性、刻意 fail-closed）**。它必須**原樣**符合
+  `/^[a-z0-9_]{1,32}$/`，或整個省略；**只有完全未提供才會套用 `default`**。伺服器不再
+  正規化、也不再降級：`HEADLESS_1` 不會被當成 `headless_1`，`my-scope`、`!!!`、空字串、
+  `null`、陣列、超過 32 字元一律回 400。
+  三條 public boundary 一致：`POST /stores/ecpay/map-url`（`invalid_cart_scope`）、
+  `GET /ecpay/store-result`（`store_result_invalid`）、`POST /stores/ecpay/reauthorize`
+  （`invalid_saved_store_request`），且都在解析 principal、開 map session、鑄 selection
+  token 或消耗一次性提領碼**之前**就拒絕。
+  之所以不能「先正規化再用」：`current_principal()` 對登入者會在讀 scope 之前就回
+  `'u:<id>'`，headless 的 `X-YS-Guest-Token` 分支也與 scope 無關——正規化等於用**另一個
+  scope 的身分**去動敏感資源。判準集中在 `src/Support/CartScope.php`（取代先前三份各自
+  漂移的 `sanitize_cart_scope()` 副本），headless SDK 送出前套用同一條規則。
+  **升級注意**：送非 canonical scope 的呼叫端會開始收到 400，而不再被靜默改綁。
+- `POST /stores/ecpay/map-url` 現在在任何 string cast 之前檢查參數形狀。先前
+  `{"cart_scope":["x"]}` 會發 array-to-string warning 並產生一個合法但錯誤的 scope；
+  `return_url` 送物件更會是未捕捉的 fatal。畸形請求也不再消耗呼叫端真正的節流配額。
+- `POST /stores/ecpay/reauthorize` 的欄位存在性判斷由 `isset()` 改為 `array_key_exists()`，
+  `null` 因此被正確視為「有提供但形狀錯」；形狀檢查同時上移到任何資料庫讀取之前
+  （認證仍排第一）。
+- 管理端列印 `admin_post_ys_cart_ecpay_print` 現在先驗 key 的**確切格式**
+  （`/^[A-Za-z0-9]{24}$/`，即鑄造端 `wp_generate_password( 24, false, false )` 的形狀），
+  再碰任何 transient 或送出任何 header。`?key[]=x` 不再觸發 array-to-string warning，也不再
+  以捏造的識別碼做 transient 讀取與刪除；錯誤訊息維持既有那一句，不洩漏 transient 識別資訊。
+- 公開的 `GET /ecpay/store-result` 加上節流，複用 Core 既有的 `YSRateLimiter`
+  （`ecpay_store_result_ip`，與姊妹端點 `ecpay_map_ip` 同樣的 60/60），**不另建**任何平行儲存。
+  節流位在形狀閘門**之後**（畸形請求不消耗合法配額）、身分與提領**之前**（公開 GET 不放大
+  transient 讀取）。限流器不可用時 fail-safe 為放行，並由 v031 在一個真的沒有該類別的子程序
+  中證明。
 - 最低核心版本提高為 **YS CART 2.58.0**，並 fail-closed 探測 order serialization、
   typed replay reservation／token／commit／release、五參數 shipping pipeline advance
   與 deferred hook capability；舊 gate transient namespace 同步升版，避免沿用先前的
@@ -61,6 +89,14 @@
   次數**而不是引數值——只斷言引數的話，「被呼叫但引數是空字串」與「根本沒被呼叫」完全同形。
   涵蓋 array code、array scope、兩者皆 array、缺 code、空 code、whitespace-only code、
   `null`（釘住 `array_key_exists` 而非 `isset`）與 `code='0'`（釘住 `'' ===` 而非 `empty()`）。
+  另新增 **route custody**：捕捉 `register_rest_route()` 的 exact config，釘住這條路由不得
+  宣告 `args`／`sanitize_callback`（否則 WP 會在 handler 之前把陣列洗成純量 `''`，形狀閘門
+  永遠不觸發、而行為測試看不出來），並釘住前置拒絕的 exact error code／message 與 no-store。
+- 新增 `v031`（`cart_scope` canonical ABI，三條 public boundary ＋ 節流契約，含在一個真的
+  沒有 `YSRateLimiter` 的子程序中證明 fail-safe）與 `v032`（列印 key 的 exact 形狀閘門）。
+- `v013` 增補 SDK／文件的 canonical validator custody：釘住 SDK 只有**一份** pattern、map 與
+  claim 兩條路徑共用同一個 validator、pattern 與伺服器端 `CartScope` 逐字相同，並實際以
+  Node 執行 SDK 驗證兩條路徑都在**發出任何請求之前**就 reject。
 
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 
