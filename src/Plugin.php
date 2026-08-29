@@ -781,7 +781,7 @@ final class Plugin {
 		$shipping_id      = sanitize_text_field( $params['shipping_id'] ?? '' );
 		$context          = sanitize_key( $params['context'] ?? 'checkout' );
 		$order_id         = absint( $params['order_id'] ?? 0 );
-		$return_url       = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
+		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
 		$subscription_item = null;
 
 		if ( 'subscription' === $context ) {
