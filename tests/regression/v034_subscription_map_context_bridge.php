@@ -232,23 +232,23 @@ namespace {
 	);
 
 	$GLOBALS['v034_user_id'] = 8;
-	$response = $map( $base );
-	$check(
-		'non-owner cannot mint a subscription map session',
-		403 === $response->get_status()
-			&& 'subscription_forbidden' === ( $response->data['code'] ?? '' )
-			&& [] === EcpayStoreSelector::$map_calls
-	);
-
-	$GLOBALS['v034_user_id'] = 7;
+	$active_other = $map( $base );
+	YSSubscription::$rows[41]->status = 'cancelled';
+	$terminal_other = $map( $base );
+	YSSubscription::$rows[41]->status = 'active';
 	$response = $map( array_merge( $base, [ 'subscription_id' => 404 ] ) );
 	$check(
-		'missing subscription fails closed',
+		'missing, active-other and terminal-other subscriptions are indistinguishable',
 		404 === $response->get_status()
+			&& 404 === $active_other->get_status()
+			&& 404 === $terminal_other->get_status()
+			&& $response->data === $active_other->data
+			&& $response->data === $terminal_other->data
 			&& 'subscription_not_found' === ( $response->data['code'] ?? '' )
 			&& [] === EcpayStoreSelector::$map_calls
 	);
 
+	$GLOBALS['v034_user_id'] = 7;
 	YSSubscription::$rows[41]->status = 'cancelled';
 	$response = $map( $base );
 	$check(

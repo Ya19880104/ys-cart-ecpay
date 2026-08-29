@@ -782,16 +782,17 @@ final class Plugin {
 		$context          = sanitize_key( $params['context'] ?? 'checkout' );
 		$order_id         = absint( $params['order_id'] ?? 0 );
 		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
-		$subscription_item = null;
+		$is_subscription_context = false;
 
 		if ( 'subscription' === $context ) {
-			$subscription_context = $this->subscription_map_context( $params );
+			$subscription_context = $this->subscription_fulfillment_context( $params, $shipping_id );
 			if ( true !== ( $subscription_context['ok'] ?? false ) ) {
 				return $subscription_context['response'];
 			}
-			$cart_scope        = (string) $subscription_context['cart_scope'];
-			$payment_method    = (string) $subscription_context['payment_method'];
-			$subscription_item = $subscription_context['item'];
+			$shipping_id            = (string) $subscription_context['shipping_id'];
+			$cart_scope             = (string) $subscription_context['cart_scope'];
+			$payment_method         = (string) $subscription_context['payment_method'];
+			$is_subscription_context = true;
 		} else {
 			// `cart_scope` 走 canonical ABI：有提供就必須**已經是** canonical，
 			// 只有完全未提供才用 default。詳見 CartScope。
@@ -862,8 +863,8 @@ final class Plugin {
 		// 商品的「允許的物流方式」交集時，可對商品禁用的 sub-type 簽發**已簽章**的
 		// 電子地圖表單——使用者選完門市、callback 也寫進 session 與 localStorage，
 		// 直到送單才被擋。fail-closed：購物車讀取失敗亦視為不允許。
-		$shipping_allowed = is_array( $subscription_item )
-			? $this->is_shipping_allowed_for_subscription( $shipping_id, $subscription_item )
+		$shipping_allowed = $is_subscription_context
+			? true
 			: $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope );
 		if ( ! $shipping_allowed ) {
 			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
@@ -878,7 +879,7 @@ final class Plugin {
 	}
 
 	/**
-	 * Resolve the subscription-owned map tuple from Core authority.
+	 * Resolve one subscription-owned fulfillment tuple from Core authority.
 	 *
 	 * The browser may identify a subscription, but it never chooses the scope,
 	 * payment gateway or product identity used by the provider.  Those values are
@@ -886,15 +887,24 @@ final class Plugin {
 	 * when they match exactly.
 	 *
 	 * @param array<string,mixed> $params
-	 * @return array{ok:true,cart_scope:string,payment_method:string,item:array{product_id:int,variant_id:int}}|array{ok:false,response:\WP_REST_Response}
+	 * @return array{ok:true,owner_user_id:int,shipping_id:string,cart_scope:string,payment_method:string,item:array{product_id:int,variant_id:int}}|array{ok:false,response:\WP_REST_Response}
 	 */
-	private function subscription_map_context( array $params ): array {
+	private function subscription_fulfillment_context( array $params, string $shipping_id ): array {
 		$user_id = get_current_user_id();
 		if ( $user_id <= 0 || ! is_user_logged_in() ) {
 			return [
 				'ok'       => false,
 				'response' => YSRestResponder::error( 'authentication_required', '請先登入再變更訂閱取貨門市。', 401 ),
 			];
+		}
+
+		foreach ( [ 'subscription_id', 'cart_scope', 'payment_method' ] as $field ) {
+			if ( array_key_exists( $field, $params ) && ! is_scalar( $params[ $field ] ) ) {
+				return [
+					'ok'       => false,
+					'response' => YSRestResponder::error( 'invalid_subscription_context', '訂閱取貨資料格式不正確。', 400 ),
+				];
+			}
 		}
 
 		if ( ! array_key_exists( 'subscription_id', $params ) || absint( $params['subscription_id'] ) <= 0 ) {
@@ -921,10 +931,13 @@ final class Plugin {
 			];
 		}
 		if ( ! is_object( $subscription ) || $subscription_id !== (int) ( $subscription->id ?? 0 ) ) {
-			return [
-				'ok'       => false,
-				'response' => YSRestResponder::error( 'subscription_not_found', '找不到這筆訂閱。', 404 ),
-			];
+			return self::hidden_subscription_context();
+		}
+
+		$owner_id = (int) ( $subscription->user_id ?? 0 );
+		$is_admin = function_exists( 'current_user_can' ) && current_user_can( 'manage_options' );
+		if ( $owner_id <= 0 || ( ! $is_admin && $user_id !== $owner_id ) ) {
+			return self::hidden_subscription_context();
 		}
 
 		$status = trim( (string) ( $subscription->status ?? '' ) );
@@ -932,15 +945,6 @@ final class Plugin {
 			return [
 				'ok'       => false,
 				'response' => YSRestResponder::error( 'subscription_stale', '這筆訂閱已無法變更取貨門市。', 409 ),
-			];
-		}
-
-		$owner_id = (int) ( $subscription->user_id ?? 0 );
-		$is_admin = function_exists( 'current_user_can' ) && current_user_can( 'manage_options' );
-		if ( $owner_id <= 0 || ( ! $is_admin && $user_id !== $owner_id ) ) {
-			return [
-				'ok'       => false,
-				'response' => YSRestResponder::error( 'subscription_forbidden', '你沒有權限變更這筆訂閱。', 403 ),
 			];
 		}
 
@@ -979,14 +983,46 @@ final class Plugin {
 			];
 		}
 
+		if ( '' === $shipping_id ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'missing_shipping_id', '缺少物流方式 ID。', 400 ),
+			];
+		}
+
+		$item = [
+			'product_id' => $product_id,
+			'variant_id' => $variant_id,
+		];
+		if ( ! $this->is_shipping_allowed_for_subscription( $shipping_id, $item ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。', 400 ),
+			];
+		}
+
 		return [
 			'ok'             => true,
+			'owner_user_id'  => $owner_id,
+			'shipping_id'    => $shipping_id,
 			'cart_scope'     => $cart_scope,
 			'payment_method' => $payment_method,
-			'item'           => [
-				'product_id' => $product_id,
-				'variant_id' => $variant_id,
-			],
+			'item'           => $item,
+		];
+	}
+
+	/**
+	 * Missing and unauthorized subscriptions deliberately share one response.
+	 *
+	 * Status and row data are evaluated only after this ownership gate, so a
+	 * logged-in caller cannot enumerate another customer's active/terminal rows.
+	 *
+	 * @return array{ok:false,response:\WP_REST_Response}
+	 */
+	private static function hidden_subscription_context(): array {
+		return [
+			'ok'       => false,
+			'response' => YSRestResponder::error( 'subscription_not_found', '找不到這筆訂閱。', 404 ),
 		];
 	}
 
@@ -1114,8 +1150,41 @@ final class Plugin {
 	}
 
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {
+		$params        = YSRequestParser::params( $request );
+		$owner_user_id = null;
+
+		if ( array_key_exists( 'context', $params ) && ! is_scalar( $params['context'] ) ) {
+			$response = YSRestResponder::error( 'invalid_saved_store_request', '已儲存門市的重新授權資料格式錯誤。', 400 );
+			$response->header( 'Cache-Control', 'no-store, private' );
+			return $response;
+		}
+
+		$context = sanitize_key( $params['context'] ?? 'checkout' );
+		if ( 'subscription' === $context ) {
+			foreach ( [ 'subscription_id', 'address_id', 'shipping_id', 'cart_scope', 'payment_method' ] as $field ) {
+				if ( array_key_exists( $field, $params ) && ! is_scalar( $params[ $field ] ) ) {
+					$response = YSRestResponder::error( 'invalid_saved_store_request', '已儲存門市的重新授權資料格式錯誤。', 400 );
+					$response->header( 'Cache-Control', 'no-store, private' );
+					return $response;
+				}
+			}
+
+			$shipping_id = sanitize_text_field( wp_unslash( (string) ( $params['shipping_id'] ?? '' ) ) );
+			$authority   = $this->subscription_fulfillment_context( $params, $shipping_id );
+			if ( true !== ( $authority['ok'] ?? false ) ) {
+				$response = $authority['response'];
+				$response->header( 'Cache-Control', 'no-store, private' );
+				return $response;
+			}
+
+			$owner_user_id           = (int) $authority['owner_user_id'];
+			$params['shipping_id']    = (string) $authority['shipping_id'];
+			$params['cart_scope']     = (string) $authority['cart_scope'];
+			$params['payment_method'] = (string) $authority['payment_method'];
+		}
+
 		try {
-			$result = EcpaySavedStoreReauthorizer::reauthorize( YSRequestParser::params( $request ) );
+			$result = EcpaySavedStoreReauthorizer::reauthorize( $params, $owner_user_id );
 		} catch ( \Throwable $e ) {
 			$result = [
 				'success' => false,

@@ -16,6 +16,7 @@ namespace {
 	define( 'ARRAY_A', 'ARRAY_A' );
 
 	$GLOBALS['v035_user_id'] = 7;
+	$GLOBALS['v035_admin'] = false;
 	$GLOBALS['v035_password_counter'] = 0;
 	$GLOBALS['v035_transients'] = [];
 
@@ -28,6 +29,9 @@ namespace {
 	function esc_url_raw( string $url ): string { return $url; }
 	function get_current_user_id(): int { return (int) $GLOBALS['v035_user_id']; }
 	function is_user_logged_in(): bool { return get_current_user_id() > 0; }
+	function current_user_can( string $capability ): bool {
+		return 'manage_options' === $capability && true === $GLOBALS['v035_admin'];
+	}
 	function current_time( string $type ): int|string {
 		return 'timestamp' === $type ? 1788062400 : '2026-08-30 12:00:00';
 	}
@@ -57,8 +61,30 @@ namespace {
 		return $url . $separator . http_build_query( $args );
 	}
 
+	final class WP_REST_Request {
+		/** @param array<string,mixed> $body */
+		public function __construct( private array $body = [] ) {}
+		/** @return array<string,mixed> */
+		public function get_json_params(): array { return $this->body; }
+		/** @return array<string,mixed> */
+		public function get_body_params(): array { return []; }
+		/** @return array<string,mixed> */
+		public function get_query_params(): array { return []; }
+	}
+
+	final class WP_REST_Response {
+		/** @var array<string,string> */
+		public array $headers = [];
+		/** @param array<string,mixed> $data */
+		public function __construct( public array $data, private int $status ) {}
+		public function get_status(): int { return $this->status; }
+		public function header( string $name, string $value ): void { $this->headers[ $name ] = $value; }
+	}
+
 	final class V035Wpdb {
 		public string $prefix = 'wp_';
+		/** @var list<mixed> */
+		public array $prepare_args = [];
 		/** @var array<string,mixed> */
 		public array $address = [
 			'id'                 => 81,
@@ -68,15 +94,46 @@ namespace {
 			'shipping_method_id' => 'ys_ec_ecpay_ship_unimart',
 			'cvs_store_id'       => '991122',
 		];
-		public function prepare( string $sql, mixed ...$args ): string { return $sql; }
+		public function prepare( string $sql, mixed ...$args ): string {
+			$this->prepare_args = $args;
+			return $sql;
+		}
 		/** @return array<string,mixed> */
-		public function get_row( string $sql, string $output ): array { return $this->address; }
+		public function get_row( string $sql, string $output ): array {
+			return [ 81, 91 ] === $this->prepare_args ? $this->address : [];
+		}
 	}
 	$GLOBALS['wpdb'] = new V035Wpdb();
 }
 
 namespace YangSheep\Ecommerce\Api\Storefront {
+	final class YSRequestParser {
+		/** @return array<string,mixed> */
+		public static function params( \WP_REST_Request $request ): array {
+			$params = $request->get_json_params();
+			return [] !== $params ? $params : $request->get_body_params();
+		}
+	}
+
+	final class YSRestResponder {
+		public static function error( string $code, string $message, int $status = 400, array $data = [] ): \WP_REST_Response {
+			return new \WP_REST_Response(
+				[ 'success' => false, 'code' => $code, 'message' => $message, 'data' => $data ],
+				$status
+			);
+		}
+		public static function success( string $code, string $message, array $data = [] ): \WP_REST_Response {
+			return new \WP_REST_Response(
+				[ 'success' => true, 'code' => $code, 'message' => $message, 'data' => $data ],
+				200
+			);
+		}
+	}
+
 	final class YSRestAuth {
+		public static function permission_customer_or_guest(): bool { return true; }
+		public static function permission_customer_or_guest_write(): bool { return true; }
+		public static function permission_logged_in_write(): bool { return true; }
 		public static function validate_guest_token( string $token ): bool { return false; }
 		public static function get_guest_token(): ?string { return null; }
 	}
@@ -99,7 +156,28 @@ namespace YangSheep\Ecommerce\Gateways {
 namespace YangSheep\Ecommerce\Models {
 	final class YSCustomer {
 		public static function find_by_user_id( int $id ): ?object {
-			return 7 === $id ? (object) [ 'id' => 91, 'user_id' => 7 ] : null;
+			if ( 7 === $id ) {
+				return (object) [ 'id' => 91, 'user_id' => 7 ];
+			}
+			return $id > 0 ? (object) [ 'id' => 199, 'user_id' => $id ] : null;
+		}
+	}
+
+	final class YSSubscription {
+		/** @var array<int,object> */
+		public static array $rows = [];
+		public static function find( int $id ): ?object { return self::$rows[ $id ] ?? null; }
+	}
+}
+
+namespace YangSheep\Ecommerce\Shipping {
+	final class YSShippingRegistry {
+		public static bool $allowed = true;
+		/** @var list<array{method:string,items:array<int,array<string,mixed>>}> */
+		public static array $calls = [];
+		public static function is_method_allowed_for_cart( string $method, array $items ): bool {
+			self::$calls[] = [ 'method' => $method, 'items' => $items ];
+			return self::$allowed;
 		}
 	}
 }
@@ -128,8 +206,10 @@ namespace YangSheep\YSCartEcpay\Support {
 
 	final class ShippingMethodOperability {
 		public static function is_operable( string $method ): bool {
-			return 'ys_ec_ecpay_ship_unimart' === $method;
+			return in_array( $method, [ 'ys_ec_ecpay_ship_unimart', 'ys_ec_ecpay_ship_hilife' ], true );
 		}
+		public static function has_operable_method(): bool { return true; }
+		public static function is_configured( string $method ): bool { return self::is_operable( $method ); }
 	}
 }
 
@@ -144,13 +224,14 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 	final class EcpayShippingCatalog {
 		/** @return array<string,mixed>|null */
 		public static function get( string $id ): ?array {
-			if ( 'ys_ec_ecpay_ship_unimart' !== $id ) {
+			if ( ! in_array( $id, [ 'ys_ec_ecpay_ship_unimart', 'ys_ec_ecpay_ship_hilife' ], true ) ) {
 				return null;
 			}
+			$is_unimart = 'ys_ec_ecpay_ship_unimart' === $id;
 			return [
 				'class'               => V035EcpayShipping::class,
 				'logistics_type'      => 'CVS',
-				'logistics_subtype'   => 'UNIMARTC2C',
+				'logistics_subtype'   => $is_unimart ? 'UNIMARTC2C' : 'HILIFEC2C',
 				'requires_store'      => true,
 				'cod_capable'         => true,
 				'temperature'         => 'ROOM',
@@ -159,7 +240,10 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 		}
 		/** @return array<string,string> */
 		public static function map_subtypes(): array {
-			return [ 'ys_ec_ecpay_ship_unimart' => 'UNIMARTC2C' ];
+			return [
+				'ys_ec_ecpay_ship_unimart' => 'UNIMARTC2C',
+				'ys_ec_ecpay_ship_hilife'  => 'HILIFEC2C',
+			];
 		}
 	}
 
@@ -177,6 +261,8 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 }
 
 namespace {
+	use YangSheep\Ecommerce\Models\YSSubscription;
+	use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
 	use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySavedStoreReauthorizer;
 	use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 
@@ -184,6 +270,7 @@ namespace {
 	require_once $root . '/src/Support/CartScope.php';
 	require_once $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
 	require_once $root . '/src/Shipping/Ecpay/EcpaySavedStoreReauthorizer.php';
+	require_once $root . '/src/Plugin.php';
 
 	$pass = 0;
 	$fail = 0;
@@ -269,25 +356,144 @@ namespace {
 			&& null !== $new_replay['error']
 	);
 
-	$saved = EcpaySavedStoreReauthorizer::reauthorize( [
-		'address_id'     => 81,
-		'shipping_id'    => $shipping,
+	YSSubscription::$rows[41] = (object) [
+		'id'         => 41,
+		'user_id'    => 7,
+		'product_id' => 501,
+		'variant_id' => 9,
+		'gateway_id' => $payment,
+		'status'     => 'active',
+	];
+	$plugin = new \YangSheep\YSCartEcpay\Plugin();
+	$saved_route = static function ( array $body ) use ( $plugin ): WP_REST_Response {
+		YSShippingRegistry::$calls = [];
+		return $plugin->ecpay_reauthorize_saved_store( new WP_REST_Request( $body ) );
+	};
+	$saved_base = [
+		'context'         => 'subscription',
+		'subscription_id' => 41,
+		'address_id'      => 81,
+		'shipping_id'     => $shipping,
+	];
+
+	$GLOBALS['v035_user_id'] = 8;
+	$active_other = $saved_route( array_merge( $saved_base, [
+		'cart_scope' => $scope,
 		'payment_method' => $payment,
-		'cart_scope'     => $scope,
-	] );
-	$saved_token = (string) ( $saved['data']['selection_token'] ?? '' );
+	] ) );
+	YSSubscription::$rows[41]->status = 'cancelled';
+	$terminal_other = $saved_route( array_merge( $saved_base, [
+		'cart_scope' => $scope,
+		'payment_method' => $payment,
+	] ) );
+	YSSubscription::$rows[41]->status = 'active';
+	$GLOBALS['v035_user_id'] = 7;
+	$missing = $saved_route( array_merge( $saved_base, [
+		'subscription_id' => 404,
+		'cart_scope' => 'sub_404',
+		'payment_method' => $payment,
+	] ) );
+	$check(
+		'saved route hides missing, active-other and terminal-other subscriptions identically',
+		404 === $missing->get_status()
+			&& 404 === $active_other->get_status()
+			&& 404 === $terminal_other->get_status()
+			&& $missing->data === $active_other->data
+			&& $missing->data === $terminal_other->data
+			&& 'subscription_not_found' === ( $missing->data['code'] ?? '' )
+	);
+
+	YSSubscription::$rows[41]->status = 'cancelled';
+	$terminal_owner = $saved_route( $saved_base );
+	$check(
+		'authorized owner cannot reauthorize a terminal subscription',
+		409 === $terminal_owner->get_status()
+			&& 'subscription_stale' === ( $terminal_owner->data['code'] ?? '' )
+	);
+	YSSubscription::$rows[41]->status = 'active';
+
+	$malformed = $saved_route( array_merge( $saved_base, [
+		'address_id' => [ 81 ],
+	] ) );
+	$check(
+		'saved route rejects malformed fields before subscription product work',
+		400 === $malformed->get_status()
+			&& 'invalid_saved_store_request' === ( $malformed->data['code'] ?? '' )
+			&& [] === YSShippingRegistry::$calls
+	);
+
+	$scope_spoof = $saved_route( array_merge( $saved_base, [
+		'cart_scope' => 'default',
+		'payment_method' => $payment,
+	] ) );
+	$payment_spoof = $saved_route( array_merge( $saved_base, [
+		'cart_scope' => $scope,
+		'payment_method' => 'ys_ec_cod',
+	] ) );
+	$check(
+		'saved route rejects caller scope and payment substitution',
+		409 === $scope_spoof->get_status()
+			&& 'subscription_scope_mismatch' === ( $scope_spoof->data['code'] ?? '' )
+			&& 409 === $payment_spoof->get_status()
+			&& 'subscription_payment_mismatch' === ( $payment_spoof->data['code'] ?? '' )
+	);
+
+	YSShippingRegistry::$allowed = false;
+	$method_restricted = $saved_route( $saved_base );
+	$method_call = YSShippingRegistry::$calls[0] ?? [];
+	$check(
+		'saved route enforces the subscription product and variant shipping restriction',
+		400 === $method_restricted->get_status()
+			&& 'shipping_method_not_allowed' === ( $method_restricted->data['code'] ?? '' )
+			&& $shipping === ( $method_call['method'] ?? '' )
+			&& [ [ 'product_id' => 501, 'variant_id' => 9 ] ] === ( $method_call['items'] ?? null )
+	);
+	YSShippingRegistry::$allowed = true;
+
+	$method_spoof = $saved_route( array_merge( $saved_base, [
+		'shipping_id' => 'ys_ec_ecpay_ship_hilife',
+		'cart_scope' => $scope,
+		'payment_method' => $payment,
+	] ) );
+	$check(
+		'saved address cannot be rebound to another allowed shipping method',
+		409 === $method_spoof->get_status()
+			&& 'saved_store_incompatible' === ( $method_spoof->data['code'] ?? '' )
+	);
+
+	$GLOBALS['v035_user_id'] = 99;
+	$GLOBALS['v035_admin'] = true;
+	$admin_saved = $saved_route( $saved_base );
+	$admin_token = (string) ( $admin_saved->data['data']['selection_token'] ?? '' );
+	$admin_claim = EcpayStoreSelector::claim_selection_authoritative( [
+		'ecpay_store_token' => $admin_token,
+		'cvs_store_id'      => '991122',
+		'cart_scope'        => $scope,
+	], $shipping, $payment );
+	$check(
+		'admin may reauthorize the same server-derived subscription tuple',
+		200 === $admin_saved->get_status()
+			&& '' !== $admin_token
+			&& null === $admin_claim['error']
+	);
+	$GLOBALS['v035_admin'] = false;
+	$GLOBALS['v035_user_id'] = 7;
+
+	$saved = $saved_route( $saved_base );
+	$saved_token = (string) ( $saved->data['data']['selection_token'] ?? '' );
 	$saved_data = [
 		'ecpay_store_token' => $saved_token,
 		'cvs_store_id'      => '991122',
 		'cart_scope'        => $scope,
 	];
 	$check(
-		'saved-store reauthorization returns the same exact subscription tuple',
-		true === ( $saved['success'] ?? false )
+		'saved route derives and returns the exact subscription tuple',
+		200 === $saved->get_status()
 			&& '' !== $saved_token
-			&& $scope === ( $saved['data']['cart_scope'] ?? '' )
-			&& $payment === ( $saved['data']['payment_method'] ?? '' )
-			&& 1 === ( $saved['data']['store_verified'] ?? 0 )
+			&& $scope === ( $saved->data['data']['cart_scope'] ?? '' )
+			&& $payment === ( $saved->data['data']['payment_method'] ?? '' )
+			&& 1 === ( $saved->data['data']['store_verified'] ?? 0 )
+			&& 'no-store, private' === ( $saved->headers['Cache-Control'] ?? '' )
 	);
 	$check(
 		'saved-store token rejects scope and payment substitution without consumption',

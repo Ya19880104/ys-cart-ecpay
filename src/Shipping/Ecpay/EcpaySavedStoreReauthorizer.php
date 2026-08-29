@@ -22,12 +22,17 @@ final class EcpaySavedStoreReauthorizer {
 
 	/**
 	 * @param array<string,mixed> $params
+	 * @param int|null            $owner_user_id Server-authorized address owner; null keeps the current-user checkout path.
 	 * @return array{success:bool,code:string,message:string,status:int,data:array<string,mixed>}
 	 */
-	public static function reauthorize( array $params ): array {
-		$user_id = get_current_user_id();
-		if ( $user_id <= 0 || ! is_user_logged_in() ) {
+	public static function reauthorize( array $params, ?int $owner_user_id = null ): array {
+		$actor_user_id = get_current_user_id();
+		if ( $actor_user_id <= 0 || ! is_user_logged_in() ) {
 			return self::failure( 'authentication_required', '請先登入再使用已儲存的取貨門市。', 401 );
+		}
+		$owner_user_id = $owner_user_id ?? $actor_user_id;
+		if ( $owner_user_id <= 0 ) {
+			return self::failure( 'saved_store_not_found', '找不到可用的收件地址。', 404 );
 		}
 
 		// 🔴 形狀在**認證之後、任何資料庫讀取之前**驗完。
@@ -58,7 +63,7 @@ final class EcpaySavedStoreReauthorizer {
 			return self::failure( 'saved_store_not_found', '找不到可用的收件地址。', 404 );
 		}
 
-		$customer    = YSCustomer::find_by_user_id( $user_id );
+		$customer    = YSCustomer::find_by_user_id( $owner_user_id );
 		$customer_id = is_object( $customer ) ? (int) ( $customer->id ?? 0 ) : 0;
 		if ( $customer_id <= 0 ) {
 			return self::failure( 'saved_store_not_found', '找不到可用的收件地址。', 404 );
@@ -118,7 +123,7 @@ final class EcpaySavedStoreReauthorizer {
 		}
 
 		$principal = EcpayStoreSelector::current_principal( $cart_scope );
-		if ( '' === $principal || 'u:' . $user_id !== $principal ) {
+		if ( '' === $principal || 'u:' . $actor_user_id !== $principal ) {
 			return self::failure( 'authentication_required', '無法確認已儲存門市的擁有者。', 401 );
 		}
 
