@@ -9,6 +9,7 @@ use YangSheep\Ecommerce\Api\Storefront\YSRequestParser;
 use YangSheep\Ecommerce\Api\Storefront\YSRestAuth;
 use YangSheep\Ecommerce\Api\Storefront\YSRestResponder;
 use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
+use YangSheep\Ecommerce\Models\YSSubscription;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Security\YSRateLimiter;
 use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
@@ -771,24 +772,37 @@ final class Plugin {
 		// `sanitize_*`：送 `{"cart_scope":["headless_1"]}` 會發 array-to-string warning、
 		// 變成字串 `Array`，再被正規化成一個**合法但錯誤**的 scope，然後據此解析
 		// principal 並簽發 map session 與 signed form。
-		foreach ( [ 'shipping_id', 'context', 'order_id', 'return_url', 'payment_method' ] as $field ) {
+		foreach ( [ 'shipping_id', 'context', 'subscription_id', 'order_id', 'return_url', 'payment_method' ] as $field ) {
 			if ( array_key_exists( $field, $params ) && ! is_scalar( $params[ $field ] ) ) {
 				return YSRestResponder::error( 'invalid_map_request', '選店請求的參數格式不正確。', 400 );
 			}
 		}
 
-		// `cart_scope` 走 canonical ABI：有提供就必須**已經是** canonical，
-		// 只有完全未提供才用 default。詳見 CartScope。
-		$cart_scope = CartScope::resolve( $params );
-		if ( null === $cart_scope ) {
-			return YSRestResponder::error( 'invalid_cart_scope', self::CART_SCOPE_ERROR, 400 );
+		$shipping_id      = sanitize_text_field( $params['shipping_id'] ?? '' );
+		$context          = sanitize_key( $params['context'] ?? 'checkout' );
+		$order_id         = absint( $params['order_id'] ?? 0 );
+		$return_url       = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
+		$subscription_item = null;
+
+		if ( 'subscription' === $context ) {
+			$subscription_context = $this->subscription_map_context( $params );
+			if ( true !== ( $subscription_context['ok'] ?? false ) ) {
+				return $subscription_context['response'];
+			}
+			$cart_scope        = (string) $subscription_context['cart_scope'];
+			$payment_method    = (string) $subscription_context['payment_method'];
+			$subscription_item = $subscription_context['item'];
+		} else {
+			// `cart_scope` 走 canonical ABI：有提供就必須**已經是** canonical，
+			// 只有完全未提供才用 default。詳見 CartScope。
+			$cart_scope = CartScope::resolve( $params );
+			if ( null === $cart_scope ) {
+				return YSRestResponder::error( 'invalid_cart_scope', self::CART_SCOPE_ERROR, 400 );
+			}
+			$payment_method = '';
 		}
 
-		$shipping_id = sanitize_text_field( $params['shipping_id'] ?? '' );
-		$context     = sanitize_key( $params['context'] ?? 'checkout' );
-		$order_id    = absint( $params['order_id'] ?? 0 );
-		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
-		$principal   = EcpayStoreSelector::current_principal( $cart_scope );
+		$principal = EcpayStoreSelector::current_principal( $cart_scope );
 		if ( '' === $principal ) {
 			return YSRestResponder::error( 'identity_unavailable', '無法辨識目前購物階段，請重新整理後再試。', 401 );
 		}
@@ -807,14 +821,16 @@ final class Plugin {
 		// 🔴 付款方式決定電子地圖要用「代收」還是「不代收」去篩門市，而綠界對兩者
 		// 給的門市清單不同。缺這個欄位不是「預設不代收」，是**無法證明**——
 		// 猜錯的代價是顧客選得到門市、結完帳、送單當下才被綠界拒絕。
-		if ( ! isset( $params['payment_method'] ) ) {
+		if ( 'subscription' !== $context && ! isset( $params['payment_method'] ) ) {
 			return YSRestResponder::error(
 				'missing_payment_method',
 				'缺少付款方式，無法決定電子地圖的代收模式。'
 			);
 		}
 
-		$payment_method = sanitize_text_field( (string) $params['payment_method'] );
+		if ( 'subscription' !== $context ) {
+			$payment_method = sanitize_text_field( (string) $params['payment_method'] );
+		}
 
 		// 🔴 「有帶這個欄位」不等於「帶了一個有效的付款方式」。
 		//
@@ -846,7 +862,10 @@ final class Plugin {
 		// 商品的「允許的物流方式」交集時，可對商品禁用的 sub-type 簽發**已簽章**的
 		// 電子地圖表單——使用者選完門市、callback 也寫進 session 與 localStorage，
 		// 直到送單才被擋。fail-closed：購物車讀取失敗亦視為不允許。
-		if ( ! $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope ) ) {
+		$shipping_allowed = is_array( $subscription_item )
+			? $this->is_shipping_allowed_for_subscription( $shipping_id, $subscription_item )
+			: $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope );
+		if ( ! $shipping_allowed ) {
 			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
 		}
 
@@ -856,6 +875,119 @@ final class Plugin {
 		}
 
 		return YSRestResponder::error( 'map_url_failed', '綠界物流設定尚未完成或不支援此物流方式。' );
+	}
+
+	/**
+	 * Resolve the subscription-owned map tuple from Core authority.
+	 *
+	 * The browser may identify a subscription, but it never chooses the scope,
+	 * payment gateway or product identity used by the provider.  Those values are
+	 * read from the current Core row and caller-supplied copies are accepted only
+	 * when they match exactly.
+	 *
+	 * @param array<string,mixed> $params
+	 * @return array{ok:true,cart_scope:string,payment_method:string,item:array{product_id:int,variant_id:int}}|array{ok:false,response:\WP_REST_Response}
+	 */
+	private function subscription_map_context( array $params ): array {
+		$user_id = get_current_user_id();
+		if ( $user_id <= 0 || ! is_user_logged_in() ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'authentication_required', '請先登入再變更訂閱取貨門市。', 401 ),
+			];
+		}
+
+		if ( ! array_key_exists( 'subscription_id', $params ) || absint( $params['subscription_id'] ) <= 0 ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'missing_subscription_id', '缺少有效的訂閱 ID。', 400 ),
+			];
+		}
+		$subscription_id = absint( $params['subscription_id'] );
+
+		if ( ! class_exists( YSSubscription::class ) || ! method_exists( YSSubscription::class, 'find' ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_context_unavailable', '目前無法驗證訂閱資料，請稍後再試。', 503 ),
+			];
+		}
+
+		try {
+			$subscription = YSSubscription::find( $subscription_id );
+		} catch ( \Throwable $error ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_context_unavailable', '目前無法驗證訂閱資料，請稍後再試。', 503 ),
+			];
+		}
+		if ( ! is_object( $subscription ) || $subscription_id !== (int) ( $subscription->id ?? 0 ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_not_found', '找不到這筆訂閱。', 404 ),
+			];
+		}
+
+		$status = trim( (string) ( $subscription->status ?? '' ) );
+		if ( ! in_array( $status, [ 'pending', 'active', 'on-hold', 'suspended' ], true ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_stale', '這筆訂閱已無法變更取貨門市。', 409 ),
+			];
+		}
+
+		$owner_id = (int) ( $subscription->user_id ?? 0 );
+		$is_admin = function_exists( 'current_user_can' ) && current_user_can( 'manage_options' );
+		if ( $owner_id <= 0 || ( ! $is_admin && $user_id !== $owner_id ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_forbidden', '你沒有權限變更這筆訂閱。', 403 ),
+			];
+		}
+
+		$product_id     = (int) ( $subscription->product_id ?? 0 );
+		$variant_id     = max( 0, (int) ( $subscription->variant_id ?? 0 ) );
+		$payment_method = trim( (string) ( $subscription->gateway_id ?? '' ) );
+		if ( $product_id <= 0 || '' === $payment_method ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_stale', '這筆訂閱缺少可用的商品或付款資料。', 409 ),
+			];
+		}
+
+		$cart_scope = 'sub_' . $subscription_id;
+		if ( array_key_exists( 'cart_scope', $params ) ) {
+			$provided_scope = CartScope::resolve( $params );
+			if ( null === $provided_scope ) {
+				return [
+					'ok'       => false,
+					'response' => YSRestResponder::error( 'invalid_cart_scope', self::CART_SCOPE_ERROR, 400 ),
+				];
+			}
+			if ( $cart_scope !== $provided_scope ) {
+				return [
+					'ok'       => false,
+					'response' => YSRestResponder::error( 'subscription_scope_mismatch', '購物階段與訂閱不相符。', 409 ),
+				];
+			}
+		}
+
+		if ( array_key_exists( 'payment_method', $params )
+			&& $payment_method !== sanitize_text_field( wp_unslash( (string) $params['payment_method'] ) ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'subscription_payment_mismatch', '付款方式與訂閱不相符。', 409 ),
+			];
+		}
+
+		return [
+			'ok'             => true,
+			'cart_scope'     => $cart_scope,
+			'payment_method' => $payment_method,
+			'item'           => [
+				'product_id' => $product_id,
+				'variant_id' => $variant_id,
+			],
+		];
 	}
 
 	public function ecpay_store_result( \WP_REST_Request $request ): \WP_REST_Response {
@@ -1090,6 +1222,20 @@ final class Plugin {
 		}
 
 		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, $items );
+	}
+
+	/**
+	 * Apply Core's existing product shipping restriction to the subscription line.
+	 *
+	 * @param array{product_id:int,variant_id:int} $item
+	 */
+	private function is_shipping_allowed_for_subscription( string $shipping_id, array $item ): bool {
+		if ( ! class_exists( YSShippingRegistry::class )
+			|| ! method_exists( YSShippingRegistry::class, 'is_method_allowed_for_cart' ) ) {
+			return false;
+		}
+
+		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, [ $item ] );
 	}
 
 	/**
