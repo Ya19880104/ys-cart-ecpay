@@ -23,6 +23,7 @@ namespace {
 	/** @var list<array{0:string,1:string}> */
 	$GLOBALS['v037_transient_calls'] = [];
 	$GLOBALS['v037_claim_calls'] = 0;
+	$GLOBALS['v037_swap_to'] = null;
 
 	function absint( mixed $value ): int { return abs( (int) $value ); }
 	function sanitize_text_field( mixed $value ): string { return trim( (string) $value ); }
@@ -86,6 +87,11 @@ namespace {
 		}
 		if ( 'ys_ec_claim_fulfillment_selection_v1' === $hook ) {
 			++$GLOBALS['v037_claim_calls'];
+			// Drift fixture: swap the GLOBAL connection right before the provider
+			// claim runs, exactly as a mid-request reconnect/swap would.
+			if ( is_object( $GLOBALS['v037_swap_to'] ?? null ) ) {
+				$GLOBALS['wpdb'] = $GLOBALS['v037_swap_to'];
+			}
 			return $plugin->claim_fulfillment_selection(
 				$value,
 				is_array( $args[0] ?? null ) ? $args[0] : [],
@@ -110,11 +116,13 @@ namespace {
 		public string $last_error = '';
 		public bool $ready = true;
 		public string $commit_mode = 'ok';
+		public bool $rollback_fail = false;
 		public int $starts = 0;
 		public int $commits = 0;
 		public int $rollbacks = 0;
 		public int $closed = 0;
 		public int $cas_updates = 0;
+		public int $queries_after_close = 0;
 		/** @var array<string,string> */
 		public array $rows = [];
 		/** @var array<string,string> */
@@ -180,6 +188,9 @@ namespace {
 
 		public function get_var( string $sql ): ?string {
 			[ $template, $args ] = $this->decode( $sql );
+			if ( $this->closed > 0 ) {
+				++$this->queries_after_close;
+			}
 			$this->last_error = '';
 			if ( str_contains( $template, 'SELECT option_value FROM' ) ) {
 				return $this->rows[ (string) ( $args[0] ?? '' ) ] ?? null;
@@ -230,6 +241,9 @@ namespace {
 		public function query( string $sql ): int|false {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->statement_log[] = $template;
+			if ( $this->closed > 0 ) {
+				++$this->queries_after_close;
+			}
 			$this->last_error = '';
 			if ( 'START TRANSACTION' === $template ) {
 				++$this->starts;
@@ -238,6 +252,9 @@ namespace {
 			}
 			if ( 'ROLLBACK' === $template ) {
 				++$this->rollbacks;
+				if ( $this->rollback_fail ) {
+					return false;
+				}
 				$this->restore();
 				return 1;
 			}
@@ -499,8 +516,22 @@ namespace {
 
 	$GLOBALS['v037_plugin'] = new Plugin();
 
+	$boundary_class = 'YangSheep\\Ecommerce\\Services\\Subscription\\YSSubscriptionSharedDbBoundary';
+	$reset_boundary = static function () use ( $boundary_class ): void {
+		if ( ! class_exists( $boundary_class ) ) {
+			return;
+		}
+		$reflection = new \ReflectionClass( $boundary_class );
+		foreach ( [ 'poisoned' => false, 'reason' => '' ] as $property_name => $value ) {
+			$property = $reflection->getProperty( $property_name );
+			$property->setAccessible( true );
+			$property->setValue( null, $value );
+		}
+	};
+
+	// Durable rows are keyed by the token DIGEST; raw token bytes never reach DB.
 	$durable_state = static function ( string $token ): string {
-		$bytes = $GLOBALS['wpdb']->rows[ 'ys_ec_ecpay_subsel_' . $token ] ?? null;
+		$bytes = $GLOBALS['wpdb']->rows[ 'ys_ec_ecpay_subsel_' . hash( 'sha256', $token ) ] ?? null;
 		if ( ! is_string( $bytes ) ) {
 			return '';
 		}
@@ -685,6 +716,66 @@ namespace {
 			&& 'issued' === $durable_state( $token )
 			&& 1 === $GLOBALS['wpdb']->rollbacks
 	);
+
+	// ── p6: same-handle fence — a global-connection swap right before the claim
+	//        must never consume on the second handle; the original transaction
+	//        rolls back with generation and token unchanged ──
+	$reset_subscription();
+	$first_pair_wpdb = new V037PairWpdb();
+	$GLOBALS['wpdb'] = $first_pair_wpdb;
+	$token = $mint_token();
+	$second_pair_wpdb = new V037PairWpdb();
+	$GLOBALS['v037_swap_to'] = $second_pair_wpdb;
+	$drift_response = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$GLOBALS['v037_swap_to'] = null;
+	$GLOBALS['wpdb'] = $first_pair_wpdb;
+	$second_handle_updates = array_values( array_filter(
+		$second_pair_wpdb->statement_log,
+		static fn ( string $template ): bool => str_starts_with( $template, 'UPDATE ' )
+	) );
+	$check(
+		'a swapped global handle at claim time consumes nothing: token issued, N unchanged, zero UPDATE on the second handle',
+		false === ( $drift_response['success'] ?? true )
+			&& 3 === $generation()
+			&& 'issued' === $durable_state( $token )
+			&& 0 === $second_pair_wpdb->cas_updates
+			&& [] === $second_handle_updates
+			&& 1 === $first_pair_wpdb->starts
+			&& 1 === $first_pair_wpdb->rollbacks
+	);
+
+	// ── p6b: drift plus an unacknowledged rollback must poison and close the
+	//         ORIGINAL frozen connection — never the swapped-in second handle ──
+	$reset_subscription();
+	$first_pair_wpdb = new V037PairWpdb();
+	$GLOBALS['wpdb'] = $first_pair_wpdb;
+	$token = $mint_token();
+	$second_pair_wpdb = new V037PairWpdb();
+	$first_pair_wpdb->rollback_fail = true;
+	$GLOBALS['v037_swap_to'] = $second_pair_wpdb;
+	$drift_rollback_lost = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$GLOBALS['v037_swap_to'] = null;
+	$first_pair_wpdb->rollback_fail = false;
+	$GLOBALS['wpdb'] = $first_pair_wpdb;
+	$second_updates_after_drift = array_values( array_filter(
+		$second_pair_wpdb->statement_log,
+		static fn ( string $template ): bool => str_starts_with( $template, 'UPDATE ' )
+	) );
+	$check(
+		'drift plus unacknowledged rollback closes only the original frozen handle and stops all work',
+		false === ( $drift_rollback_lost['success'] ?? true )
+			&& 'profile_update_rollback_indeterminate' === ( $drift_rollback_lost['code'] ?? '' )
+			&& 1 === $first_pair_wpdb->closed
+			&& false === $first_pair_wpdb->ready
+			&& 0 === $first_pair_wpdb->queries_after_close
+			&& 0 === $second_pair_wpdb->closed
+			&& true === $second_pair_wpdb->ready
+			&& 0 === $second_pair_wpdb->cas_updates
+			&& [] === $second_updates_after_drift
+			&& 'issued' === $durable_state( $token )
+			&& 3 === $generation()
+	);
+	$reset_boundary();
 
 	// ── p5: a legacy ordinary transient token cannot enter the subscription scope ──
 	$reset_subscription();

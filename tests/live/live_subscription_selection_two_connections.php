@@ -6,7 +6,8 @@
  * issued. Without a real DSN this gate exits 2 and the atomicity claim MUST
  * NOT be reported green.
  *
- * Run: YS_TEST_MYSQL_DSN=host:port php -n tests/live/live_subscription_selection_two_connections.php
+ * Run with a mysqli-enabled PHP (NOT -n, which drops the extension):
+ *   YS_TEST_MYSQL_DSN=host:port php tests/live/live_subscription_selection_two_connections.php
  * Env: YS_TEST_MYSQL_USER (default root), YS_TEST_MYSQL_PASSWORD, YS_TEST_MYSQL_DB (default ys_live_gate)
  */
 
@@ -87,22 +88,38 @@ $check(
 	1 === $rolled_cas && $issued === $after_rollback
 );
 
-// Round 2: A claims inside an open transaction and COMMITs while B races the
-// same CAS on a second connection. Exactly one connection may win.
+// Round 2: A claims inside an open transaction; B races the same CAS on the
+// second connection as a genuinely concurrent MYSQLI_ASYNC statement (a
+// synchronous call here would just park this single PHP thread on A's row
+// lock and time out — that proves nothing). B's UPDATE waits on the row lock,
+// A commits, then B's re-evaluation must see the consumed bytes and lose.
 $a->begin_transaction();
 $win_a = $cas( $a, $table, $name, $issued, $consumed );
 $b->begin_transaction();
-$win_b = $cas( $b, $table, $name, $issued, $consumed ); // blocks until A resolves, then re-evaluates
+$b_sql = "UPDATE `{$table}` SET option_value = '" . $b->real_escape_string( $consumed ) . "'"
+	. " WHERE option_name = '" . $b->real_escape_string( $name ) . "'"
+	. " AND option_value = BINARY '" . $b->real_escape_string( $issued ) . "'";
+$b->query( $b_sql, MYSQLI_ASYNC );
+usleep( 200000 ); // let B genuinely reach A's row lock before A resolves
 $a->commit();
-if ( 0 === $win_b ) {
-	$b->rollback();
-} else {
-	// If B reported a win it must have happened after A rolled back — invalid here.
-	$b->commit();
+$win_b = -1;
+for ( $round = 0; $round < 50; $round++ ) {
+	$links = [ $b ];
+	$errors = [ $b ];
+	$reject = [ $b ];
+	if ( mysqli_poll( $links, $errors, $reject, 0, 200000 ) > 0 ) {
+		$reaped = $b->reap_async_query();
+		$win_b = false === $reaped ? -1 : $b->affected_rows;
+		if ( $reaped instanceof \mysqli_result ) {
+			$reaped->free();
+		}
+		break;
+	}
 }
+$b->rollback();
 $final = $a->query( "SELECT option_value FROM `{$table}` WHERE option_name = '" . $a->real_escape_string( $name ) . "'" )->fetch_row()[0] ?? '';
 $check(
-	'two connections racing the same token produce exactly one committed winner',
+	'two concurrent connections racing the same token produce exactly one committed winner',
 	1 === $win_a && 0 === $win_b && $consumed === $final
 );
 

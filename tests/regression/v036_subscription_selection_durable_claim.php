@@ -321,7 +321,7 @@ namespace {
 			return;
 		}
 		$reflection = new \ReflectionClass( $store_class );
-		$property = $reflection->getProperty( 'engine_proof' );
+		$property = $reflection->getProperty( 'proof_handle' );
 		$property->setAccessible( true );
 		$property->setValue( null, null );
 	};
@@ -430,13 +430,13 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 42, 'profile_generation' => 4 ]
+		[ 'subscription_id' => 42, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$missing_generation = EcpayStoreSelector::claim_selection_authoritative(
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 0 ]
+		[ 'subscription_id' => 41, 'profile_generation' => 0, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$check(
 		'durable claim fails closed without the exact subscription id and target generation fence',
@@ -453,7 +453,7 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4 ]
+		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$claim_statements = array_slice( $GLOBALS['wpdb']->statement_log, $statements_before );
 	$transaction_statements = array_values( array_filter(
@@ -480,7 +480,7 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 5 ]
+		[ 'subscription_id' => 41, 'profile_generation' => 5, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$check(
 		'consumed durable token rejects replay without resurrecting the row',
@@ -502,7 +502,7 @@ namespace {
 		array_merge( $data, [ 'ecpay_store_token' => $raced_token ] ),
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4 ]
+		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$check(
 		'a concurrently consumed durable row loses the byte CAS and the claim is refused',
@@ -525,7 +525,7 @@ namespace {
 		$expired_data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4 ]
+		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
 	);
 	$check(
 		'expired durable selections are rejected read-only and at claim time',
@@ -593,6 +593,59 @@ namespace {
 			&& null === $ordinary_claim['error']
 			&& null !== $ordinary_replay['error']
 			&& $durable_rows_before === count( $GLOBALS['wpdb']->rows )
+	);
+
+	// ── same-handle fence: a swapped global connection never consumes ──
+	$row_state = static function ( string $probe_token ) use ( $durable_row ): string {
+		$row = $durable_row( $probe_token );
+		return is_array( $row ) ? (string) ( $row['state'] ?? '' ) : '';
+	};
+	$drift_token = (string) $issue->invoke( null, $subscription_selection, 'u:7' );
+	$first_wpdb = $GLOBALS['wpdb'];
+	$drift_bytes = (string) ( $first_wpdb->rows[ $durable_name( $drift_token ) ] ?? '' );
+	$second_wpdb = new V036OptionsWpdb();
+	$GLOBALS['wpdb'] = $second_wpdb;
+	$drift_selector = EcpayStoreSelector::claim_selection_authoritative(
+		array_merge( $data, [ 'ecpay_store_token' => $drift_token ] ),
+		$shipping,
+		$payment,
+		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $first_wpdb ]
+	);
+	$drift_store = ! $store_ready ? true : $store_class::claim( $drift_token, $drift_bytes, 41, 4, $first_wpdb );
+	$GLOBALS['wpdb'] = $first_wpdb;
+	$second_updates = array_values( array_filter(
+		$second_wpdb->statement_log,
+		static fn ( string $template ): bool => str_starts_with( $template, 'UPDATE ' )
+	) );
+	$check(
+		'handle drift is fail-closed: neither selector nor store consumes on a second connection',
+		null !== $drift_selector['error']
+			&& false === $drift_store
+			&& 'issued' === $row_state( $drift_token )
+			&& [] === $second_updates
+			&& [] === $second_wpdb->rows
+	);
+
+	// ── store-level defense in depth: subscription id and expiry re-checked at CAS time ──
+	$wrong_sub_direct = ! $store_ready ? false : $store_class::claim( $drift_token, $drift_bytes, 42, 4, $GLOBALS['wpdb'] );
+	$expired_direct_token = (string) $issue->invoke( null, $subscription_selection, 'u:7' );
+	$expired_direct_name = $durable_name( $expired_direct_token );
+	$expired_direct_bytes = '';
+	if ( isset( $GLOBALS['wpdb']->rows[ $expired_direct_name ] ) ) {
+		$expired_direct_row = json_decode( (string) $GLOBALS['wpdb']->rows[ $expired_direct_name ], true );
+		if ( is_array( $expired_direct_row ) ) {
+			$expired_direct_row['record']['expires_at'] = time() - 10;
+			$expired_direct_bytes = (string) json_encode( $expired_direct_row );
+			$GLOBALS['wpdb']->rows[ $expired_direct_name ] = $expired_direct_bytes;
+		}
+	}
+	$expired_direct = ! $store_ready ? false : $store_class::claim( $expired_direct_token, $expired_direct_bytes, 41, 4, $GLOBALS['wpdb'] );
+	$check(
+		'store CAS re-validates the row binding: wrong subscription id and expired rows never consume',
+		false === $wrong_sub_direct
+			&& 'issued' === $row_state( $drift_token )
+			&& false === $expired_direct
+			&& 'issued' === $row_state( $expired_direct_token )
 	);
 
 	echo "v036 subscription durable selection claim: {$pass} PASS / {$fail} FAIL\n";

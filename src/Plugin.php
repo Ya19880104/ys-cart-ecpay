@@ -421,10 +421,22 @@ final class Plugin {
 		}
 
 		if ( 'store_selection' === $claim_type ) {
+			// 訂閱保留 scope 的 durable 認領需要 Core 的交易圍籬（訂閱 id＋CAS 目標
+			// 世代）。只透傳 Core 型別正確的值；selector 端對圍籬缺席一律 fail closed。
+			$fence_context = [];
+			if ( EcpayStoreSelector::subscription_id_from_scope( $request['cart_scope'] ) > 0 ) {
+				$fence_context = [
+					'subscription_id'    => is_int( $context['subscription_id'] ?? null ) ? $context['subscription_id'] : 0,
+					'profile_generation' => is_int( $context['profile_generation'] ?? null ) ? $context['profile_generation'] : 0,
+					// Core 交易起始時凍結的連線物件：selector/store 據此擋 handle drift。
+					'transaction_db'     => is_object( $context['transaction_db'] ?? null ) ? $context['transaction_db'] : null,
+				];
+			}
 			$claimed = EcpayStoreSelector::claim_selection_authoritative(
 				$data,
 				$request['method_id'],
-				$request['payment_method']
+				$request['payment_method'],
+				$fence_context
 			);
 			if ( null !== $claimed['error'] ) {
 				return [ 'handled' => true, 'ok' => false, 'code' => 'claim_rejected', 'message' => (string) $claimed['error'], 'digest' => '' ];

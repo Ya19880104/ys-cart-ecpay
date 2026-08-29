@@ -403,9 +403,10 @@ namespace {
 		echo "FAIL {$label}\n";
 	};
 
-	// Subscription-bound selections are durable options rows, never transients.
+	// Subscription-bound selections are durable options rows keyed by the token
+	// DIGEST (raw token bytes never reach the options table), never transients.
 	$durable_row = static function ( string $token ): ?array {
-		$bytes = $GLOBALS['wpdb']->rows[ 'ys_ec_ecpay_subsel_' . $token ] ?? null;
+		$bytes = $GLOBALS['wpdb']->rows[ 'ys_ec_ecpay_subsel_' . hash( 'sha256', $token ) ] ?? null;
 		if ( ! is_string( $bytes ) ) {
 			return null;
 		}
@@ -626,9 +627,10 @@ namespace {
 	);
 	$pair_claim_context = array_merge( $pair_context, [
 		'selection_digest'   => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
-		// Core merges the CAS target generation into the claim context; the
-		// durable one-use consume is fenced by it.
+		// Core merges the CAS target generation and the frozen transaction
+		// handle into the claim context; the durable consume is fenced by both.
 		'profile_generation' => 4,
+		'transaction_db'     => $GLOBALS['wpdb'],
 	] );
 	$pair_claim = $plugin->claim_fulfillment_selection(
 		[ 'handled' => false ],
@@ -695,7 +697,7 @@ namespace {
 			&& null !== EcpayStoreSelector::verify_selection( $new_data, $shipping, 'ys_ec_cod' )
 			&& null === EcpayStoreSelector::verify_selection( $new_data, $shipping, $payment )
 	);
-	$subscription_fence = [ 'subscription_id' => 41, 'profile_generation' => 4 ];
+	$subscription_fence = [ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ];
 	$new_claim = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
 	$new_replay = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
 	$check(
@@ -857,7 +859,7 @@ namespace {
 		'ecpay_store_token' => $admin_token,
 		'cvs_store_id'      => '991122',
 		'cart_scope'        => $scope,
-	], $shipping, $payment, [ 'subscription_id' => 41, 'profile_generation' => 4 ] );
+	], $shipping, $payment, [ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ] );
 	$check(
 		'admin may reauthorize the same server-derived subscription tuple',
 		200 === $admin_saved->get_status()

@@ -305,6 +305,20 @@ final class EcpayStoreSelector {
 		}
 
 		$token = wp_generate_password( 32, false, false );
+
+		// 🔴 訂閱綁定的選店 authority 走 durable 路徑（fresh map 與 saved reauth
+		// 都會走到這裡）：transient／object cache 的刪除是 ROLLBACK 救不回來的
+		// 外部耐久寫，一次性認領必須能騎乘 Core profile 交易一起 commit/rollback。
+		// 一般結帳維持既有 transient 行為，一個位元組都不動。
+		if ( self::SUBSCRIPTION_AUTHORITY_MARKER === (string) $record['authority_marker'] ) {
+			EcpaySubscriptionSelectionStore::cleanup_expired();
+			$record['expires_at'] = time() + self::SELECTION_TTL;
+			if ( ! EcpaySubscriptionSelectionStore::issue( $token, $record ) ) {
+				return '';
+			}
+			return $token;
+		}
+
 		if ( ! set_transient( self::SELECTION_PREFIX . $token, $record, self::SELECTION_TTL ) ) {
 			return '';
 		}
@@ -407,6 +421,66 @@ final class EcpayStoreSelector {
 	}
 
 	/**
+	 * 讀出這張 token 的 authority 紀錄——**由結帳資料的 cart_scope 決定唯一的
+	 * 儲存來源**：訂閱保留 scope（sub_<id>）只查 durable options 列；其他 scope
+	 * 只查 transient。絕不雙查（雙 authority＝I2 的根因形狀）。
+	 *
+	 * @param array<string,mixed> $data
+	 * @return array{record:?array,durable:bool,state:string,bytes:string,token:string,reject:?string}
+	 */
+	private static function read_selection_authority( array $data ): array {
+		$token   = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
+		$scope   = self::sanitize_cart_scope( (string) ( $data['cart_scope'] ?? 'default' ) );
+		$durable = self::subscription_id_from_scope( $scope ) > 0;
+		$missing = [
+			'record'  => null,
+			'durable' => $durable,
+			'state'   => '',
+			'bytes'   => '',
+			'token'   => $token,
+			'reject'  => '取貨門市的選擇已逾時或無效，請重新選擇門市。',
+		];
+		if ( '' === $token ) {
+			return $missing;
+		}
+
+		if ( ! $durable ) {
+			$record = get_transient( self::SELECTION_PREFIX . $token );
+			if ( ! is_array( $record ) ) {
+				return $missing;
+			}
+			return [
+				'record'  => $record,
+				'durable' => false,
+				'state'   => '',
+				'bytes'   => '',
+				'token'   => $token,
+				'reject'  => null,
+			];
+		}
+
+		$row = EcpaySubscriptionSelectionStore::read( $token );
+		if ( null === $row ) {
+			return $missing;
+		}
+		if ( EcpaySubscriptionSelectionStore::STATE_CONSUMED === $row['state'] ) {
+			$missing['reject'] = '這次的取貨門市選擇已被使用，請重新選擇門市。';
+			return $missing;
+		}
+		if ( (int) ( $row['record']['expires_at'] ?? 0 ) <= time() ) {
+			return $missing;
+		}
+		return [
+			'record'  => $row['record'],
+			'durable' => true,
+			'state'   => $row['state'],
+			'bytes'   => $row['bytes'],
+			'token'   => $token,
+			'reject'  => null,
+		];
+	}
+
+	/**
 	 * 驗證一張門市選擇 token（**只讀，不消耗**）。
 	 *
 	 * 回 `null` 代表通過；回字串代表拒絕的理由，呼叫端據此要求重選。
@@ -428,10 +502,11 @@ final class EcpayStoreSelector {
 			return '請重新選擇取貨門市（缺少門市選擇憑證）。';
 		}
 
-		$record = get_transient( self::SELECTION_PREFIX . $token );
-		if ( ! is_array( $record ) ) {
-			return '取貨門市的選擇已逾時或無效，請重新選擇門市。';
+		$authority = self::read_selection_authority( $data );
+		if ( null !== $authority['reject'] || ! is_array( $authority['record'] ) ) {
+			return $authority['reject'] ?? '取貨門市的選擇已逾時或無效，請重新選擇門市。';
 		}
+		$record = $authority['record'];
 		if ( ! self::has_valid_scope_authority( $record ) ) {
 			return '取貨門市的選擇已逾時或無效，請重新選擇門市。';
 		}
@@ -508,11 +583,11 @@ final class EcpayStoreSelector {
 			return [ 'error' => $rejection, 'store' => [] ];
 		}
 
-		$token  = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
-		$record = get_transient( self::SELECTION_PREFIX . $token );
-		if ( ! is_array( $record ) || 1 !== (int) ( $record['store_verified'] ?? 0 ) ) {
+		$authority = self::read_selection_authority( $data );
+		$record    = $authority['record'];
+		if ( null !== $authority['reject'] || ! is_array( $record ) || 1 !== (int) ( $record['store_verified'] ?? 0 ) ) {
 			return [
-				'error' => '目前無法取得門市的伺服器權威資料，請稍後重新選擇門市。',
+				'error' => $authority['reject'] ?? '目前無法取得門市的伺服器權威資料，請稍後重新選擇門市。',
 				'store' => [],
 			];
 		}
@@ -546,6 +621,34 @@ final class EcpayStoreSelector {
 	}
 
 	/**
+	 * 訂閱 durable 認領的交易圍籬。
+	 *
+	 * Core coordinator 在「已鎖訂閱列＋profile CAS N→N+1 成功」之後、COMMIT 之前
+	 * 呼叫認領，並把目標世代（N+1）與訂閱 id 傳進來。圍籬缺席或不符＝fail
+	 * closed：任何沒有 Core 交易脈絡的呼叫（含 legacy 一般結帳 filter）都不得
+	 * 消耗訂閱綁定的 durable token。
+	 *
+	 * @param array<string,mixed> $claim_context
+	 * @return array{subscription_id:int,target_generation:int,transaction_db:object}|null
+	 */
+	private static function subscription_claim_fence( array $claim_context, array $record ): ?array {
+		$subscription_id   = $claim_context['subscription_id'] ?? null;
+		$target_generation = $claim_context['profile_generation'] ?? null;
+		$transaction_db    = $claim_context['transaction_db'] ?? null;
+		if ( ! is_int( $subscription_id ) || ! is_int( $target_generation )
+			|| ! is_object( $transaction_db )
+			|| $subscription_id < 1 || $target_generation < 1
+			|| $subscription_id !== (int) ( $record['subscription_id'] ?? 0 ) ) {
+			return null;
+		}
+		return [
+			'subscription_id'   => $subscription_id,
+			'target_generation' => $target_generation,
+			'transaction_db'    => $transaction_db,
+		];
+	}
+
+	/**
 	 * 認領，並把**伺服器保存的門市資料**一起交回去。
 	 *
 	 * 🔴 只比對門市代號是不夠的。名稱與地址是跟著代號一起從綠界回來的，但結帳
@@ -556,21 +659,48 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed> $data
 	 * @return array{error:?string,store:array<string,string>}
 	 */
-	public static function claim_selection_authoritative( array $data, string $shipping_id, string $payment_method ): array {
+	public static function claim_selection_authoritative( array $data, string $shipping_id, string $payment_method, array $claim_context = [] ): array {
 		$rejection = self::verify_selection( $data, $shipping_id, $payment_method );
 		if ( null !== $rejection ) {
 			return [ 'error' => $rejection, 'store' => [] ];
 		}
 
-		$token  = trim( (string) ( $data['ecpay_store_token'] ?? '' ) );
-		$record = get_transient( self::SELECTION_PREFIX . $token );
-		$store  = is_array( $record ) ? [
+		$authority = self::read_selection_authority( $data );
+		$record    = $authority['record'];
+		if ( null !== $authority['reject'] || ! is_array( $record ) ) {
+			return [
+				'error' => $authority['reject'] ?? '取貨門市的選擇已逾時或無效，請重新選擇門市。',
+				'store' => [],
+			];
+		}
+		$store = [
 			'cvs_store_id'   => (string) ( $record['store_id'] ?? '' ),
 			'cvs_store_name' => (string) ( $record['store_name'] ?? '' ),
 			'cvs_store_addr' => (string) ( $record['store_address'] ?? '' ),
-		] : [];
+		];
 
-		// 🔴 一次性消耗必須是**原子的**。
+		if ( $authority['durable'] ) {
+			// 🔴 訂閱 durable 認領＝同一 global $wpdb、同一 InnoDB 交易內的
+			// issued→consumed exact BINARY bytes CAS，由 Core 的交易圍籬守門：
+			// Core ROLLBACK 會把這次消耗一起回滾（token 回到 issued），COMMIT 則
+			// 讓 generation N+1 與 consumed 一起耐久——I2 的原子性邊界在這裡。
+			$fence = self::subscription_claim_fence( $claim_context, $record );
+			if ( null === $fence ) {
+				return [ 'error' => '訂閱物流認領缺少有效的交易圍籬，請重新選擇門市。', 'store' => [] ];
+			}
+			if ( ! EcpaySubscriptionSelectionStore::claim(
+				$authority['token'],
+				$authority['bytes'],
+				$fence['subscription_id'],
+				$fence['target_generation'],
+				$fence['transaction_db']
+			) ) {
+				return [ 'error' => '這次的取貨門市選擇已被使用，請重新選擇門市。', 'store' => [] ];
+			}
+			return [ 'error' => null, 'store' => $store ];
+		}
+
+		// 🔴 一般結帳：一次性消耗必須是**原子的**。
 		//
 		// 先 `get_transient()` 驗、再 `delete_transient()` 刪的話，兩個併發的結帳
 		// 會同時通過驗證、同時刪除，兩張訂單共用一次選店。
@@ -580,7 +710,7 @@ final class EcpayStoreSelector {
 		// 這一條在真實的 object cache（Redis／Memcached）與多 process 之下同樣成立：
 		// WordPress 的 `delete_transient()` 最終走到 `wp_cache_delete()` 或
 		// `delete_option()`，兩者對「那一列本來就不在」都回 false。
-		if ( ! delete_transient( self::SELECTION_PREFIX . $token ) ) {
+		if ( ! delete_transient( self::SELECTION_PREFIX . $authority['token'] ) ) {
 			return [ 'error' => '這次的取貨門市選擇已被使用，請重新選擇門市。', 'store' => [] ];
 		}
 
@@ -730,7 +860,13 @@ final class EcpayStoreSelector {
 		// 而且要用**同一個 principal** 才換得到、且只能換一次。
 		$result_code = self::issue_result_code( $store_info, $actor );
 		if ( '' === $result_code ) {
-			delete_transient( self::SELECTION_PREFIX . $store_info['selection_token'] );
+			// 補償要對準這張 token 實際使用的儲存：訂閱 durable 列 vs 一般 transient。
+			// 判斷用 exact marker——任意非空字串不是 durable 的證據。
+			if ( self::SUBSCRIPTION_AUTHORITY_MARKER === (string) ( $token_selection['authority_marker'] ?? '' ) ) {
+				EcpaySubscriptionSelectionStore::delete( (string) $store_info['selection_token'] );
+			} else {
+				delete_transient( self::SELECTION_PREFIX . $store_info['selection_token'] );
+			}
 			wp_die( 'Unable to persist store result.', 'ECPay Store Callback', [ 'response' => 503 ] );
 		}
 
