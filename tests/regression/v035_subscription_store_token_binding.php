@@ -86,8 +86,16 @@ namespace {
 
 	final class V035Wpdb {
 		public string $prefix = 'wp_';
+		public string $options = 'wp_options';
+		public string $last_error = '';
+		public bool $ready = true;
 		/** @var list<mixed> */
 		public array $prepare_args = [];
+		/** @var array<string,string> */
+		public array $rows = [];
+		/** @var array<string,string> */
+		public array $autoload = [];
+		public ?string $engine = 'InnoDB';
 		/** @var array<string,mixed> */
 		public array $address = [
 			'id'                 => 81,
@@ -97,13 +105,112 @@ namespace {
 			'shipping_method_id' => 'ys_ec_ecpay_ship_unimart',
 			'cvs_store_id'       => '991122',
 		];
+
 		public function prepare( string $sql, mixed ...$args ): string {
 			$this->prepare_args = $args;
-			return $sql;
+			return "\x00PREP\x00" . json_encode( [ $sql, $args ] );
 		}
-		/** @return array<string,mixed> */
-		public function get_row( string $sql, string $output ): array {
+
+		/** @return array{0:string,1:list<mixed>} */
+		private function decode( string $sql ): array {
+			if ( str_starts_with( $sql, "\x00PREP\x00" ) ) {
+				$decoded = json_decode( substr( $sql, 6 ), true );
+				return [ (string) ( $decoded[0] ?? '' ), array_values( (array) ( $decoded[1] ?? [] ) ) ];
+			}
+			return [ $sql, [] ];
+		}
+
+		public function esc_like( string $text ): string {
+			return addcslashes( $text, '_%\\' );
+		}
+
+		/** @return array<string,mixed>|object|null */
+		public function get_row( string $sql, string $output = 'OBJECT' ): mixed {
+			[ $template, $args ] = $this->decode( $sql );
+			$this->last_error = '';
+			if ( str_contains( $template, 'SHOW TABLE STATUS WHERE Name' ) ) {
+				if ( null === $this->engine ) {
+					return null;
+				}
+				$row = [ 'Name' => (string) ( $args[0] ?? '' ), 'Engine' => $this->engine ];
+				return ARRAY_A === $output ? $row : (object) $row;
+			}
 			return [ 81, 91 ] === $this->prepare_args ? $this->address : [];
+		}
+
+		public function get_var( string $sql ): ?string {
+			[ $template, $args ] = $this->decode( $sql );
+			$this->last_error = '';
+			if ( str_contains( $template, 'SELECT option_value FROM' ) ) {
+				return $this->rows[ (string) ( $args[0] ?? '' ) ] ?? null;
+			}
+			return null;
+		}
+
+		/** @return list<array<string,string>> */
+		public function get_results( string $sql, string $output = 'OBJECT' ): array {
+			[ $template, $args ] = $this->decode( $sql );
+			$this->last_error = '';
+			unset( $output );
+			if ( ! str_contains( $template, 'SELECT option_name, option_value FROM' ) ) {
+				return [];
+			}
+			$like = (string) ( $args[0] ?? '' );
+			$prefix = str_replace( [ '\\_', '\\%', '\\\\' ], [ '_', '%', '\\' ], rtrim( $like, '%' ) );
+			$limit = (int) ( $args[1] ?? 0 );
+			$found = [];
+			foreach ( $this->rows as $name => $value ) {
+				if ( ! str_starts_with( $name, $prefix ) ) {
+					continue;
+				}
+				$found[] = [ 'option_name' => $name, 'option_value' => $value ];
+				if ( $limit > 0 && count( $found ) >= $limit ) {
+					break;
+				}
+			}
+			return $found;
+		}
+
+		public function insert( string $table, array $data, mixed $format = null ): int|false {
+			unset( $format );
+			$this->last_error = '';
+			if ( $table !== $this->options ) {
+				return false;
+			}
+			$name = (string) ( $data['option_name'] ?? '' );
+			if ( '' === $name || array_key_exists( $name, $this->rows ) ) {
+				$this->last_error = "Duplicate entry '{$name}' for key 'option_name'";
+				return false;
+			}
+			$this->rows[ $name ] = (string) ( $data['option_value'] ?? '' );
+			$this->autoload[ $name ] = (string) ( $data['autoload'] ?? '' );
+			return 1;
+		}
+
+		public function query( string $sql ): int|false {
+			[ $template, $args ] = $this->decode( $sql );
+			$this->last_error = '';
+			if ( str_starts_with( $template, 'UPDATE ' ) && str_contains( $template, 'option_value = BINARY' ) ) {
+				[ $new_value, $name, $old_value ] = [ (string) $args[0], (string) $args[1], (string) $args[2] ];
+				if ( array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
+					$this->rows[ $name ] = $new_value;
+					return 1;
+				}
+				return 0;
+			}
+			if ( str_starts_with( $template, 'DELETE FROM' ) ) {
+				$name = (string) ( $args[0] ?? '' );
+				if ( ! array_key_exists( $name, $this->rows ) ) {
+					return 0;
+				}
+				if ( str_contains( $template, 'option_value = BINARY' )
+					&& $this->rows[ $name ] !== (string) ( $args[1] ?? '' ) ) {
+					return 0;
+				}
+				unset( $this->rows[ $name ], $this->autoload[ $name ] );
+				return 1;
+			}
+			return 0;
 		}
 	}
 	$GLOBALS['wpdb'] = new V035Wpdb();
@@ -276,6 +383,10 @@ namespace {
 
 	$root = dirname( __DIR__, 2 );
 	require_once $root . '/src/Support/CartScope.php';
+	$store_path = $root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php';
+	if ( is_file( $store_path ) ) {
+		require_once $store_path;
+	}
 	require_once $root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
 	require_once $root . '/src/Shipping/Ecpay/EcpaySavedStoreReauthorizer.php';
 	require_once $root . '/src/Plugin.php';
@@ -290,6 +401,23 @@ namespace {
 		}
 		++$fail;
 		echo "FAIL {$label}\n";
+	};
+
+	// Subscription-bound selections are durable options rows, never transients.
+	$durable_row = static function ( string $token ): ?array {
+		$bytes = $GLOBALS['wpdb']->rows[ 'ys_ec_ecpay_subsel_' . $token ] ?? null;
+		if ( ! is_string( $bytes ) ) {
+			return null;
+		}
+		$decoded = json_decode( $bytes, true );
+		return is_array( $decoded ) ? $decoded : null;
+	};
+	$durable_record = static function ( string $token ) use ( $durable_row ): ?array {
+		$row = $durable_row( $token );
+		return is_array( $row ) && is_array( $row['record'] ?? null ) ? $row['record'] : null;
+	};
+	$durable_state = static function ( string $token ) use ( $durable_row ): string {
+		return (string) ( ( $durable_row( $token ) ?? [] )['state'] ?? '' );
 	};
 
 	$shipping = 'ys_ec_ecpay_ship_unimart';
@@ -363,7 +491,7 @@ namespace {
 		'subscription_id'   => 41,
 		'authority_marker'  => 'subscription_fulfillment_v1',
 	], 'u:7' );
-	$new_record = get_transient( 'ys_ec_ecpay_sel_' . $new_token );
+	$new_record = $durable_record( $new_token );
 	$new_data = [
 		'ecpay_store_token' => $new_token,
 		'cvs_store_id'      => '991122',
@@ -371,7 +499,7 @@ namespace {
 	];
 	$new_inspection = EcpayStoreSelector::inspect_selection_authoritative( $new_data, $shipping, $payment );
 	$check(
-		'fresh selection token exposes only its canonical server-owned store tuple',
+		'fresh selection token exposes only its canonical server-owned store tuple from the durable row',
 		'' !== $new_token
 			&& null === $new_inspection['error']
 			&& [
@@ -383,6 +511,8 @@ namespace {
 			&& 'subscription_fulfillment_v1' === ( $new_record['authority_marker'] ?? '' )
 			&& 'subscription' === ( $new_record['context'] ?? '' )
 			&& 41 === ( $new_record['subscription_id'] ?? 0 )
+			&& 'issued' === $durable_state( $new_token )
+			&& false === get_transient( 'ys_ec_ecpay_sel_' . $new_token )
 	);
 
 	$old_token = str_repeat( 'L', 32 );
@@ -467,7 +597,7 @@ namespace {
 		'ordinary checkout scope never treats the generic Core token as an ECPay token',
 		false === ( $ordinary_generic['ok'] ?? true )
 			&& 'store_selection_invalid' === ( $ordinary_generic['code'] ?? '' )
-			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
+			&& 'issued' === $durable_state( $pair_token )
 	);
 
 	$missing_id_generic = $plugin->resolve_fulfillment_selection(
@@ -486,7 +616,7 @@ namespace {
 			&& 'store_selection_invalid' === ( $missing_id_generic['code'] ?? '' )
 			&& false === ( $mismatched_id_generic['ok'] ?? true )
 			&& 'store_selection_invalid' === ( $mismatched_id_generic['code'] ?? '' )
-			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
+			&& 'issued' === $durable_state( $pair_token )
 	);
 
 	$pair_resolution = $plugin->resolve_fulfillment_selection(
@@ -495,7 +625,10 @@ namespace {
 		$pair_context
 	);
 	$pair_claim_context = array_merge( $pair_context, [
-		'selection_digest' => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
+		'selection_digest'   => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
+		// Core merges the CAS target generation into the claim context; the
+		// durable one-use consume is fenced by it.
+		'profile_generation' => 4,
 	] );
 	$pair_claim = $plugin->claim_fulfillment_selection(
 		[ 'handled' => false ],
@@ -516,7 +649,7 @@ namespace {
 			&& '991122' === ( $pair_resolution['selection']['destination']['store_id'] ?? '' )
 			&& true === ( $pair_claim['ok'] ?? false )
 			&& false === ( $pair_replay['ok'] ?? true )
-			&& false === get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
+			&& 'consumed' === $durable_state( $pair_token )
 	);
 
 	$ordinary_scope = 'headless_1';
@@ -562,13 +695,15 @@ namespace {
 			&& null !== EcpayStoreSelector::verify_selection( $new_data, $shipping, 'ys_ec_cod' )
 			&& null === EcpayStoreSelector::verify_selection( $new_data, $shipping, $payment )
 	);
-	$new_claim = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment );
-	$new_replay = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment );
+	$subscription_fence = [ 'subscription_id' => 41, 'profile_generation' => 4 ];
+	$new_claim = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
+	$new_replay = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
 	$check(
 		'fresh selection token claims once under the exact subscription tuple',
 		null === $new_claim['error']
 			&& '991122' === ( $new_claim['store']['cvs_store_id'] ?? '' )
 			&& null !== $new_replay['error']
+			&& 'consumed' === $durable_state( $new_token )
 	);
 
 	YSSubscription::$rows[41] = (object) [
@@ -722,7 +857,7 @@ namespace {
 		'ecpay_store_token' => $admin_token,
 		'cvs_store_id'      => '991122',
 		'cart_scope'        => $scope,
-	], $shipping, $payment );
+	], $shipping, $payment, [ 'subscription_id' => 41, 'profile_generation' => 4 ] );
 	$check(
 		'admin may reauthorize the same server-derived subscription tuple',
 		200 === $admin_saved->get_status()
@@ -734,7 +869,7 @@ namespace {
 
 	$saved = $saved_route( $saved_base );
 	$saved_token = (string) ( $saved->data['data']['selection_token'] ?? '' );
-	$saved_record = get_transient( 'ys_ec_ecpay_sel_' . $saved_token );
+	$saved_record = $durable_record( $saved_token );
 	$saved_data = [
 		'ecpay_store_token' => $saved_token,
 		'cvs_store_id'      => '991122',
@@ -764,13 +899,14 @@ namespace {
 			&& null !== EcpayStoreSelector::verify_selection( $saved_data, $shipping, 'ys_ec_cod' )
 			&& null === EcpayStoreSelector::verify_selection( $saved_data, $shipping, $payment )
 	);
-	$saved_claim = EcpayStoreSelector::claim_selection_authoritative( $saved_data, $shipping, $payment );
-	$saved_replay = EcpayStoreSelector::claim_selection_authoritative( $saved_data, $shipping, $payment );
+	$saved_claim = EcpayStoreSelector::claim_selection_authoritative( $saved_data, $shipping, $payment, $subscription_fence );
+	$saved_replay = EcpayStoreSelector::claim_selection_authoritative( $saved_data, $shipping, $payment, $subscription_fence );
 	$check(
 		'saved-store token claims once under the exact subscription tuple',
 		null === $saved_claim['error']
 			&& 'Canonical Store' === ( $saved_claim['store']['cvs_store_name'] ?? '' )
 			&& null !== $saved_replay['error']
+			&& 'consumed' === $durable_state( $saved_token )
 	);
 
 	echo "\nsubscription store token binding: {$pass} PASS / {$fail} FAIL\n";
