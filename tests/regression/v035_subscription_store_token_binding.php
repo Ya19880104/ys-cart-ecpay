@@ -27,6 +27,9 @@ namespace {
 	function absint( mixed $value ): int { return abs( (int) $value ); }
 	function wp_unslash( mixed $value ): mixed { return $value; }
 	function esc_url_raw( string $url ): string { return $url; }
+	function wp_json_encode( mixed $value, int $flags = 0, int $depth = 512 ): string|false {
+		return json_encode( $value, $flags, $depth );
+	}
 	function get_current_user_id(): int { return (int) $GLOBALS['v035_user_id']; }
 	function is_user_logged_in(): bool { return get_current_user_id() > 0; }
 	function current_user_can( string $capability ): bool {
@@ -222,6 +225,10 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 	final class V035EcpayShipping extends EcpayShipping {}
 
 	final class EcpayShippingCatalog {
+		public const TEMP_ROOM = 'ROOM';
+		public const TEMP_CHILLED = 'CHILLED';
+		public const TEMP_FROZEN = 'FROZEN';
+
 		/** @return array<string,mixed>|null */
 		public static function get( string $id ): ?array {
 			if ( ! in_array( $id, [ 'ys_ec_ecpay_ship_unimart', 'ys_ec_ecpay_ship_hilife' ], true ) ) {
@@ -263,6 +270,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 namespace {
 	use YangSheep\Ecommerce\Models\YSSubscription;
 	use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
+	use YangSheep\YSCartEcpay\Plugin;
 	use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySavedStoreReauthorizer;
 	use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 
@@ -416,6 +424,99 @@ namespace {
 			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $id_token )
 			&& null !== $context_claim['error']
 			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $context_token )
+	);
+
+	$pair_token = (string) $issue->invoke( null, [
+		'shipping_id'       => $shipping,
+		'cvs_type'          => 'UNIMARTC2C',
+		'store_id'          => '991122',
+		'store_name'        => 'Canonical Store',
+		'store_address'     => 'No. 1 Store Rd.',
+		'store_verified'    => 1,
+		'collection_mode'   => 'N',
+		'payment_method'    => $payment,
+		'cart_scope'        => $scope,
+		'context'           => 'subscription',
+		'subscription_id'   => 41,
+		'authority_marker'  => 'subscription_fulfillment_v1',
+	], 'u:7' );
+	$pair_data = [
+		'selection_token'  => $pair_token,
+		'cvs_store_id'     => '991122',
+		'billing_name'     => 'Pair Customer',
+		'billing_phone'    => '0912345678',
+		'billing_country'  => 'TW',
+		// Browser-carried authority-looking fields are intentionally inert.
+		'authority_marker' => 'subscription_fulfillment_v1',
+		'subscription_id'  => 41,
+	];
+	$pair_context = [
+		'method_id'          => $shipping,
+		'payment_method'     => $payment,
+		'cart_scope'         => $scope,
+		'zero_payment_order' => false,
+		'subscription_id'    => 41,
+	];
+	$plugin = new Plugin();
+	$ordinary_generic = $plugin->resolve_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_data,
+		array_merge( $pair_context, [ 'cart_scope' => 'headless_1' ] )
+	);
+	$check(
+		'ordinary checkout scope never treats the generic Core token as an ECPay token',
+		false === ( $ordinary_generic['ok'] ?? true )
+			&& 'store_selection_invalid' === ( $ordinary_generic['code'] ?? '' )
+			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
+	);
+
+	$missing_id_generic = $plugin->resolve_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_data,
+		array_diff_key( $pair_context, [ 'subscription_id' => true ] )
+	);
+	$mismatched_id_generic = $plugin->resolve_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_data,
+		array_merge( $pair_context, [ 'subscription_id' => 42 ] )
+	);
+	$check(
+		'generic Core token requires exact server subscription id and reserved scope binding',
+		false === ( $missing_id_generic['ok'] ?? true )
+			&& 'store_selection_invalid' === ( $missing_id_generic['code'] ?? '' )
+			&& false === ( $mismatched_id_generic['ok'] ?? true )
+			&& 'store_selection_invalid' === ( $mismatched_id_generic['code'] ?? '' )
+			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
+	);
+
+	$pair_resolution = $plugin->resolve_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_data,
+		$pair_context
+	);
+	$pair_claim_context = array_merge( $pair_context, [
+		'selection_digest' => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
+	] );
+	$pair_claim = $plugin->claim_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_resolution['claim'] ?? [],
+		$pair_data,
+		$pair_claim_context
+	);
+	$pair_replay = $plugin->claim_fulfillment_selection(
+		[ 'handled' => false ],
+		$pair_resolution['claim'] ?? [],
+		$pair_data,
+		$pair_claim_context
+	);
+	$check(
+		'actual Plugin resolves and claims a generic Core subscription token exactly once',
+		true === ( $pair_resolution['ok'] ?? false )
+			&& $pair_token === ( $pair_resolution['claim']['token'] ?? '' )
+			&& '991122' === ( $pair_resolution['selection']['destination']['store_id'] ?? '' )
+			&& true === ( $pair_claim['ok'] ?? false )
+			&& false === ( $pair_replay['ok'] ?? true )
+			&& false === get_transient( 'ys_ec_ecpay_sel_' . $pair_token )
 	);
 
 	$ordinary_scope = 'headless_1';

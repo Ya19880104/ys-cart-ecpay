@@ -581,6 +581,20 @@ final class Plugin {
 		$data['payment_method']  = $payment_method;
 		$data['cart_scope']      = $cart_scope;
 
+		// Core keeps provider tokens generic. Adapt that field only after Core's
+		// typed subscription id and reserved scope agree exactly; the selector
+		// still verifies the server-minted marker/id/context record below.
+		$scope_subscription_id = EcpayStoreSelector::subscription_id_from_scope( $cart_scope );
+		$context_subscription_id = is_int( $context['subscription_id'] ?? null )
+			? $context['subscription_id'] : 0;
+		if ( $has_typed_context
+			&& $scope_subscription_id > 0
+			&& $context_subscription_id === $scope_subscription_id
+			&& $cart_scope === 'sub_' . $context_subscription_id
+			&& is_string( $data['selection_token'] ?? null ) ) {
+			$data['ecpay_store_token'] = trim( $data['selection_token'] );
+		}
+
 		return [
 			'data'               => $data,
 			'method_id'          => $method_id,
