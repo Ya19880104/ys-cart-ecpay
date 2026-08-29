@@ -28,6 +28,8 @@ namespace {
 	function current_user_can( string $capability ): bool {
 		return 'manage_options' === $capability && true === $GLOBALS['v034_admin'];
 	}
+	function add_filter( string $hook, callable $callback, int $priority = 10 ): bool { return true; }
+	function remove_filter( string $hook, callable $callback, int $priority = 10 ): bool { return true; }
 
 	final class WP_REST_Request {
 		/** @param array<string,mixed> $body */
@@ -90,6 +92,16 @@ namespace YangSheep\Ecommerce\Models {
 		public static function find( int $id ): ?object {
 			++self::$find_calls;
 			return self::$rows[ $id ] ?? null;
+		}
+	}
+}
+
+namespace YangSheep\Ecommerce\Handlers {
+	final class YSCartHandler {
+		public static function get_instance(): self { return new self(); }
+		/** @return list<array{product_id:int,variant_id:int}> */
+		public function try_get_items_raw(): array {
+			return [ [ 'product_id' => 501, 'variant_id' => 9 ] ];
 		}
 	}
 }
@@ -167,6 +179,12 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 			self::$principal_scopes[] = $scope;
 			$user_id = \get_current_user_id();
 			return $user_id > 0 ? 'u:' . $user_id : '';
+		}
+
+		public static function subscription_id_from_scope( string $scope ): int {
+			return 1 === preg_match( '/^sub_([0-9]+)$/D', $scope, $matches )
+				? max( 0, (int) $matches[1] )
+				: 0;
 		}
 
 		public static function build_map_form_data( mixed ...$args ): array {
@@ -259,6 +277,47 @@ namespace {
 	);
 	YSSubscription::$rows[41]->status = 'active';
 
+	$legacy_base = [
+		'context'        => 'checkout',
+		'shipping_id'    => 'ys_ec_ecpay_ship_unimart',
+		'payment_method' => 'ys_ec_ecpay_credit',
+		'cart_scope'     => 'sub_41',
+		'return_url'     => 'https://shop.example.test/checkout/',
+	];
+	$GLOBALS['v034_user_id'] = 8;
+	$foreign_legacy = $map( $legacy_base );
+	$foreign_calls = EcpayStoreSelector::$map_calls;
+	$foreign_finds = YSSubscription::$find_calls;
+	$GLOBALS['v034_user_id'] = 7;
+	YSSubscription::$rows[41]->status = 'cancelled';
+	$terminal_legacy = $map( $legacy_base );
+	$terminal_calls = EcpayStoreSelector::$map_calls;
+	$terminal_finds = YSSubscription::$find_calls;
+	$check(
+		'foreign and terminal subscription scopes cannot enter the legacy map mint boundary',
+		400 === $foreign_legacy->get_status()
+			&& 'reserved_subscription_scope' === ( $foreign_legacy->data['code'] ?? '' )
+			&& 400 === $terminal_legacy->get_status()
+			&& $foreign_legacy->data === $terminal_legacy->data
+			&& [] === $foreign_calls
+			&& [] === $terminal_calls
+			&& 0 === $foreign_finds
+			&& 0 === $terminal_finds
+	);
+	YSSubscription::$rows[41]->status = 'active';
+
+	$ordinary = $map( array_merge( $legacy_base, [ 'cart_scope' => 'headless_1' ] ) );
+	$ordinary_args = EcpayStoreSelector::$map_calls[0] ?? [];
+	$check(
+		'ordinary checkout scope retains the legacy map flow',
+		200 === $ordinary->get_status()
+			&& 'map_url_ready' === ( $ordinary->data['code'] ?? '' )
+			&& 'checkout' === ( $ordinary_args[1] ?? '' )
+			&& 'headless_1' === ( $ordinary_args[3] ?? '' )
+			&& 0 === ( $ordinary_args[6] ?? -1 )
+			&& 0 === YSSubscription::$find_calls
+	);
+
 	$response = $map( array_merge( $base, [ 'cart_scope' => 'default' ] ) );
 	$check(
 		'caller cannot spoof subscription cart scope',
@@ -301,6 +360,7 @@ namespace {
 				'sub_41',
 				'https://shop.example.test/subscriptions/41',
 				'ys_ec_ecpay_credit',
+				41,
 			] === $args
 			&& [ 'sub_41' ] === EcpayStoreSelector::$principal_scopes
 	);

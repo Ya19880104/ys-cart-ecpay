@@ -45,7 +45,8 @@ final class EcpayStoreSelector {
 		int $order_id = 0,
 		string $cart_scope = 'default',
 		string $return_url = '',
-		string $payment_method = ''
+		string $payment_method = '',
+		int $subscription_id = 0
 	) {
 		$descriptor = EcpayShippingCatalog::get( $shipping_id );
 		$subtypes   = self::subtypes();
@@ -65,6 +66,10 @@ final class EcpayStoreSelector {
 
 		$is_collection = self::resolve_collection_mode( $method, $payment_method );
 		$cart_scope    = self::sanitize_cart_scope( $cart_scope );
+		$authority     = self::scope_authority( $context, $cart_scope, $subscription_id );
+		if ( null === $authority ) {
+			return false;
+		}
 
 		// 🔴 身分要在**這裡**算，不能等到回呼。
 		//
@@ -123,6 +128,8 @@ final class EcpayStoreSelector {
 			'payment_method'    => $payment_method,
 			'is_collection'     => $is_collection,
 			'created_at'        => current_time( 'timestamp' ),
+			'authority_marker'  => $authority['authority_marker'],
+			'subscription_id'   => $authority['subscription_id'],
 		];
 		if ( ! set_transient( 'ys_ec_ecpay_map_' . $temp_id, $map_record, 30 * MINUTE_IN_SECONDS ) ) {
 			return false;
@@ -181,6 +188,9 @@ final class EcpayStoreSelector {
 
 	private const SELECTION_PREFIX = 'ys_ec_ecpay_sel_';
 
+	/** Server-only version marker for subscription-owned map and selection authority. */
+	private const SUBSCRIPTION_AUTHORITY_MARKER = 'subscription_fulfillment_v1';
+
 	/** 門市選擇的有效期（秒）。與地圖 session 一致。 */
 	private const SELECTION_TTL = 30 * MINUTE_IN_SECONDS;
 
@@ -201,7 +211,9 @@ final class EcpayStoreSelector {
 		array $canonical,
 		string $payment_method,
 		string $cart_scope,
-		string $principal
+		string $principal,
+		string $context = 'checkout',
+		int $subscription_id = 0
 	): string {
 		$shipping_id       = trim( $shipping_id );
 		$logistics_subtype = trim( $logistics_subtype );
@@ -211,10 +223,12 @@ final class EcpayStoreSelector {
 		$principal         = trim( $principal );
 		$store_name        = trim( (string) ( $canonical['name'] ?? '' ) );
 		$store_address     = trim( (string) ( $canonical['address'] ?? '' ) );
+		$authority         = self::scope_authority( $context, $cart_scope, $subscription_id );
 
 		$descriptor = EcpayShippingCatalog::get( $shipping_id );
 		$method     = self::instantiate( $shipping_id );
-		if ( null === $descriptor
+		if ( null === $authority
+			|| null === $descriptor
 			|| null === $method
 			|| empty( $descriptor['requires_store'] )
 			|| $logistics_subtype !== (string) ( $descriptor['logistics_subtype'] ?? '' )
@@ -240,6 +254,9 @@ final class EcpayStoreSelector {
 				'collection_mode'   => self::resolve_collection_mode( $method, $payment_method ) ? 'Y' : 'N',
 				'payment_method'    => $payment_method,
 				'cart_scope'        => $cart_scope,
+				'context'           => $context,
+				'authority_marker'  => $authority['authority_marker'],
+				'subscription_id'   => $authority['subscription_id'],
 			],
 			$principal
 		);
@@ -258,8 +275,6 @@ final class EcpayStoreSelector {
 	 * @param string              $principal 由 map session **複製**而來的擁有者識別
 	 */
 	private static function issue_selection_token( array $selection, string $principal ): string {
-		$token = wp_generate_password( 32, false, false );
-
 		$record = [
 			'shipping_id'       => (string) ( $selection['shipping_id'] ?? '' ),
 			'logistics_subtype' => (string) ( $selection['cvs_type'] ?? '' ),
@@ -273,6 +288,9 @@ final class EcpayStoreSelector {
 			// 兩者的門市限制未必相同，而且那本來就是「另一次結帳」。
 			'payment_method'    => (string) ( $selection['payment_method'] ?? '' ),
 			'cart_scope'        => (string) ( $selection['cart_scope'] ?? 'default' ),
+			'context'           => (string) ( $selection['context'] ?? 'checkout' ),
+			'authority_marker'  => (string) ( $selection['authority_marker'] ?? '' ),
+			'subscription_id'   => (int) ( $selection['subscription_id'] ?? 0 ),
 			// 🔴 訪客也要綁。登入者綁 user id；訪客綁購物車 session——沒有它，
 			// 一張 token 誰撿到都能用。
 			//
@@ -282,6 +300,11 @@ final class EcpayStoreSelector {
 			'principal'         => $principal,
 			'issued_at'         => current_time( 'timestamp' ),
 		];
+		if ( ! self::has_valid_scope_authority( $record ) ) {
+			return '';
+		}
+
+		$token = wp_generate_password( 32, false, false );
 		if ( ! set_transient( self::SELECTION_PREFIX . $token, $record, self::SELECTION_TTL ) ) {
 			return '';
 		}
@@ -326,6 +349,64 @@ final class EcpayStoreSelector {
 	}
 
 	/**
+	 * Return the positive subscription id reserved by an exact `sub_<digits>` scope.
+	 *
+	 * Leading-zero spellings remain reserved but cannot become valid authority:
+	 * the exact authority scope is always `sub_` plus the canonical integer.
+	 */
+	public static function subscription_id_from_scope( string $scope ): int {
+		if ( 1 !== preg_match( '/^sub_([0-9]+)$/D', $scope, $matches ) ) {
+			return 0;
+		}
+
+		$subscription_id = (int) $matches[1];
+		return $subscription_id > 0 ? $subscription_id : 0;
+	}
+
+	/**
+	 * Derive server-owned authority fields for a mint boundary.
+	 *
+	 * @return array{authority_marker:string,subscription_id:int}|null
+	 */
+	private static function scope_authority( string $context, string $cart_scope, int $subscription_id ): ?array {
+		$reserved_id = self::subscription_id_from_scope( $cart_scope );
+		if ( $reserved_id > 0 ) {
+			if ( 'subscription' !== $context
+				|| $subscription_id !== $reserved_id
+				|| $cart_scope !== 'sub_' . $subscription_id ) {
+				return null;
+			}
+
+			return [
+				'authority_marker' => self::SUBSCRIPTION_AUTHORITY_MARKER,
+				'subscription_id'  => $subscription_id,
+			];
+		}
+
+		if ( 'subscription' === $context || $subscription_id > 0 ) {
+			return null;
+		}
+
+		return [
+			'authority_marker' => '',
+			'subscription_id'  => 0,
+		];
+	}
+
+	/** @param array<string,mixed> $record */
+	private static function has_valid_scope_authority( array $record ): bool {
+		$context         = (string) ( $record['context'] ?? 'checkout' );
+		$cart_scope      = (string) ( $record['cart_scope'] ?? 'default' );
+		$subscription_id = (int) ( $record['subscription_id'] ?? 0 );
+		$marker          = (string) ( $record['authority_marker'] ?? '' );
+		$authority       = self::scope_authority( $context, $cart_scope, $subscription_id );
+
+		return null !== $authority
+			&& $marker === $authority['authority_marker']
+			&& $subscription_id === $authority['subscription_id'];
+	}
+
+	/**
 	 * 驗證一張門市選擇 token（**只讀，不消耗**）。
 	 *
 	 * 回 `null` 代表通過；回字串代表拒絕的理由，呼叫端據此要求重選。
@@ -351,13 +432,21 @@ final class EcpayStoreSelector {
 		if ( ! is_array( $record ) ) {
 			return '取貨門市的選擇已逾時或無效，請重新選擇門市。';
 		}
+		if ( ! self::has_valid_scope_authority( $record ) ) {
+			return '取貨門市的選擇已逾時或無效，請重新選擇門市。';
+		}
 
 		$method = self::instantiate( $shipping_id );
 		if ( null === $method ) {
 			return '所選的物流方式無效，請重新選擇。';
 		}
 
-		$scope = self::sanitize_cart_scope( (string) ( $data['cart_scope'] ?? 'default' ) );
+		$raw_scope = $data['cart_scope'] ?? 'default';
+		$scope     = self::sanitize_cart_scope( (string) $raw_scope );
+		if ( self::subscription_id_from_scope( $scope ) > 0
+			&& ( ! is_string( $raw_scope ) || $raw_scope !== $scope ) ) {
+			return '取貨門市與目前的購物車不符，請重新選擇門市。';
+		}
 
 		// 🔴 擁有者：登入者綁 user id、訪客綁購物車 session。
 		// 兩邊都必須算得出身分——算不出來就是「證明不了是誰」，一律拒絕。
@@ -534,6 +623,9 @@ final class EcpayStoreSelector {
 		if ( ! is_array( $map_data ) ) {
 			wp_die( 'Invalid map session.', 'ECPay Store Callback', [ 'response' => 400 ] );
 		}
+		if ( ! self::has_valid_scope_authority( $map_data ) ) {
+			wp_die( 'Invalid map session authority.', 'ECPay Store Callback', [ 'response' => 400 ] );
+		}
 
 		if ( ! self::validate_map_owner( $map_data ) ) {
 			wp_die( 'Invalid map session owner.', 'ECPay Store Callback', [ 'response' => 403 ] );
@@ -619,7 +711,10 @@ final class EcpayStoreSelector {
 
 		// 🔴 發 token，權威資料留伺服器。前端只帶這個字串回結帳。
 		// 擁有者識別不放進 $store_info——那份資料會被 JSON 印進回呼頁面。
-		$store_info['selection_token'] = self::issue_selection_token( $store_info, $actor );
+		$token_selection = $store_info;
+		$token_selection['authority_marker'] = (string) ( $map_data['authority_marker'] ?? '' );
+		$token_selection['subscription_id']  = (int) ( $map_data['subscription_id'] ?? 0 );
+		$store_info['selection_token'] = self::issue_selection_token( $token_selection, $actor );
 		if ( '' === $store_info['selection_token'] ) {
 			wp_die( 'Unable to persist store selection.', 'ECPay Store Callback', [ 'response' => 503 ] );
 		}

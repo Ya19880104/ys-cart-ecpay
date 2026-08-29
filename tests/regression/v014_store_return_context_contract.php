@@ -35,7 +35,8 @@ $check(
 );
 
 // 合流後（0.2.15 main）：build_map_form_data 多收 $payment_method（代收模式
-// 仲裁用）——return context 語意不變。
+// 仲裁用）；2.60 subscription bridge 再追加 server-derived $subscription_id。
+// 兩者都不改變 return context 語意。
 //
 // 🔴 2026-08-28：`cart_scope` 改走 canonical ABI，判準集中到 `CartScope::resolve()`
 // （取代先前三份各自漂移的 `sanitize_cart_scope()` 私有副本）。這條斷言原本釘的是舊
@@ -45,7 +46,7 @@ $check(
 	'map route accepts return_url/cart_scope and passes them to selector',
 	strpos( $plugin, "\$cart_scope = CartScope::resolve( \$params )" ) !== false
 		&& strpos( $plugin, "\$return_url  = esc_url_raw" ) !== false
-		&& preg_match( '/build_map_form_data\(\s*\$shipping_id,\s*\$context,\s*\$order_id,\s*\$cart_scope,\s*\$return_url,\s*\$payment_method\s*\)/s', $plugin ) === 1
+		&& preg_match( '/build_map_form_data\(\s*\$shipping_id,\s*\$context,\s*\$order_id,\s*\$cart_scope,\s*\$return_url,\s*\$payment_method,\s*\$subscription_id\s*\)/s', $plugin ) === 1
 );
 
 // 合流後：map transient 與 store payload 的 return context 欄位對齊為 8 空格

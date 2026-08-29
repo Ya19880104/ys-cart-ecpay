@@ -783,6 +783,7 @@ final class Plugin {
 		$order_id         = absint( $params['order_id'] ?? 0 );
 		$return_url  = esc_url_raw( (string) ( $params['return_url'] ?? '' ) );
 		$is_subscription_context = false;
+		$subscription_id = 0;
 
 		if ( 'subscription' === $context ) {
 			$subscription_context = $this->subscription_fulfillment_context( $params, $shipping_id );
@@ -792,6 +793,7 @@ final class Plugin {
 			$shipping_id            = (string) $subscription_context['shipping_id'];
 			$cart_scope             = (string) $subscription_context['cart_scope'];
 			$payment_method         = (string) $subscription_context['payment_method'];
+			$subscription_id        = (int) $subscription_context['subscription_id'];
 			$is_subscription_context = true;
 		} else {
 			// `cart_scope` 走 canonical ABI：有提供就必須**已經是** canonical，
@@ -799,6 +801,9 @@ final class Plugin {
 			$cart_scope = CartScope::resolve( $params );
 			if ( null === $cart_scope ) {
 				return YSRestResponder::error( 'invalid_cart_scope', self::CART_SCOPE_ERROR, 400 );
+			}
+			if ( EcpayStoreSelector::subscription_id_from_scope( $cart_scope ) > 0 ) {
+				return YSRestResponder::error( 'reserved_subscription_scope', '訂閱購物階段必須由訂閱流程授權。', 400 );
 			}
 			$payment_method = '';
 		}
@@ -870,7 +875,7 @@ final class Plugin {
 			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
 		}
 
-		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url, $payment_method );
+		$result = EcpayStoreSelector::build_map_form_data( $shipping_id, $context, $order_id, $cart_scope, $return_url, $payment_method, $subscription_id );
 		if ( $result ) {
 			return YSRestResponder::success( 'map_url_ready', '', $result );
 		}
@@ -887,7 +892,7 @@ final class Plugin {
 	 * when they match exactly.
 	 *
 	 * @param array<string,mixed> $params
-	 * @return array{ok:true,owner_user_id:int,shipping_id:string,cart_scope:string,payment_method:string,item:array{product_id:int,variant_id:int}}|array{ok:false,response:\WP_REST_Response}
+	 * @return array{ok:true,subscription_id:int,owner_user_id:int,shipping_id:string,cart_scope:string,payment_method:string,item:array{product_id:int,variant_id:int}}|array{ok:false,response:\WP_REST_Response}
 	 */
 	private function subscription_fulfillment_context( array $params, string $shipping_id ): array {
 		$user_id = get_current_user_id();
@@ -1003,6 +1008,7 @@ final class Plugin {
 
 		return [
 			'ok'             => true,
+			'subscription_id' => $subscription_id,
 			'owner_user_id'  => $owner_id,
 			'shipping_id'    => $shipping_id,
 			'cart_scope'     => $cart_scope,
@@ -1152,6 +1158,7 @@ final class Plugin {
 	public function ecpay_reauthorize_saved_store( \WP_REST_Request $request ): \WP_REST_Response {
 		$params        = YSRequestParser::params( $request );
 		$owner_user_id = null;
+		$subscription_id = 0;
 
 		if ( array_key_exists( 'context', $params ) && ! is_scalar( $params['context'] ) ) {
 			$response = YSRestResponder::error( 'invalid_saved_store_request', '已儲存門市的重新授權資料格式錯誤。', 400 );
@@ -1178,13 +1185,21 @@ final class Plugin {
 			}
 
 			$owner_user_id           = (int) $authority['owner_user_id'];
+			$subscription_id         = (int) $authority['subscription_id'];
 			$params['shipping_id']    = (string) $authority['shipping_id'];
 			$params['cart_scope']     = (string) $authority['cart_scope'];
 			$params['payment_method'] = (string) $authority['payment_method'];
+		} else {
+			$legacy_scope = CartScope::resolve( $params );
+			if ( is_string( $legacy_scope ) && EcpayStoreSelector::subscription_id_from_scope( $legacy_scope ) > 0 ) {
+				$response = YSRestResponder::error( 'reserved_subscription_scope', '訂閱購物階段必須由訂閱流程授權。', 400 );
+				$response->header( 'Cache-Control', 'no-store, private' );
+				return $response;
+			}
 		}
 
 		try {
-			$result = EcpaySavedStoreReauthorizer::reauthorize( $params, $owner_user_id );
+			$result = EcpaySavedStoreReauthorizer::reauthorize( $params, $owner_user_id, $subscription_id );
 		} catch ( \Throwable $e ) {
 			$result = [
 				'success' => false,

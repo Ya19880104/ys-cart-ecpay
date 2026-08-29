@@ -146,6 +146,12 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
             return self::$anonymous ? '' : 'u:7';
         }
 
+        public static function subscription_id_from_scope(string $scope): int {
+            return 1 === preg_match('/^sub_([0-9]+)$/D', $scope, $matches)
+                ? max(0, (int) $matches[1])
+                : 0;
+        }
+
         public static function claim_result_code(string $code, string $principal): array {
             ++self::$claim_calls;
             return ['error' => null, 'store' => ['store_id' => '001234']];

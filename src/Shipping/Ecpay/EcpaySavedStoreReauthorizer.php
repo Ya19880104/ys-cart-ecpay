@@ -23,9 +23,10 @@ final class EcpaySavedStoreReauthorizer {
 	/**
 	 * @param array<string,mixed> $params
 	 * @param int|null            $owner_user_id Server-authorized address owner; null keeps the current-user checkout path.
+	 * @param int                 $subscription_id Server-authorized subscription id; zero keeps the ordinary checkout path.
 	 * @return array{success:bool,code:string,message:string,status:int,data:array<string,mixed>}
 	 */
-	public static function reauthorize( array $params, ?int $owner_user_id = null ): array {
+	public static function reauthorize( array $params, ?int $owner_user_id = null, int $subscription_id = 0 ): array {
 		$actor_user_id = get_current_user_id();
 		if ( $actor_user_id <= 0 || ! is_user_logged_in() ) {
 			return self::failure( 'authentication_required', '請先登入再使用已儲存的取貨門市。', 401 );
@@ -57,6 +58,12 @@ final class EcpaySavedStoreReauthorizer {
 		$cart_scope = CartScope::resolve( $params );
 		if ( null === $cart_scope ) {
 			return self::failure( 'invalid_saved_store_request', '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。', 400 );
+		}
+		$scope_subscription_id = EcpayStoreSelector::subscription_id_from_scope( $cart_scope );
+		if ( ( $scope_subscription_id > 0
+				&& ( $subscription_id !== $scope_subscription_id || $cart_scope !== 'sub_' . $subscription_id ) )
+			|| ( 0 === $scope_subscription_id && $subscription_id > 0 ) ) {
+			return self::failure( 'reserved_subscription_scope', '訂閱購物階段必須由訂閱流程授權。', 400 );
 		}
 
 		if ( ! class_exists( YSCustomer::class ) || ! method_exists( YSCustomer::class, 'find_by_user_id' ) ) {
@@ -134,7 +141,9 @@ final class EcpaySavedStoreReauthorizer {
 			$canonical,
 			$payment,
 			$cart_scope,
-			$principal
+			$principal,
+			$subscription_id > 0 ? 'subscription' : 'checkout',
+			$subscription_id
 		);
 		if ( '' === $token ) {
 			return self::failure( 'saved_store_token_unavailable', '目前無法建立門市授權，請稍後再試。', 503 );

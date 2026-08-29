@@ -294,7 +294,8 @@ namespace {
 		0,
 		$scope,
 		'https://shop.example.test/subscriptions/41',
-		$payment
+		$payment,
+		41
 	);
 	$map_record = is_array( $map )
 		? get_transient( 'ys_ec_ecpay_map_' . (string) ( $map['temp_id'] ?? '' ) )
@@ -306,6 +307,36 @@ namespace {
 			&& $scope === ( $map_record['cart_scope'] ?? '' )
 			&& $payment === ( $map_record['payment_method'] ?? '' )
 			&& 'u:7' === ( $map_record['actor'] ?? '' )
+			&& 'subscription_fulfillment_v1' === ( $map_record['authority_marker'] ?? '' )
+			&& 41 === ( $map_record['subscription_id'] ?? 0 )
+	);
+	$legacy_selector_map = EcpayStoreSelector::build_map_form_data(
+		$shipping,
+		'checkout',
+		0,
+		$scope,
+		'https://shop.example.test/checkout/',
+		$payment
+	);
+	$check(
+		'reserved subscription scope is closed at the selector map mint boundary',
+		false === $legacy_selector_map
+	);
+
+	$authority_check = new \ReflectionMethod( EcpayStoreSelector::class, 'has_valid_scope_authority' );
+	$authority_check->setAccessible( true );
+	$old_map_record = is_array( $map_record ) ? $map_record : [];
+	unset( $old_map_record['authority_marker'], $old_map_record['subscription_id'] );
+	$id_map_record = is_array( $map_record ) ? $map_record : [];
+	$id_map_record['subscription_id'] = 42;
+	$context_map_record = is_array( $map_record ) ? $map_record : [];
+	$context_map_record['context'] = 'checkout';
+	$check(
+		'subscription map sessions require marker, exact id and exact context',
+		true === $authority_check->invoke( null, $map_record )
+			&& false === $authority_check->invoke( null, $old_map_record )
+			&& false === $authority_check->invoke( null, $id_map_record )
+			&& false === $authority_check->invoke( null, $context_map_record )
 	);
 
 	$issue = new \ReflectionMethod( EcpayStoreSelector::class, 'issue_selection_token' );
@@ -320,7 +351,11 @@ namespace {
 		'collection_mode'   => 'N',
 		'payment_method'    => $payment,
 		'cart_scope'        => $scope,
+		'context'           => 'subscription',
+		'subscription_id'   => 41,
+		'authority_marker'  => 'subscription_fulfillment_v1',
 	], 'u:7' );
+	$new_record = get_transient( 'ys_ec_ecpay_sel_' . $new_token );
 	$new_data = [
 		'ecpay_store_token' => $new_token,
 		'cvs_store_id'      => '991122',
@@ -336,6 +371,80 @@ namespace {
 				'store_name' => 'Canonical Store',
 				'store_address' => 'No. 1 Store Rd.',
 			] === $new_inspection['store']
+			&& is_array( $new_record )
+			&& 'subscription_fulfillment_v1' === ( $new_record['authority_marker'] ?? '' )
+			&& 'subscription' === ( $new_record['context'] ?? '' )
+			&& 41 === ( $new_record['subscription_id'] ?? 0 )
+	);
+
+	$old_token = str_repeat( 'L', 32 );
+	$old_record = is_array( $new_record ) ? $new_record : [];
+	unset( $old_record['authority_marker'], $old_record['subscription_id'], $old_record['context'] );
+	set_transient( 'ys_ec_ecpay_sel_' . $old_token, $old_record, 1800 );
+	$old_data = array_merge( $new_data, [
+		'ecpay_store_token' => $old_token,
+		'authority_marker'  => 'subscription_fulfillment_v1',
+		'context'           => 'subscription',
+		'subscription_id'   => 41,
+	] );
+	$old_rejection = EcpayStoreSelector::verify_selection( $old_data, $shipping, $payment );
+	$old_claim = EcpayStoreSelector::claim_selection_authoritative( $old_data, $shipping, $payment );
+
+	$id_token = str_repeat( 'I', 32 );
+	$id_record = is_array( $new_record ) ? $new_record : [];
+	$id_record['authority_marker'] = 'subscription_fulfillment_v1';
+	$id_record['context'] = 'subscription';
+	$id_record['subscription_id'] = 42;
+	set_transient( 'ys_ec_ecpay_sel_' . $id_token, $id_record, 1800 );
+	$id_data = array_merge( $new_data, [ 'ecpay_store_token' => $id_token ] );
+	$id_rejection = EcpayStoreSelector::verify_selection( $id_data, $shipping, $payment );
+
+	$context_token = str_repeat( 'C', 32 );
+	$context_record = is_array( $new_record ) ? $new_record : [];
+	$context_record['authority_marker'] = 'subscription_fulfillment_v1';
+	$context_record['context'] = 'checkout';
+	$context_record['subscription_id'] = 41;
+	set_transient( 'ys_ec_ecpay_sel_' . $context_token, $context_record, 1800 );
+	$context_data = array_merge( $new_data, [ 'ecpay_store_token' => $context_token ] );
+	$context_claim = EcpayStoreSelector::claim_selection_authoritative( $context_data, $shipping, $payment );
+	$check(
+		'reserved subscription tokens require server marker, exact id and exact context',
+		null !== $old_rejection
+			&& null !== $old_claim['error']
+			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $old_token )
+			&& null !== $id_rejection
+			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $id_token )
+			&& null !== $context_claim['error']
+			&& false !== get_transient( 'ys_ec_ecpay_sel_' . $context_token )
+	);
+
+	$ordinary_scope = 'headless_1';
+	$ordinary_token = (string) $issue->invoke( null, [
+		'shipping_id'       => $shipping,
+		'cvs_type'          => 'UNIMARTC2C',
+		'store_id'          => '991122',
+		'store_name'        => 'Canonical Store',
+		'store_address'     => 'No. 1 Store Rd.',
+		'store_verified'    => 1,
+		'collection_mode'   => 'N',
+		'payment_method'    => $payment,
+		'cart_scope'        => $ordinary_scope,
+		'context'           => 'checkout',
+	], 'u:7' );
+	$ordinary_data = [
+		'ecpay_store_token' => $ordinary_token,
+		'cvs_store_id'      => '991122',
+		'cart_scope'        => $ordinary_scope,
+	];
+	$ordinary_verify = EcpayStoreSelector::verify_selection( $ordinary_data, $shipping, $payment );
+	$ordinary_claim = EcpayStoreSelector::claim_selection_authoritative( $ordinary_data, $shipping, $payment );
+	$ordinary_replay = EcpayStoreSelector::claim_selection_authoritative( $ordinary_data, $shipping, $payment );
+	$check(
+		'ordinary checkout token remains backward compatible and one-use',
+		'' !== $ordinary_token
+			&& null === $ordinary_verify
+			&& null === $ordinary_claim['error']
+			&& null !== $ordinary_replay['error']
 	);
 	$check(
 		'fresh selection token rejects scope and payment substitution without consumption',
@@ -344,6 +453,11 @@ namespace {
 			$shipping,
 			$payment
 		)
+			&& null !== EcpayStoreSelector::verify_selection(
+				array_merge( $new_data, [ 'cart_scope' => 'SUB_41' ] ),
+				$shipping,
+				$payment
+			)
 			&& null !== EcpayStoreSelector::verify_selection( $new_data, $shipping, 'ys_ec_cod' )
 			&& null === EcpayStoreSelector::verify_selection( $new_data, $shipping, $payment )
 	);
@@ -375,6 +489,44 @@ namespace {
 		'address_id'      => 81,
 		'shipping_id'     => $shipping,
 	];
+	$legacy_saved_base = [
+		'context'        => 'checkout',
+		'address_id'     => 81,
+		'shipping_id'    => $shipping,
+		'payment_method' => $payment,
+		'cart_scope'     => $scope,
+	];
+	$GLOBALS['v035_user_id'] = 8;
+	$foreign_reserved_legacy = $saved_route( $legacy_saved_base );
+	$GLOBALS['v035_user_id'] = 7;
+	YSSubscription::$rows[41]->status = 'cancelled';
+	$reserved_legacy = $saved_route( $legacy_saved_base );
+	$check(
+		'foreign and terminal subscription scopes cannot enter the legacy saved-store mint boundary',
+		400 === $reserved_legacy->get_status()
+			&& 'reserved_subscription_scope' === ( $reserved_legacy->data['code'] ?? '' )
+			&& '' === ( $reserved_legacy->data['data']['selection_token'] ?? '' )
+			&& 400 === $foreign_reserved_legacy->get_status()
+			&& $reserved_legacy->data === $foreign_reserved_legacy->data
+	);
+	YSSubscription::$rows[41]->status = 'active';
+
+	$ordinary_saved = $saved_route( array_merge( $legacy_saved_base, [ 'cart_scope' => $ordinary_scope ] ) );
+	$ordinary_saved_token = (string) ( $ordinary_saved->data['data']['selection_token'] ?? '' );
+	$ordinary_saved_data = [
+		'ecpay_store_token' => $ordinary_saved_token,
+		'cvs_store_id'      => '991122',
+		'cart_scope'        => $ordinary_scope,
+	];
+	$ordinary_saved_claim = EcpayStoreSelector::claim_selection_authoritative( $ordinary_saved_data, $shipping, $payment );
+	$ordinary_saved_replay = EcpayStoreSelector::claim_selection_authoritative( $ordinary_saved_data, $shipping, $payment );
+	$check(
+		'ordinary checkout saved-store flow remains available and one-use',
+		200 === $ordinary_saved->get_status()
+			&& '' !== $ordinary_saved_token
+			&& null === $ordinary_saved_claim['error']
+			&& null !== $ordinary_saved_replay['error']
+	);
 
 	$GLOBALS['v035_user_id'] = 8;
 	$active_other = $saved_route( array_merge( $saved_base, [
@@ -481,6 +633,7 @@ namespace {
 
 	$saved = $saved_route( $saved_base );
 	$saved_token = (string) ( $saved->data['data']['selection_token'] ?? '' );
+	$saved_record = get_transient( 'ys_ec_ecpay_sel_' . $saved_token );
 	$saved_data = [
 		'ecpay_store_token' => $saved_token,
 		'cvs_store_id'      => '991122',
@@ -494,6 +647,11 @@ namespace {
 			&& $payment === ( $saved->data['data']['payment_method'] ?? '' )
 			&& 1 === ( $saved->data['data']['store_verified'] ?? 0 )
 			&& 'no-store, private' === ( $saved->headers['Cache-Control'] ?? '' )
+			&& ! array_key_exists( 'authority_marker', $saved->data['data'] ?? [] )
+			&& is_array( $saved_record )
+			&& 'subscription_fulfillment_v1' === ( $saved_record['authority_marker'] ?? '' )
+			&& 'subscription' === ( $saved_record['context'] ?? '' )
+			&& 41 === ( $saved_record['subscription_id'] ?? 0 )
 	);
 	$check(
 		'saved-store token rejects scope and payment substitution without consumption',
