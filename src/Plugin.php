@@ -426,10 +426,15 @@ final class Plugin {
 			$fence_context = [];
 			if ( EcpayStoreSelector::subscription_id_from_scope( $request['cart_scope'] ) > 0 ) {
 				$fence_context = [
-					'subscription_id'    => is_int( $context['subscription_id'] ?? null ) ? $context['subscription_id'] : 0,
-					'profile_generation' => is_int( $context['profile_generation'] ?? null ) ? $context['profile_generation'] : 0,
+					'subscription_id'       => is_int( $context['subscription_id'] ?? null ) ? $context['subscription_id'] : 0,
+					'profile_generation'    => is_int( $context['profile_generation'] ?? null ) ? $context['profile_generation'] : 0,
 					// Core 交易起始時凍結的連線物件：selector/store 據此擋 handle drift。
-					'transaction_db'     => is_object( $context['transaction_db'] ?? null ) ? $context['transaction_db'] : null,
+					'transaction_db'        => is_object( $context['transaction_db'] ?? null ) ? $context['transaction_db'] : null,
+					// Core 凍結的實體 session 原始值：物件不是 session 證明，
+					// consume UPDATE 以這三個 exact 值做同 statement fence。
+					'session_connection_id' => is_string( $context['session_connection_id'] ?? null ) ? $context['session_connection_id'] : '',
+					'session_database'      => is_string( $context['session_database'] ?? null ) ? $context['session_database'] : '',
+					'session_owner_nonce'   => is_string( $context['session_owner_nonce'] ?? null ) ? $context['session_owner_nonce'] : '',
 				];
 			}
 			$claimed = EcpayStoreSelector::claim_selection_authoritative(

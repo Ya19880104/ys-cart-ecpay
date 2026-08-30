@@ -35,6 +35,18 @@ final class EcpaySubscriptionSelectionStore {
 	public const STATE_CONSUMED = 'consumed';
 
 	/**
+	 * 實體 session fence（跨 repo 契約，拼法與 Core
+	 * YSSubscription::PROFILE_SESSION_FENCE_SQL_V1 逐字相同）：同一個 PHP wpdb
+	 * 物件不等於同一條 MySQL session——errno 2006 時 wpdb 會自動重連並在**新
+	 * session**（autocommit、Core 交易已消失）上重送同一句 SQL。consume UPDATE
+	 * 因此把 Core 凍結的 CONNECTION_ID／DATABASE／@ys_profile_tx_owner nonce 放進
+	 * 同一句 statement 的 predicate：重送必然 0 列，token 絕不會在交易外被消耗。
+	 */
+	public const PROFILE_SESSION_FENCE_SQL_V1 = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
+
+	/**
 	 * Per-request memo of the InnoDB proof，**綁定 exact handle＋options 表名**：
 	 * global $wpdb 被換掉（drift）或表名不同時，memo 失效並重新驗證。
 	 * WeakReference：物件身分不能拿 spl_object_id 之類可重用的鍵來記。
@@ -173,15 +185,51 @@ final class EcpaySubscriptionSelectionStore {
 	 * transaction control，也不換 handle。rows=1 才算贏；0＝已被消耗或位元組
 	 * 已變（併發輸家），呼叫端據此拒絕並回滾自己的 CAS。
 	 */
-	public static function claim( string $token, string $expected_bytes, int $subscription_id, int $target_generation, ?object $expected_handle = null ): bool {
-		// same-handle fence：認領必須發生在 Core 凍結的那一條連線上；缺席或
-		// global 已 drift 都 fail closed——不得在第二條連線上消耗。
-		if ( ! is_object( $expected_handle ) ) {
+	/**
+	 * 驗證 Core 交易圍籬（物件＋實體 session 原始值）；無效＝null＝fail closed。
+	 *
+	 * @param array<string,mixed> $session_fence
+	 * @return array{transaction_db:object,connection_id:string,database:string,owner_nonce:string}|null
+	 */
+	private static function claim_session_fence( array $session_fence ): ?array {
+		$transaction_db = $session_fence['transaction_db'] ?? null;
+		$connection_id  = $session_fence['connection_id'] ?? null;
+		$database       = $session_fence['database'] ?? null;
+		$owner_nonce    = $session_fence['owner_nonce'] ?? null;
+		if ( ! is_object( $transaction_db )
+			|| ! is_string( $connection_id ) || 1 !== preg_match( '/^[0-9]{1,20}$/D', $connection_id )
+			|| ! is_string( $database ) || '' === $database || strlen( $database ) > 64
+			|| ! is_string( $owner_nonce ) || 1 !== preg_match( '/^[a-f0-9]{32}$/D', $owner_nonce ) ) {
+			return null;
+		}
+		return [
+			'transaction_db' => $transaction_db,
+			'connection_id'  => $connection_id,
+			'database'       => $database,
+			'owner_nonce'    => $owner_nonce,
+		];
+	}
+
+	/**
+	 * issued→consumed 的 exact BINARY bytes CAS，帶實體 session fence。
+	 *
+	 * 必須在呼叫端（Core coordinator）已開啟的交易內、同一條凍結連線上執行：
+	 * 這裡**不**發任何 transaction control，也不換 handle。物件同一性只是第一
+	 * 道便宜圍籬——真正擋 2006 重連重送的是同一句 statement 內的凍結
+	 * CONNECTION_ID／DATABASE／owner nonce predicate。rows=1 才算贏；0＝已被
+	 * 消耗、位元組已變、或 session 已 drift（呼叫端據此拒絕並回滾自己的 CAS，
+	 * 絕不補送）。
+	 *
+	 * @param array<string,mixed> $session_fence Core 凍結的圍籬（物件＋三原始值）。
+	 */
+	public static function claim( string $token, string $expected_bytes, int $subscription_id, int $target_generation, array $session_fence = [] ): bool {
+		$fence = self::claim_session_fence( $session_fence );
+		if ( null === $fence ) {
 			return false;
 		}
-		$wpdb = self::usable_wpdb( $expected_handle );
+		$wpdb = self::usable_wpdb( $fence['transaction_db'] );
 		if ( null === $wpdb || '' === $token || '' === $expected_bytes
-			|| $subscription_id < 1 || $target_generation < 1 || ! self::storage_ready( $expected_handle ) ) {
+			|| $subscription_id < 1 || $target_generation < 1 || ! self::storage_ready( $fence['transaction_db'] ) ) {
 			return false;
 		}
 		$decoded = json_decode( $expected_bytes, true );
@@ -205,10 +253,13 @@ final class EcpaySubscriptionSelectionStore {
 		}
 		$wpdb->last_error = '';
 		$updated = $wpdb->query( $wpdb->prepare(
-			"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = BINARY %s",
+			"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = BINARY %s AND " . self::PROFILE_SESSION_FENCE_SQL_V1,
 			$payload,
 			self::option_name( $token ),
-			$expected_bytes
+			$expected_bytes,
+			$fence['connection_id'],
+			$fence['database'],
+			$fence['owner_nonce']
 		) );
 		return 1 === $updated && '' === (string) ( $wpdb->last_error ?? '' );
 	}

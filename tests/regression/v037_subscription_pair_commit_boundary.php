@@ -219,7 +219,7 @@ namespace {
 		public function get_row( string $sql, string $output = 'OBJECT' ): mixed {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->last_error = '';
-			if ( str_contains( $template, 'CONNECTION_ID() AS cid' ) ) {
+			if ( str_contains( $template, ') AS cid,' ) ) {
 				unset( $args );
 				$row = [
 					'cid'    => (string) $this->session_id,
@@ -918,16 +918,21 @@ namespace {
 	);
 
 	// The fence must be ONE cross-repo spelling: ECPay's consume predicate uses
-	// byte-for-byte the fragment the Core model freezes.
+	// byte-for-byte the fragment the Core model freezes. (The Core model class
+	// cannot be loaded here — this file fakes it — so the Core side is proven
+	// by its distinctive source pieces; the ECPay side by constant equality.)
 	$fence_fragment = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
 	$core_model_source = (string) file_get_contents( $core_root . '/src/Models/YSSubscription.php' );
-	$store_source = (string) file_get_contents( $ecpay_root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php' );
+	$store_fence_class = 'YangSheep\\YSCartEcpay\\Shipping\\Ecpay\\EcpaySubscriptionSelectionStore';
 	$check(
 		'Core model and ECPay store freeze the identical physical-session fence spelling',
-		str_contains( $core_model_source, $fence_fragment )
-			&& str_contains( $store_source, $fence_fragment )
+		defined( $store_fence_class . '::PROFILE_SESSION_FENCE_SQL_V1' )
+			&& constant( $store_fence_class . '::PROFILE_SESSION_FENCE_SQL_V1' ) === $fence_fragment
+			&& str_contains( $core_model_source, 'PROFILE_SESSION_FENCE_SQL_V1' )
+			&& str_contains( $core_model_source, "'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'" )
+			&& str_contains( $core_model_source, '@ys_profile_tx_owner' )
 	);
 
 	// ── p5: a legacy ordinary transient token cannot enter the subscription scope ──

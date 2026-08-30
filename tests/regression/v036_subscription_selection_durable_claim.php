@@ -777,14 +777,17 @@ namespace {
 			&& 'issued' === $row_state( $object_only_token )
 	);
 
-	// The store freezes the provider-proven fence spelling verbatim.
-	$store_source = (string) file_get_contents( $root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php' );
+	// The store freezes the provider-proven fence spelling verbatim (constant
+	// equality: the fragment is authored as a concatenation, so the joined
+	// bytes never appear literally in the source).
 	$fence_fragment = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
 	$check(
-		'the durable store embeds the exact physical-session fence fragment in its consume statement',
-		str_contains( $store_source, $fence_fragment )
+		'the durable store freezes the exact physical-session fence fragment for its consume statement',
+		$store_ready
+			&& defined( $store_class . '::PROFILE_SESSION_FENCE_SQL_V1' )
+			&& constant( $store_class . '::PROFILE_SESSION_FENCE_SQL_V1' ) === $fence_fragment
 	);
 
 	echo "v036 subscription durable selection claim: {$pass} PASS / {$fail} FAIL\n";

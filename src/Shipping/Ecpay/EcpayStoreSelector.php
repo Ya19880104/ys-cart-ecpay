@@ -629,22 +629,33 @@ final class EcpayStoreSelector {
 	 * 消耗訂閱綁定的 durable token。
 	 *
 	 * @param array<string,mixed> $claim_context
-	 * @return array{subscription_id:int,target_generation:int,transaction_db:object}|null
+	 * @return array{subscription_id:int,target_generation:int,transaction_db:object,connection_id:string,database:string,owner_nonce:string}|null
 	 */
 	private static function subscription_claim_fence( array $claim_context, array $record ): ?array {
 		$subscription_id   = $claim_context['subscription_id'] ?? null;
 		$target_generation = $claim_context['profile_generation'] ?? null;
 		$transaction_db    = $claim_context['transaction_db'] ?? null;
+		// 實體 session 原始值：物件不是 session 證明（2006 重連＝同物件、新
+		// session），凍結的 CONNECTION_ID／DATABASE／owner nonce 缺一即 fail closed。
+		$connection_id = $claim_context['session_connection_id'] ?? null;
+		$database      = $claim_context['session_database'] ?? null;
+		$owner_nonce   = $claim_context['session_owner_nonce'] ?? null;
 		if ( ! is_int( $subscription_id ) || ! is_int( $target_generation )
 			|| ! is_object( $transaction_db )
 			|| $subscription_id < 1 || $target_generation < 1
-			|| $subscription_id !== (int) ( $record['subscription_id'] ?? 0 ) ) {
+			|| $subscription_id !== (int) ( $record['subscription_id'] ?? 0 )
+			|| ! is_string( $connection_id ) || 1 !== preg_match( '/^[0-9]{1,20}$/D', $connection_id )
+			|| ! is_string( $database ) || '' === $database || strlen( $database ) > 64
+			|| ! is_string( $owner_nonce ) || 1 !== preg_match( '/^[a-f0-9]{32}$/D', $owner_nonce ) ) {
 			return null;
 		}
 		return [
 			'subscription_id'   => $subscription_id,
 			'target_generation' => $target_generation,
 			'transaction_db'    => $transaction_db,
+			'connection_id'     => $connection_id,
+			'database'          => $database,
+			'owner_nonce'       => $owner_nonce,
 		];
 	}
 
@@ -693,7 +704,12 @@ final class EcpayStoreSelector {
 				$authority['bytes'],
 				$fence['subscription_id'],
 				$fence['target_generation'],
-				$fence['transaction_db']
+				[
+					'transaction_db' => $fence['transaction_db'],
+					'connection_id'  => $fence['connection_id'],
+					'database'       => $fence['database'],
+					'owner_nonce'    => $fence['owner_nonce'],
+				]
 			) ) {
 				return [ 'error' => '這次的取貨門市選擇已被使用，請重新選擇門市。', 'store' => [] ];
 			}
