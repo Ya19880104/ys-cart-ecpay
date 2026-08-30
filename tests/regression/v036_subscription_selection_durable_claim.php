@@ -87,6 +87,29 @@ namespace {
 		public array $statement_log = [];
 		/** @var list<mixed> */
 		public array $prepare_args = [];
+		// Physical-session model: same PHP object, changeable MySQL session.
+		public int $session_id = 7101;
+		public string $dbname = 'wp_test_db';
+		/** @var array<string,string> */
+		public array $session_vars = [];
+		public bool $drop_on_next_update = false;
+
+		public function reconnect(): void {
+			++$this->session_id;
+			$this->session_vars = [];
+		}
+
+		/** @return array{0:list<mixed>,1:bool} */
+		private function split_fence( string $template, array $args ): array {
+			if ( ! str_contains( $template, 'CONNECTION_ID()' ) ) {
+				return [ $args, true ];
+			}
+			$fence = array_splice( $args, -3 );
+			$ok = (string) ( $fence[0] ?? '' ) === (string) $this->session_id
+				&& (string) ( $fence[1] ?? '' ) === $this->dbname
+				&& (string) ( $fence[2] ?? '' ) === (string) ( $this->session_vars['@ys_profile_tx_owner'] ?? "\x00unset" );
+			return [ $args, $ok ];
+		}
 
 		public function prepare( string $sql, mixed ...$args ): string {
 			$this->prepare_args = $args;
@@ -172,9 +195,20 @@ namespace {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->statement_log[] = $template;
 			$this->last_error = '';
+			if ( str_starts_with( $template, 'SET @ys_profile_tx_owner' ) ) {
+				$this->session_vars['@ys_profile_tx_owner'] = (string) ( $args[0] ?? '' );
+				return 0;
+			}
 			if ( str_starts_with( $template, 'UPDATE ' ) && str_contains( $template, 'option_value = BINARY' ) ) {
+				if ( $this->drop_on_next_update ) {
+					// 2006 on this statement: wpdb reconnects and resends it on
+					// the new session; only the resend's result reaches the caller.
+					$this->drop_on_next_update = false;
+					$this->reconnect();
+				}
+				[ $args, $fence_ok ] = $this->split_fence( $template, $args );
 				[ $new_value, $name, $old_value ] = [ (string) $args[0], (string) $args[1], (string) $args[2] ];
-				if ( array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
+				if ( $fence_ok && array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
 					$this->rows[ $name ] = $new_value;
 					return 1;
 				}
@@ -343,6 +377,48 @@ namespace {
 		) );
 	};
 
+	// The coordinator SETs the owner nonce on the fenced session and hands the
+	// claim exact primitives (connection id / database / nonce), never only the
+	// PHP object: a same object is NOT a same MySQL session.
+	$session_nonce = str_repeat( 'cd', 16 );
+	$GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'] = $session_nonce;
+	$session_fence = static function ( int $subscription_id = 41, int $generation = 4 ) use ( $session_nonce ): array {
+		return [
+			'subscription_id'       => $subscription_id,
+			'profile_generation'    => $generation,
+			'transaction_db'        => $GLOBALS['wpdb'],
+			'session_connection_id' => (string) $GLOBALS['wpdb']->session_id,
+			'session_database'      => $GLOBALS['wpdb']->dbname,
+			'session_owner_nonce'   => $session_nonce,
+		];
+	};
+	$store_fence = static function ( ?object $handle = null, ?string $connection_id = null ) use ( $session_nonce ): array {
+		$db = $handle ?? $GLOBALS['wpdb'];
+		return [
+			'transaction_db' => $db,
+			'connection_id'  => $connection_id ?? (string) $db->session_id,
+			'database'       => $db->dbname,
+			'owner_nonce'    => $session_nonce,
+		];
+	};
+	// RED-safe direct-store invocation: before the correction the claim still
+	// has the object-only signature; calling it with the fence array would be a
+	// TypeError instead of a clean FAIL.
+	$store_claim_accepts_fence = false;
+	if ( $store_ready ) {
+		$claim_parameters = ( new \ReflectionMethod( $store_class, 'claim' ) )->getParameters();
+		$store_claim_accepts_fence = isset( $claim_parameters[4] )
+			&& 'array' === (string) $claim_parameters[4]->getType();
+	}
+	$direct_store_claim = static function ( string $token, string $bytes, int $sub, int $gen, array $fence ) use ( $store_ready, $store_class, $store_claim_accepts_fence ): bool {
+		if ( ! $store_ready || ! $store_claim_accepts_fence ) {
+			// Placeholder TRUE keeps the pre-correction run a clean RED (the
+			// assertions expect FALSE) without fataling on the old signature.
+			return true;
+		}
+		return $store_class::claim( $token, $bytes, $sub, $gen, $fence );
+	};
+
 	$shipping = 'ys_ec_ecpay_ship_unimart';
 	$payment = 'ys_ec_ecpay_credit';
 	$scope = 'sub_41';
@@ -430,13 +506,13 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 42, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence( 42, 4 )
 	);
 	$missing_generation = EcpayStoreSelector::claim_selection_authoritative(
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 0, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence( 41, 0 )
 	);
 	$check(
 		'durable claim fails closed without the exact subscription id and target generation fence',
@@ -453,7 +529,7 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence()
 	);
 	$claim_statements = array_slice( $GLOBALS['wpdb']->statement_log, $statements_before );
 	$transaction_statements = array_values( array_filter(
@@ -480,7 +556,7 @@ namespace {
 		$data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 5, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence( 41, 5 )
 	);
 	$check(
 		'consumed durable token rejects replay without resurrecting the row',
@@ -502,7 +578,7 @@ namespace {
 		array_merge( $data, [ 'ecpay_store_token' => $raced_token ] ),
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence()
 	);
 	$check(
 		'a concurrently consumed durable row loses the byte CAS and the claim is refused',
@@ -525,7 +601,7 @@ namespace {
 		$expired_data,
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
+		$session_fence()
 	);
 	$check(
 		'expired durable selections are rejected read-only and at claim time',
@@ -609,9 +685,16 @@ namespace {
 		array_merge( $data, [ 'ecpay_store_token' => $drift_token ] ),
 		$shipping,
 		$payment,
-		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $first_wpdb ]
+		[
+			'subscription_id'       => 41,
+			'profile_generation'    => 4,
+			'transaction_db'        => $first_wpdb,
+			'session_connection_id' => (string) $first_wpdb->session_id,
+			'session_database'      => $first_wpdb->dbname,
+			'session_owner_nonce'   => $session_nonce,
+		]
 	);
-	$drift_store = ! $store_ready ? true : $store_class::claim( $drift_token, $drift_bytes, 41, 4, $first_wpdb );
+	$drift_store = $direct_store_claim( $drift_token, $drift_bytes, 41, 4, $store_fence( $first_wpdb ) );
 	$GLOBALS['wpdb'] = $first_wpdb;
 	$second_updates = array_values( array_filter(
 		$second_wpdb->statement_log,
@@ -627,7 +710,7 @@ namespace {
 	);
 
 	// ── store-level defense in depth: subscription id and expiry re-checked at CAS time ──
-	$wrong_sub_direct = ! $store_ready ? false : $store_class::claim( $drift_token, $drift_bytes, 42, 4, $GLOBALS['wpdb'] );
+	$wrong_sub_direct = ! $store_claim_accepts_fence ? true : $store_class::claim( $drift_token, $drift_bytes, 42, 4, $store_fence() );
 	$expired_direct_token = (string) $issue->invoke( null, $subscription_selection, 'u:7' );
 	$expired_direct_name = $durable_name( $expired_direct_token );
 	$expired_direct_bytes = '';
@@ -639,13 +722,69 @@ namespace {
 			$GLOBALS['wpdb']->rows[ $expired_direct_name ] = $expired_direct_bytes;
 		}
 	}
-	$expired_direct = ! $store_ready ? false : $store_class::claim( $expired_direct_token, $expired_direct_bytes, 41, 4, $GLOBALS['wpdb'] );
+	$expired_direct = ! $store_claim_accepts_fence ? true : $store_class::claim( $expired_direct_token, $expired_direct_bytes, 41, 4, $store_fence() );
 	$check(
 		'store CAS re-validates the row binding: wrong subscription id and expired rows never consume',
 		false === $wrong_sub_direct
 			&& 'issued' === $row_state( $drift_token )
 			&& false === $expired_direct
 			&& 'issued' === $row_state( $expired_direct_token )
+	);
+
+	// ── physical-session fence: a same PHP object on a NEW MySQL session (2006
+	//    reconnect) must never consume — the fence is a same-statement predicate ──
+	$phys_token = (string) $issue->invoke( null, $subscription_selection, 'u:7' );
+	$phys_data = array_merge( $data, [ 'ecpay_store_token' => $phys_token ] );
+	$fence_at_freeze = $session_fence();
+	$GLOBALS['wpdb']->reconnect();
+	$phys_drift_claim = EcpayStoreSelector::claim_selection_authoritative( $phys_data, $shipping, $payment, $fence_at_freeze );
+	$check(
+		'a claim carrying the frozen session primitives is fenced to zero rows after a reconnect on the same object',
+		null !== $phys_drift_claim['error']
+			&& 'issued' === $row_state( $phys_token )
+	);
+
+	// The same token stays claimable once a healthy fenced session exists again.
+	$GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'] = $session_nonce;
+	$GLOBALS['wpdb']->drop_on_next_update = true;
+	$fence_before_2006 = $session_fence();
+	$phys_retry_claim = EcpayStoreSelector::claim_selection_authoritative( $phys_data, $shipping, $payment, $fence_before_2006 );
+	$check(
+		'a consume UPDATE resent after 2006 on the same object matches zero rows and never consumes',
+		null !== $phys_retry_claim['error']
+			&& 'issued' === $row_state( $phys_token )
+	);
+
+	$GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'] = $session_nonce;
+	$phys_recover_claim = EcpayStoreSelector::claim_selection_authoritative( $phys_data, $shipping, $payment, $session_fence() );
+	$check(
+		'after the drops, a fresh fenced session still consumes the same token exactly once',
+		null === $phys_recover_claim['error']
+			&& 'consumed' === $row_state( $phys_token )
+	);
+
+	// Claims missing the session primitives (object alone) fail closed.
+	$object_only_token = (string) $issue->invoke( null, $subscription_selection, 'u:7' );
+	$object_only_claim = EcpayStoreSelector::claim_selection_authoritative(
+		array_merge( $data, [ 'ecpay_store_token' => $object_only_token ] ),
+		$shipping,
+		$payment,
+		[ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ]
+	);
+	$check(
+		'the connection object alone is not a session proof: claims without exact primitives are refused',
+		null !== $object_only_claim['error']
+			&& 'issued' === $row_state( $object_only_token )
+	);
+
+	// The store freezes the provider-proven fence spelling verbatim.
+	$store_source = (string) file_get_contents( $root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php' );
+	$fence_fragment = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
+	$check(
+		'the durable store embeds the exact physical-session fence fragment in its consume statement',
+		str_contains( $store_source, $fence_fragment )
 	);
 
 	echo "v036 subscription durable selection claim: {$pass} PASS / {$fail} FAIL\n";

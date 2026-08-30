@@ -89,8 +89,24 @@ namespace {
 		public string $options = 'wp_options';
 		public string $last_error = '';
 		public bool $ready = true;
+		public int $session_id = 6101;
+		public string $dbname = 'wp_test_db';
+		/** @var array<string,string> */
+		public array $session_vars = [];
 		/** @var list<mixed> */
 		public array $prepare_args = [];
+
+		/** @return array{0:list<mixed>,1:bool} */
+		private function split_fence( string $template, array $args ): array {
+			if ( ! str_contains( $template, 'CONNECTION_ID()' ) ) {
+				return [ $args, true ];
+			}
+			$fence = array_splice( $args, -3 );
+			$ok = (string) ( $fence[0] ?? '' ) === (string) $this->session_id
+				&& (string) ( $fence[1] ?? '' ) === $this->dbname
+				&& (string) ( $fence[2] ?? '' ) === (string) ( $this->session_vars['@ys_profile_tx_owner'] ?? "\x00unset" );
+			return [ $args, $ok ];
+		}
 		/** @var array<string,string> */
 		public array $rows = [];
 		/** @var array<string,string> */
@@ -191,8 +207,9 @@ namespace {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->last_error = '';
 			if ( str_starts_with( $template, 'UPDATE ' ) && str_contains( $template, 'option_value = BINARY' ) ) {
+				[ $args, $fence_ok ] = $this->split_fence( $template, $args );
 				[ $new_value, $name, $old_value ] = [ (string) $args[0], (string) $args[1], (string) $args[2] ];
-				if ( array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
+				if ( $fence_ok && array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
 					$this->rows[ $name ] = $new_value;
 					return 1;
 				}
@@ -214,6 +231,9 @@ namespace {
 		}
 	}
 	$GLOBALS['wpdb'] = new V035Wpdb();
+	$GLOBALS['wpdb']->session_id = 6101;
+	$GLOBALS['wpdb']->dbname = 'wp_test_db';
+	$GLOBALS['wpdb']->session_vars = [ '@ys_profile_tx_owner' => str_repeat( 'ef', 16 ) ];
 }
 
 namespace YangSheep\Ecommerce\Api\Storefront {
@@ -626,11 +646,14 @@ namespace {
 		$pair_context
 	);
 	$pair_claim_context = array_merge( $pair_context, [
-		'selection_digest'   => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
-		// Core merges the CAS target generation and the frozen transaction
-		// handle into the claim context; the durable consume is fenced by both.
-		'profile_generation' => 4,
-		'transaction_db'     => $GLOBALS['wpdb'],
+		'selection_digest'      => (string) ( $pair_resolution['claim']['selection_digest'] ?? '' ),
+		// Core merges the CAS target generation, the frozen transaction handle
+		// AND the exact physical-session primitives into the claim context.
+		'profile_generation'    => 4,
+		'transaction_db'        => $GLOBALS['wpdb'],
+		'session_connection_id' => (string) $GLOBALS['wpdb']->session_id,
+		'session_database'      => $GLOBALS['wpdb']->dbname,
+		'session_owner_nonce'   => (string) $GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'],
 	] );
 	$pair_claim = $plugin->claim_fulfillment_selection(
 		[ 'handled' => false ],
@@ -697,7 +720,14 @@ namespace {
 			&& null !== EcpayStoreSelector::verify_selection( $new_data, $shipping, 'ys_ec_cod' )
 			&& null === EcpayStoreSelector::verify_selection( $new_data, $shipping, $payment )
 	);
-	$subscription_fence = [ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ];
+	$subscription_fence = [
+		'subscription_id'       => 41,
+		'profile_generation'    => 4,
+		'transaction_db'        => $GLOBALS['wpdb'],
+		'session_connection_id' => (string) $GLOBALS['wpdb']->session_id,
+		'session_database'      => $GLOBALS['wpdb']->dbname,
+		'session_owner_nonce'   => (string) $GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'],
+	];
 	$new_claim = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
 	$new_replay = EcpayStoreSelector::claim_selection_authoritative( $new_data, $shipping, $payment, $subscription_fence );
 	$check(
@@ -859,7 +889,14 @@ namespace {
 		'ecpay_store_token' => $admin_token,
 		'cvs_store_id'      => '991122',
 		'cart_scope'        => $scope,
-	], $shipping, $payment, [ 'subscription_id' => 41, 'profile_generation' => 4, 'transaction_db' => $GLOBALS['wpdb'] ] );
+	], $shipping, $payment, [
+		'subscription_id'       => 41,
+		'profile_generation'    => 4,
+		'transaction_db'        => $GLOBALS['wpdb'],
+		'session_connection_id' => (string) $GLOBALS['wpdb']->session_id,
+		'session_database'      => $GLOBALS['wpdb']->dbname,
+		'session_owner_nonce'   => (string) $GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'],
+	] );
 	$check(
 		'admin may reauthorize the same server-derived subscription tuple',
 		200 === $admin_saved->get_status()

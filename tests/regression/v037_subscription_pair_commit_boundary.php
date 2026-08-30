@@ -24,6 +24,8 @@ namespace {
 	$GLOBALS['v037_transient_calls'] = [];
 	$GLOBALS['v037_claim_calls'] = 0;
 	$GLOBALS['v037_swap_to'] = null;
+	$GLOBALS['v037_drift_before_claim'] = false;
+	$GLOBALS['v037_drift_after_claim'] = false;
 
 	function absint( mixed $value ): int { return abs( (int) $value ); }
 	function sanitize_text_field( mixed $value ): string { return trim( (string) $value ); }
@@ -92,12 +94,25 @@ namespace {
 			if ( is_object( $GLOBALS['v037_swap_to'] ?? null ) ) {
 				$GLOBALS['wpdb'] = $GLOBALS['v037_swap_to'];
 			}
-			return $plugin->claim_fulfillment_selection(
+			// Physical-session drift on the SAME object: the old session (and its
+			// open transaction, holding the Core CAS) dies before the claim runs.
+			if ( true === ( $GLOBALS['v037_drift_before_claim'] ?? false ) ) {
+				$GLOBALS['v037_drift_before_claim'] = false;
+				$GLOBALS['wpdb']->reconnect();
+			}
+			$claim_result = $plugin->claim_fulfillment_selection(
 				$value,
 				is_array( $args[0] ?? null ) ? $args[0] : [],
 				is_array( $args[1] ?? null ) ? $args[1] : [],
 				is_array( $args[2] ?? null ) ? $args[2] : []
 			);
+			// Physical-session drift right AFTER a successful claim: the
+			// coordinator's pre-COMMIT session verify must catch it.
+			if ( true === ( $GLOBALS['v037_drift_after_claim'] ?? false ) ) {
+				$GLOBALS['v037_drift_after_claim'] = false;
+				$GLOBALS['wpdb']->reconnect();
+			}
+			return $claim_result;
 		}
 		return $value;
 	}
@@ -123,6 +138,14 @@ namespace {
 		public int $closed = 0;
 		public int $cas_updates = 0;
 		public int $queries_after_close = 0;
+		// Physical-session model: same PHP object, changeable MySQL session.
+		public int $session_id = 9101;
+		public string $dbname = 'wp_test_db';
+		/** @var array<string,string> */
+		public array $session_vars = [];
+		public bool $drop_on_next_update = false;
+		public bool $drop_on_commit = false;
+		public int $consume_update_evaluations = 0;
 		/** @var array<string,string> */
 		public array $rows = [];
 		/** @var array<string,string> */
@@ -173,9 +196,38 @@ namespace {
 			return true;
 		}
 
+		/** A dropped connection: the old session's txn dies (rolls back), the
+		 *  same object reconnects as a NEW session with empty session vars. */
+		public function reconnect(): void {
+			$this->restore();
+			++$this->session_id;
+			$this->session_vars = [];
+		}
+
+		/** @return array{0:list<mixed>,1:bool} */
+		private function split_fence( string $template, array $args ): array {
+			if ( ! str_contains( $template, 'CONNECTION_ID()' ) ) {
+				return [ $args, true ];
+			}
+			$fence = array_splice( $args, -3 );
+			$ok = (string) ( $fence[0] ?? '' ) === (string) $this->session_id
+				&& (string) ( $fence[1] ?? '' ) === $this->dbname
+				&& (string) ( $fence[2] ?? '' ) === (string) ( $this->session_vars['@ys_profile_tx_owner'] ?? "\x00unset" );
+			return [ $args, $ok ];
+		}
+
 		public function get_row( string $sql, string $output = 'OBJECT' ): mixed {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->last_error = '';
+			if ( str_contains( $template, 'CONNECTION_ID() AS cid' ) ) {
+				unset( $args );
+				$row = [
+					'cid'    => (string) $this->session_id,
+					'dbname' => $this->dbname,
+					'owner'  => $this->session_vars['@ys_profile_tx_owner'] ?? null,
+				];
+				return ARRAY_A === $output ? $row : (object) $row;
+			}
 			if ( str_contains( $template, 'SHOW TABLE STATUS WHERE Name' ) ) {
 				if ( null === $this->engine ) {
 					return null;
@@ -245,6 +297,10 @@ namespace {
 				++$this->queries_after_close;
 			}
 			$this->last_error = '';
+			if ( str_starts_with( $template, 'SET @ys_profile_tx_owner' ) ) {
+				$this->session_vars['@ys_profile_tx_owner'] = (string) ( $args[0] ?? '' );
+				return 0;
+			}
 			if ( 'START TRANSACTION' === $template ) {
 				++$this->starts;
 				$this->capture();
@@ -260,6 +316,12 @@ namespace {
 			}
 			if ( 'COMMIT' === $template ) {
 				++$this->commits;
+				if ( $this->drop_on_commit ) {
+					// 2006 during COMMIT: wpdb reconnects and resends COMMIT on
+					// the new session — a no-op ack while the old txn died.
+					$this->reconnect();
+					return 1;
+				}
 				if ( 'ok' === $this->commit_mode ) {
 					$this->snapshot = null;
 					return 1;
@@ -275,8 +337,16 @@ namespace {
 			}
 			if ( str_starts_with( $template, 'UPDATE ' ) && str_contains( $template, 'option_value = BINARY' ) ) {
 				++$this->cas_updates;
+				++$this->consume_update_evaluations;
+				if ( $this->drop_on_next_update ) {
+					// 2006 on THIS statement: wpdb reconnects and resends it on
+					// the new session; the caller only sees the resend's result.
+					$this->drop_on_next_update = false;
+					$this->reconnect();
+				}
+				[ $args, $fence_ok ] = $this->split_fence( $template, $args );
 				[ $new_value, $name, $old_value ] = [ (string) $args[0], (string) $args[1], (string) $args[2] ];
-				if ( array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
+				if ( $fence_ok && array_key_exists( $name, $this->rows ) && $this->rows[ $name ] === $old_value ) {
 					$this->rows[ $name ] = $new_value;
 					return 1;
 				}
@@ -776,6 +846,89 @@ namespace {
 			&& 3 === $generation()
 	);
 	$reset_boundary();
+
+	// ── p7: same PHP object, NEW physical session after the Core CAS — the
+	//        durable consume must be fenced to zero rows on the new session ──
+	$reset_subscription();
+	$GLOBALS['wpdb'] = new V037PairWpdb();
+	$token = $mint_token();
+	$GLOBALS['v037_drift_before_claim'] = true;
+	$claims_before_p7 = $GLOBALS['v037_claim_calls'];
+	$p7 = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$check(
+		'post-CAS physical drift on the SAME object never consumes on the new session: joint rollback, no split',
+		false === ( $p7['success'] ?? true )
+			&& 3 === $generation()
+			&& 'issued' === $durable_state( $token )
+			&& 1 === $GLOBALS['v037_claim_calls'] - $claims_before_p7
+			&& 0 === $GLOBALS['wpdb']->commits
+	);
+
+	// ── p8: 2006 lands ON the consume UPDATE itself; wpdb resends it on the
+	//        reconnected session — the resend must match zero rows ──
+	$reset_subscription();
+	$GLOBALS['wpdb'] = new V037PairWpdb();
+	$token = $mint_token();
+	$GLOBALS['wpdb']->drop_on_next_update = true;
+	$claims_before_p8 = $GLOBALS['v037_claim_calls'];
+	$p8 = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$check(
+		'a consume UPDATE resent after 2006 is fenced to zero rows: generation and token never split',
+		false === ( $p8['success'] ?? true )
+			&& 3 === $generation()
+			&& 'issued' === $durable_state( $token )
+			&& 1 === $GLOBALS['v037_claim_calls'] - $claims_before_p8
+			&& 1 === $GLOBALS['wpdb']->consume_update_evaluations
+			&& 0 === $GLOBALS['wpdb']->commits
+	);
+
+	// ── p9: drift right AFTER the successful claim — the pre-COMMIT session
+	//        verify must refuse to COMMIT; both sides roll back together ──
+	$reset_subscription();
+	$GLOBALS['wpdb'] = new V037PairWpdb();
+	$token = $mint_token();
+	$GLOBALS['v037_drift_after_claim'] = true;
+	$p9 = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$check(
+		'identity drift after the claim is caught BEFORE COMMIT: typed manual failure, zero COMMIT, joint rollback',
+		false === ( $p9['success'] ?? true )
+			&& 'profile_update_session_drift' === ( $p9['code'] ?? '' )
+			&& false === ( $p9['retryable'] ?? true )
+			&& true === ( $p9['requires_manual_reconciliation'] ?? false )
+			&& 0 === $GLOBALS['wpdb']->commits
+			&& 3 === $generation()
+			&& 'issued' === $durable_state( $token )
+	);
+
+	// ── p10: 2006 during COMMIT — the resent COMMIT acks a no-op on the new
+	//         session; the post-COMMIT verify must report manual indeterminate ──
+	$reset_subscription();
+	$GLOBALS['wpdb'] = new V037PairWpdb();
+	$token = $mint_token();
+	$GLOBALS['wpdb']->drop_on_commit = true;
+	$p10 = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
+	$check(
+		'a COMMIT resent on a new session becomes manual indeterminate with generation and token jointly rolled back',
+		false === ( $p10['success'] ?? true )
+			&& 'profile_update_commit_indeterminate' === ( $p10['code'] ?? '' )
+			&& true === ( $p10['requires_manual_reconciliation'] ?? false )
+			&& 1 === $GLOBALS['wpdb']->commits
+			&& 3 === $generation()
+			&& 'issued' === $durable_state( $token )
+	);
+
+	// The fence must be ONE cross-repo spelling: ECPay's consume predicate uses
+	// byte-for-byte the fragment the Core model freezes.
+	$fence_fragment = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
+		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
+	$core_model_source = (string) file_get_contents( $core_root . '/src/Models/YSSubscription.php' );
+	$store_source = (string) file_get_contents( $ecpay_root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php' );
+	$check(
+		'Core model and ECPay store freeze the identical physical-session fence spelling',
+		str_contains( $core_model_source, $fence_fragment )
+			&& str_contains( $store_source, $fence_fragment )
+	);
 
 	// ── p5: a legacy ordinary transient token cannot enter the subscription scope ──
 	$reset_subscription();
