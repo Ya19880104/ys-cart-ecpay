@@ -41,18 +41,32 @@ if ( $hasWiring && $hasScenario ) {
 		&& 'fixture_renewable_gateway' === $seed['subscription']['gateway_id'] && null === $seed['subscription']['current_period_key']
 		&& 501 === $seed['product']['id'] && -1 === $seed['product']['stock_qty'] && 'no' === $seed['selection']['autoload']
 		&& ! str_contains( json_encode( $seed ), $token ) );
+	// Independent literal transition, not the coordinator/model's SQL or profile builder.
+	$newProfile = json_decode( $seed['subscription']['fulfillment_profile'], true );
+	$newProfile['shipping_method_id'] = 'ys_ec_ecpay_ship_unimart'; $newProfile['shipping_provider'] = 'ecpay'; $newProfile['shipping_total'] = '65.00';
+	$newProfile['fulfillment_snapshot']['provider_id'] = 'ecpay'; $newProfile['fulfillment_snapshot']['method_id'] = 'ys_ec_ecpay_ship_unimart';
+	$newProfile['fulfillment_snapshot']['destination'] = [ 'type' => 'cvs', 'recipient_name' => 'Pair Recipient', 'recipient_phone' => '0912345678', 'country' => 'TW', 'store_id' => '991122', 'store_name' => 'Canonical Store', 'store_address' => 'No. 1 Store Rd.' ];
+	$newProfile['fulfillment_snapshot']['service']['shipping_type'] = 'cvs';
+	$expectedProfileBytes = json_encode( $newProfile, JSON_UNESCAPED_SLASHES );
+	$expectedProfileHash = hash( 'sha256', $expectedProfileBytes );
+	$fenceSql = static fn ( string $nonce ): string => "CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST('9101' AS BINARY) AND CAST(DATABASE() AS BINARY) = CAST('ecpay_offline_fixture' AS BINARY) AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST('" . $nonce . "' AS BINARY)";
+	$expectedCas = static fn ( string $nonce ): string => "UPDATE {$prefix}ys_ec_subscriptions\n             SET fulfillment_profile = '{$expectedProfileBytes}',\n                 fulfillment_profile_generation = fulfillment_profile_generation + 1,\n                 fulfillment_profile_hash = '{$expectedProfileHash}',\n                 renewal_shipping_total = '65.00',\n                 fulfillment_profile_updated_at = '2026-09-05 00:00:00',\n                 updated_at = '2026-09-05 00:00:00'\n             WHERE id = 41\n               AND fulfillment_profile_generation = 3\n               AND status IN ('pending', 'active', 'on-hold', 'suspended')\n               AND " . $fenceSql( $nonce );
+	$subscriptionRead = 'SELECT * FROM ' . $prefix . 'ys_ec_subscriptions WHERE id = 41';
+	$optionRead = 'SELECT option_value FROM ' . $prefix . "options WHERE option_name = '" . $seed['selection']['option_name'] . "'";
 	$captured = []; $owner = ''; $stock = -1;
-	$db = Session::forCapture( $prefix, static function ( string $sql ) use ( &$captured, &$owner, &$stock, $seed, $prefix ): array {
-		$captured[] = $sql; $rows = [];
-		if ( str_starts_with( $sql, 'SELECT * FROM ' . $prefix . 'ys_ec_subscriptions WHERE id = 41' ) ) { $rows = [ $seed['subscription'] ]; }
-		elseif ( str_starts_with( $sql, 'SELECT * FROM ' . $prefix . 'ys_ec_products WHERE id = 501' ) ) { $rows = [ array_replace( $seed['product'], [ 'stock_qty' => $stock ] ) ]; }
-		elseif ( str_starts_with( $sql, 'SELECT option_value FROM ' . $prefix . 'options WHERE option_name = ' ) ) { $rows = [ [ 'option_value' => $seed['selection']['option_value'] ] ]; }
-		elseif ( str_starts_with( $sql, 'SHOW TABLE STATUS WHERE Name = ' ) ) { $rows = [ [ 'Engine' => 'InnoDB' ] ]; }
+	$db = Session::forCapture( $prefix, static function ( string $sql ) use ( &$captured, &$owner, &$stock, $seed, $prefix, $subscriptionRead, $optionRead, $fenceSql, $expectedCas ): array {
+		$rows = [];
+		if ( $sql === $subscriptionRead ) { $rows = [ $seed['subscription'] ]; }
+		elseif ( '' !== $owner && $sql === $subscriptionRead . ' AND ' . $fenceSql( $owner ) . ' FOR UPDATE' ) { $rows = [ $seed['subscription'] ]; }
+		elseif ( $sql === 'SELECT * FROM ' . $prefix . 'ys_ec_products WHERE id = 501' ) { $rows = [ array_replace( $seed['product'], [ 'stock_qty' => $stock ] ) ]; }
+		elseif ( $sql === $optionRead ) { $rows = [ [ 'option_value' => $seed['selection']['option_value'] ] ]; }
+		elseif ( $sql === "SHOW TABLE STATUS WHERE Name = '" . $prefix . "options'" ) { $rows = [ [ 'Engine' => 'InnoDB' ] ]; }
 		elseif ( preg_match( "/\ASET @ys_profile_tx_owner = '([a-f0-9]{32})'\z/", $sql, $match ) ) { $owner = $match[1]; }
-		elseif ( str_contains( $sql, ') AS cid, DATABASE() AS dbname' ) ) { $rows = [ [ 'cid' => '9101', 'dbname' => 'ecpay_offline_fixture', 'owner' => $owner ] ]; }
+		elseif ( $sql === 'SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, CAST(@ys_profile_tx_owner AS CHAR) AS owner' ) { $rows = [ [ 'cid' => '9101', 'dbname' => 'ecpay_offline_fixture', 'owner' => $owner ] ]; }
 		elseif ( in_array( $sql, [ 'START TRANSACTION', 'ROLLBACK' ], true ) ) {}
-		elseif ( 1 === preg_match( '/\AUPDATE ' . $prefix . 'ys_ec_subscriptions\s+SET fulfillment_profile = /', $sql ) ) {}
+		elseif ( '' !== $owner && $sql === $expectedCas( $owner ) ) {}
 		else { throw new SubscriptionSqlFailure( 'offline_statement_not_declared' ); }
+		$captured[] = $sql;
 		return [ 'error' => '', 'rows' => $rows, 'affected' => 0 ];
 	} );
 	$GLOBALS['wpdb'] = $db; $GLOBALS['ecpay_sql_plugin'] = new \YangSheep\YSCartEcpay\Plugin();
@@ -76,9 +90,47 @@ if ( $hasWiring && $hasScenario ) {
 	$check( 'pair readback retains raw bytes/hash and authority without raw token', true === $pair['ok'] && $pair['profile_bytes'] === $seed['subscription']['fulfillment_profile']
 		&& $pair['selection_bytes'] === $seed['selection']['option_value'] && 3 === $pair['generation'] && 'issued' === $pair['selection_state']
 		&& hash( 'sha256', $pair['profile_bytes'] ) === $pair['profile_hash'] && ! str_contains( json_encode( $pair ), $token ) );
+	// Catch a recorder that supplies authority for an undeclared predicate, key or fence.
+	$locked = array_values( array_filter( $trace, static fn ( string $sql ): bool => str_ends_with( $sql, ' FOR UPDATE' ) ) );
+	$unknownStatements = [
+		'subscription-tail' => 'SELECT * FROM ' . $prefix . "ys_ec_subscriptions WHERE id = 41 AND status = 'unlisted'",
+		'subscription-id' => 'SELECT * FROM ' . $prefix . 'ys_ec_subscriptions WHERE id = 410',
+		'product-tail' => 'SELECT * FROM ' . $prefix . "ys_ec_products WHERE id = 501 AND status = 'unlisted'",
+		'product-id' => 'SELECT * FROM ' . $prefix . 'ys_ec_products WHERE id = 5010',
+		'option-key' => 'SELECT option_value FROM ' . $prefix . "options WHERE option_name = 'ys_ec_ecpay_subsel_" . str_repeat( '0', 64 ) . "'",
+		'option-tail' => 'SELECT option_value FROM ' . $prefix . "options WHERE option_name = '" . $seed['selection']['option_name'] . "' AND autoload = 'yes'",
+		'engine-table' => "SHOW TABLE STATUS WHERE Name = '" . $prefix . "unowned'",
+		'engine-tail' => "SHOW TABLE STATUS WHERE Name = '" . $prefix . "options' AND Engine = 'MyISAM'",
+		'session-projection' => "SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, 'unowned' AS owner",
+		'session-tail' => 'SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, CAST(@ys_profile_tx_owner AS CHAR) AS owner WHERE 0 = 1',
+		'locked-owner' => str_replace( $owner, str_repeat( '0', 32 ), $locked[0] ?? '' ),
+		'locked-tail' => ( $locked[0] ?? '' ) . ' LIMIT 2',
+		'cas-tail' => ( $cas[0] ?? '' ) . ' AND 0 = 1',
+		'cas-id' => str_replace( 'WHERE id = 41', 'WHERE id = 42', $cas[0] ?? '' ),
+		'cas-generation' => str_replace( 'fulfillment_profile_generation = 3', 'fulfillment_profile_generation = 4', $cas[0] ?? '' ),
+		'cas-owner' => str_replace( $owner, str_repeat( '0', 32 ), $cas[0] ?? '' ),
+		'cas-billing' => str_replace( 'Billing Owner', 'Foreign Owner', $cas[0] ?? '' ),
+		'cas-fee' => str_replace( "renewal_shipping_total = '65.00'", "renewal_shipping_total = '66.00'", $cas[0] ?? '' ),
+		'cas-database' => str_replace( 'ecpay_offline_fixture', 'foreign_fixture', $cas[0] ?? '' ),
+		'nonce-tail' => "SET @ys_profile_tx_owner = '" . str_repeat( 'a', 32 ) . "' ",
+		'nonce-shape' => "SET @ys_profile_tx_owner = 'short'",
+		'commit-not-declared' => 'COMMIT',
+	];
+	$negativeReceipts = [];
+	foreach ( $unknownStatements as $name => $sql ) {
+		$code = 'accepted';
+		try { $db->get_results( $sql ); } catch ( SubscriptionSqlFailure $error ) { $code = $error->getMessage(); }
+		$negativeReceipts[$name] = $code;
+		$check( 'complete recorder rejects ' . $name, 'offline_statement_not_declared' === $code );
+	}
 	$brokenRow = $seed['subscription']; $brokenValue = json_decode( $seed['selection']['option_value'], true );
-	$reader = Session::forCapture( $prefix, static function ( string $sql ) use ( &$brokenRow, &$brokenValue ): array {
-		return [ 'error' => '', 'affected' => 0, 'rows' => str_starts_with( $sql, 'SELECT * FROM ' ) ? ( null === $brokenRow ? [] : [ $brokenRow ] ) : [ [ 'option_value' => json_encode( $brokenValue ) ] ] ];
+	$reader = Session::forCapture( $prefix, static function ( string $sql ) use ( &$brokenRow, &$brokenValue, $subscriptionRead, $optionRead ): array {
+		$rows = match ( $sql ) {
+			$subscriptionRead => null === $brokenRow ? [] : [ $brokenRow ],
+			$optionRead => [ [ 'option_value' => json_encode( $brokenValue ) ] ],
+			default => throw new SubscriptionSqlFailure( 'offline_statement_not_declared' ),
+		};
+		return [ 'error' => '', 'affected' => 0, 'rows' => $rows ];
 	} );
 	$brokenValue['state'] = 'consumed'; $brokenValue['consumed'] = [ 'subscription_id' => 42, 'generation' => 4, 'at' => '2026-09-05 00:00:00' ];
 	$check( 'readback rejects consumed authority for a different subscription', false === Fixture::readPair( $reader, 41, $token )['ok'] );
@@ -88,6 +140,12 @@ if ( $hasWiring && $hasScenario ) {
 	$check( 'readback rejects mismatched profile hash', false === Fixture::readPair( $reader, 41, $token )['ok'] );
 	$brokenRow = null;
 	$check( 'missing subscription cannot become a successful readback', false === Fixture::readPair( $reader, 41, $token )['ok'] );
+	foreach ( [ 'subscription-tail', 'option-key' ] as $name ) {
+		$code = 'accepted';
+		try { $reader->get_results( $unknownStatements[$name] ); } catch ( SubscriptionSqlFailure $error ) { $code = $error->getMessage(); }
+		$negativeReceipts['readback-' . $name] = $code;
+		$check( 'corrupt-row reader rejects undeclared ' . $name, 'offline_statement_not_declared' === $code );
+	}
 	$manifest = Scenario::manifest();
 	$check( 'all twelve worker scenarios are deterministic and remain NOT RUN', array_keys( $manifest ) === [ 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11','P12' ]
 		&& $manifest === Scenario::manifest() && 12 === count( array_filter( $manifest, static fn ( array $row ): bool => 'NOT RUN' === $row['acceptance'] ) ) );
@@ -107,11 +165,6 @@ if ( $hasWiring && $hasScenario ) {
 	$tampered = $observed; $tampered['sentinels_after']['subscription42'] = str_repeat( 'b', 64 );
 	$check( 'foreign sibling byte changes reject the scenario', false === Scenario::evaluate( 'P11', $pair, $tampered )['matches'] );
 	$check( 'P2 is unproven without server lock-wait observation', false === Scenario::evaluate( 'P2', $pair, $observed )['matches'] );
-	$newProfile = json_decode( $pair['profile_bytes'], true );
-	$newProfile['shipping_method_id'] = 'ys_ec_ecpay_ship_unimart'; $newProfile['shipping_provider'] = 'ecpay'; $newProfile['shipping_total'] = '65.00';
-	$newProfile['fulfillment_snapshot']['provider_id'] = 'ecpay'; $newProfile['fulfillment_snapshot']['method_id'] = 'ys_ec_ecpay_ship_unimart';
-	$newProfile['fulfillment_snapshot']['destination'] = [ 'type' => 'cvs', 'recipient_name' => 'Pair Recipient', 'recipient_phone' => '0912345678', 'country' => 'TW', 'store_id' => '991122', 'store_name' => 'Canonical Store', 'store_address' => 'No. 1 Store Rd.' ];
-	$newProfile['fulfillment_snapshot']['service']['shipping_type'] = 'cvs';
 	$newSelection = json_decode( $pair['selection_bytes'], true ); $newSelection['state'] = 'consumed';
 	$newSelection['consumed'] = [ 'subscription_id' => 41, 'generation' => 4, 'at' => '2026-09-05 00:00:00' ];
 	$newPair = array_replace( $pair, [ 'generation' => 4, 'shipping_total' => '65.00', 'selection_state' => 'consumed', 'selection_generation' => 4,
@@ -166,7 +219,7 @@ if ( $hasWiring && $hasScenario ) {
 		$check( 'new-pair full authority rejects rehashed ' . $change, false === Scenario::evaluate( 'P1', $pair, $badObservation )['matches'] );
 	}
 	$scratch = sys_get_temp_dir() . '/ecpay-sql-wiring-' . bin2hex( random_bytes( 8 ) ); mkdir( $scratch ); $receipt = $scratch . '/receipts.json';
-	file_put_contents( $receipt, json_encode( [ 'products' => $products, 'helpers' => $helperReceipt, 'seed_plan' => $seed, 'recorded_sql' => $captured, 'response' => $response, 'pair' => $pair, 'workers' => $manifest, 'connection_attempts' => Session::connectionAttempts(), 'sql_execution' => 'NOT RUN' ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
+	file_put_contents( $receipt, json_encode( [ 'products' => $products, 'helpers' => $helperReceipt, 'seed_plan' => $seed, 'recorded_sql' => $captured, 'negative_statement_verdicts' => $negativeReceipts, 'response' => $response, 'pair' => $pair, 'workers' => $manifest, 'connection_attempts' => Session::connectionAttempts(), 'sql_execution' => 'NOT RUN' ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
 	echo 'WIRING_RECEIPTS ' . json_encode( [ 'path' => $receipt, 'sha256' => hash_file( 'sha256', $receipt ) ], JSON_UNESCAPED_SLASHES ) . "\n";
 }
 $logReceipt = \YSCartEcpay\Tests\SubscriptionApplicationLog::inspect( $applicationLog, [] );
