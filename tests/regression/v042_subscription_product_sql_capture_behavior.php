@@ -13,9 +13,10 @@ function wp_json_encode( mixed $data, int $flags = 0, int $depth = 512 ): string
 function current_time( string $type ): string { return '2026-09-05 00:00:00'; }
 $pass = 0; $fail = 0;
 $check = static function ( string $name, bool $ok ) use ( &$pass, &$fail ): void { echo ( $ok ? 'PASS ' : 'FAIL ' ) . $name . "\n"; $ok ? ++$pass : ++$fail; };
-$sources = Fixture::inspectSources( [ 'core' => (string) getenv( 'YS_CORE_ROOT' ), 'ecpay' => dirname( __DIR__, 2 ), 'affiliate' => (string) getenv( 'YS_AFFILIATE_ROOT' ) ] );
+$helperReceipt = Fixture::helperReceipt( $helpers );
+$sources = Fixture::inspectSources( [ 'core' => (string) getenv( 'YS_CORE_ROOT' ), 'ecpay' => (string) ( getenv( 'YS_ECPAY_ROOT' ) ?: dirname( __DIR__, 2 ) ), 'affiliate' => (string) getenv( 'YS_AFFILIATE_ROOT' ) ] );
 $products = Fixture::loadProduct( $sources );
-$check( 'nine real product classes are loaded from their exact committed raw blobs', 9 === count( $products ) );
+$check( 'fifteen real product classes are loaded from their exact committed raw blobs', 15 === count( $products ) );
 $attempts = 0;
 try { Session::connect( [ 'kind' => 'sql-execution' ], static function () use ( &$attempts ): void { ++$attempts; } ); }
 catch ( SubscriptionSqlFailure $error ) { $code = $error->getMessage(); }
@@ -97,7 +98,7 @@ foreach ( $badSignals as $badSignal ) {
 }
 $check( 'barrier readback rejects foreign roles, non-scalar connection ids and extra payload fields', 3 === $badRejected );
 $receipt = $scratch . '/capture.json';
-file_put_contents( $receipt, json_encode( [ 'products' => $products, 'ddl' => $ddl, 'captured_product_sql' => $captured, 'connection_attempts' => Session::connectionAttempts(), 'executed_sql' => 0 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
+file_put_contents( $receipt, json_encode( [ 'products' => $products, 'helpers' => $helperReceipt, 'ddl' => $ddl, 'captured_product_sql' => $captured, 'connection_attempts' => Session::connectionAttempts(), 'executed_sql' => 0 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
 echo 'CAPTURE_RECEIPTS ' . json_encode( [ 'path' => $receipt, 'sha256' => hash_file( 'sha256', $receipt ) ], JSON_UNESCAPED_SLASHES ) . "\n";
 echo "subscription product SQL capture: {$pass} PASS / {$fail} FAIL\n";
 exit( $fail > 0 ? 1 : 0 );

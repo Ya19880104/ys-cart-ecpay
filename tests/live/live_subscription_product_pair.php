@@ -5,6 +5,7 @@ use YSCartEcpay\Tests\Live\SubscriptionSqlSession as Session;
 use YSCartEcpay\Tests\Live\SubscriptionSqlBarrier as Barrier;
 use YSCartEcpay\Tests\Live\SubscriptionSqlFailure;
 require_once __DIR__ . '/helpers/SubscriptionSqlSession.php';
+require_once __DIR__ . '/helpers/SubscriptionSqlAllocation.php';
 require_once __DIR__ . '/helpers/SubscriptionSqlBarrier.php';
 require_once __DIR__ . '/helpers/SubscriptionProductSqlFixture.php';
 $result = [ 'success' => false, 'code' => '', 'connection_attempts' => 0, 'sql_statements' => 0, 'sql_execution' => 'NOT RUN', 'native_wpdb' => 'PREREQUISITE UNSATISFIED' ];
@@ -20,9 +21,7 @@ try {
 	if ( ! in_array( $options['mode'] ?? '', [ 'preflight', 'capture-ddl', 'execute' ], true ) ) { throw new SubscriptionSqlFailure( 'mode_unknown' ); }
 	$allocationPath = (string) getenv( 'YS_ECPAY_SQL_ALLOCATION' );
 	if ( '' === $allocationPath || ! is_file( $allocationPath ) ) { throw new SubscriptionSqlFailure( 'allocation_required' ); }
-	$allocation = json_decode( (string) file_get_contents( $allocationPath ), true );
-	if ( ! is_array( $allocation ) || ! in_array( $allocation['kind'] ?? '', [ 'offline-design', 'sql-execution' ], true )
-		|| ! is_int( $allocation['expires_at'] ?? null ) || $allocation['expires_at'] <= time() ) { throw new SubscriptionSqlFailure( 'allocation_invalid' ); }
+	$allocation = \YSCartEcpay\Tests\Live\SubscriptionSqlAllocation::validate( json_decode( (string) file_get_contents( $allocationPath ), true ) );
 	$dsn = (string) getenv( 'YS_TEST_MYSQL_DSN' );
 	$database = (string) getenv( 'YS_TEST_MYSQL_DB' );
 	$user = (string) getenv( 'YS_TEST_MYSQL_USER' );
@@ -39,9 +38,10 @@ try {
 	if ( in_array( '', $roots, true ) ) { throw new SubscriptionSqlFailure( 'pair_root_required' ); }
 	$sources = Fixture::inspectSources( $roots );
 	$products = Fixture::loadProduct( $sources );
+	$helpers = Fixture::helperReceipt( __DIR__ . '/helpers' );
 	if ( 'execute' === $options['mode'] ) { Session::connect( $allocation ); }
 	$barrier = Barrier::createPhase( $options['evidence-root'] ?? '', $options['phase'] ?? '' );
-	$result += [ 'sources' => $sources, 'products' => $products, 'evidence_directory' => $barrier->path(), 'allocation_kind' => $allocation['kind'] ];
+	$result += [ 'sources' => $sources, 'products' => $products, 'helpers' => $helpers, 'evidence_directory' => $barrier->path(), 'allocation_kind' => $allocation['kind'] ];
 	$result['success'] = true;
 	$result['code'] = 'offline_preflight_ready';
 	if ( 'capture-ddl' === $options['mode'] ) {

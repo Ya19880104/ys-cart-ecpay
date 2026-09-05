@@ -12,9 +12,17 @@ file_put_contents( $allocation, json_encode( $grant ) );
 file_put_contents( $scratch . '/malformed-allocation.json', '{' );
 file_put_contents( $scratch . '/expired-allocation.json', json_encode( array_replace( $grant, [ 'expires_at' => time() - 60 ] ) ) );
 file_put_contents( $scratch . '/unknown-allocation.json', json_encode( array_replace( $grant, [ 'kind' => 'unknown' ] ) ) );
+$invalidGrants = [
+	'extra-field' => $grant + [ 'unexpected_field' => 'benign' ],
+	'secret-field' => $grant + [ 'password' => 'benign-sensitive-marker' ],
+	'port-string' => array_replace( $grant, [ 'port' => '9' ] ),
+	'host-boolean' => array_replace( $grant, [ 'host' => true ] ),
+	'database-number' => array_replace( $grant, [ 'database' => 123 ] ),
+];
+foreach ( $invalidGrants as $name => $invalidGrant ) { file_put_contents( $scratch . '/' . $name . '.json', json_encode( $invalidGrant ) ); }
 $core = (string) getenv( 'YS_CORE_ROOT' );
 $affiliate = (string) getenv( 'YS_AFFILIATE_ROOT' );
-$base = [ 'YS_CORE_ROOT' => $core, 'YS_ECPAY_ROOT' => $repo, 'YS_AFFILIATE_ROOT' => $affiliate,
+$base = [ 'YS_CORE_ROOT' => $core, 'YS_ECPAY_ROOT' => (string) ( getenv( 'YS_ECPAY_ROOT' ) ?: $repo ), 'YS_AFFILIATE_ROOT' => $affiliate,
 	'YS_ECPAY_SQL_ALLOCATION' => $allocation, 'YS_TEST_MYSQL_DSN' => '127.0.0.1:9', 'YS_TEST_MYSQL_DB' => 'ecpay_offline_fixture',
 	'YS_TEST_MYSQL_USER' => 'offline_fixture', 'YS_ECPAY_SQL_PREFIX' => 'ecps_0123456789ab_' ];
 $cases = [
@@ -45,6 +53,7 @@ $cases = [
 	'capture-ddl' => [ [], [ '--mode=capture-ddl' ], 'ddl_captured_not_executed' ],
 	'execution-locked' => [ [], [ '--mode=execute' ], 'sql_execution_not_authorized_in_checkpoint' ],
 ];
+foreach ( array_keys( $invalidGrants ) as $name ) { $cases[$name] = [ [ 'YS_ECPAY_SQL_ALLOCATION' => $scratch . '/' . $name . '.json' ], [], 'allocation_invalid' ]; }
 $pass = 0;
 $fail = 0;
 $receipts = [];
