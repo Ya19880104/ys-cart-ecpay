@@ -4,6 +4,97 @@ declare(strict_types=1);
 namespace YSCartEcpay\Tests\Live;
 require_once __DIR__ . '/SubscriptionProductSqlFixture.php';
 final class SubscriptionSqlSchema {
+	public static function validateServer(array $rows,string $database):array {
+		$keys=['version','database_name','connection_id','transaction_isolation','autocommit','sql_mode','time_zone','character_set_connection','collation_connection'];
+		$r=$rows[0]??null;
+		if(1!==count($rows) || !SubscriptionSqlEvidence::exactKeys($r,$keys)) { throw new SubscriptionSqlFailure('mysql_server_invalid'); }
+		foreach($keys as $key) { if(!is_string($r[$key])) { throw new SubscriptionSqlFailure('mysql_server_invalid'); } }
+		if(1!==preg_match('/\A8\.4\.[0-9]+(?:-commercial)?\z/',$r['version']) || $database!==$r['database_name'] || 1!==preg_match('/\A[1-9][0-9]{0,19}\z/',$r['connection_id'])
+			|| !in_array($r['transaction_isolation'],['REPEATABLE-READ','READ-COMMITTED'],true) || '1'!==$r['autocommit'] || ''===$r['time_zone'] || 'utf8mb4'!==$r['character_set_connection'] || 'utf8mb4_unicode_ci'!==$r['collation_connection']
+			|| !preg_match('/(?:\A|,)STRICT_(?:TRANS|ALL)_TABLES(?:,|\z)/',$r['sql_mode']) || str_contains($r['sql_mode'],'NO_BACKSLASH_ESCAPES')) { throw new SubscriptionSqlFailure('mysql_server_invalid'); }
+		return $r;
+	}
+	/** Only the six captured TableMaker/fixture forms are admitted; unknown clauses fail closed. */
+	public static function ddlContract(string $sql):array {
+		$sql=preg_replace('/^\s*--[^\r\n]*$/m','',$sql);
+		if(1!==preg_match('/\ACREATE TABLE (ecps_[a-f0-9]{12}_(?:ys_ec_(?:products|subscriptions|orders|order_items|order_created_outbox)|options))\s*\((.*)\) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\z/s',trim($sql),$m)) { throw new SubscriptionSqlFailure('schema_ddl_unsupported'); }
+		$columns=[]; $indexes=[];
+		foreach(preg_split('/,\s*(?![^()]*\))/',trim($m[2])) as $declaration) {
+			$declaration=preg_replace('/\s+/',' ',trim($declaration));
+			if(preg_match('/\A(?:(PRIMARY) KEY|(UNIQUE )?KEY ([a-z_][a-z0-9_]*)) \(([a-z0-9_, ]+)\)\z/',$declaration,$k)) {
+				$name=''!==($k[1]??'')?'PRIMARY':$k[3];
+				if(isset($indexes[$name])) { throw new SubscriptionSqlFailure('schema_ddl_unsupported'); }
+				$indexes[$name]=['unique'=>'PRIMARY'===$name || ''!==($k[2]??''),'columns'=>array_map('trim',explode(',',$k[4]))]; continue;
+			}
+			if(1!==preg_match('/\A([a-z_][a-z0-9_]*) ((?:BIGINT|INT|TINYINT)(?:\(1\))?(?: UNSIGNED)?|(?:VARCHAR|CHAR)\([0-9]+\)|DECIMAL\([0-9]+,[0-9]+\)|TEXT|LONGTEXT|JSON|DATETIME|DATE)(?: (.*))?\z/',$declaration,$c)) { throw new SubscriptionSqlFailure('schema_ddl_unsupported'); }
+			if(1!==preg_match("/\A(?:(NOT NULL|NULL) ?)?(?:DEFAULT ('[^']*'|-?[0-9]+(?:\.[0-9]+)?|NULL|CURRENT_TIMESTAMP) ?)?(AUTO_INCREMENT)?(?: ?(ON UPDATE CURRENT_TIMESTAMP))?(?: ?(PRIMARY KEY))?\z/",$c[3]??'',$a) || isset($columns[$c[1]])) { throw new SubscriptionSqlFailure('schema_ddl_unsupported'); }
+			$default=$a[2]??''; $default=in_array($default,['','NULL'],true)?null:('CURRENT_TIMESTAMP'===$default?'CURRENT_TIMESTAMP':trim($default,"'"));
+			$columns[$c[1]]=['type'=>strtolower($c[2]),'nullable'=>'NOT NULL'!==($a[1]??''),'default'=>$default,'auto_increment'=>''!==($a[3]??''),'on_update'=>''!==($a[4]??''),'collation'=>preg_match('/\A(?:VARCHAR|CHAR|TEXT|LONGTEXT)/',$c[2])?'utf8mb4_unicode_ci':null];
+			if(''!==($a[5]??'')) { $indexes['PRIMARY']=['unique'=>true,'columns'=>[$c[1]]]; }
+		}
+		foreach($indexes as $index) { foreach($index['columns'] as $column) { if(!isset($columns[$column])) { throw new SubscriptionSqlFailure('schema_ddl_unsupported'); } } }
+		return ['table'=>$m[1],'columns'=>$columns,'indexes'=>$indexes];
+	}
+	private static function showContract(string $sql):array {
+		$sql=preg_replace('/`([a-z_][a-z0-9_]*)`/','$1',$sql);
+		$sql=preg_replace('/ COLLATE utf8mb4_unicode_ci(?= |,|\n)/','',$sql);
+		$sql=preg_replace('/current_timestamp\(\)/i','CURRENT_TIMESTAMP',$sql);
+		$sql=preg_replace_callback('/\b(PRIMARY|UNIQUE|KEY|BIGINT|INT|TINYINT|UNSIGNED|VARCHAR|CHAR|DECIMAL|TEXT|LONGTEXT|JSON|DATETIME|DATE|NOT|NULL|DEFAULT|AUTO_INCREMENT|ON|UPDATE|CURRENT_TIMESTAMP)\b/i',static fn(array $m):string=>strtoupper($m[1]),$sql);
+		$sql=preg_replace('/\) ENGINE=InnoDB(?: AUTO_INCREMENT=[0-9]+)? DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci\z/',') ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',$sql);
+		return self::ddlContract($sql);
+	}
+	public static function validateMetadata(array $plan,array $reads):array {
+		if(!is_array($plan['captured_ddl']['statements']??null) || !is_array($plan['queries']??null) || !SubscriptionSqlEvidence::exactKeys($reads,array_keys($plan['queries']))) { throw new SubscriptionSqlFailure('mysql_schema_invalid'); }
+		foreach($plan['queries'] as $key=>$sql) { $r=$reads[$key]; if(!SubscriptionSqlEvidence::exactKeys($r,['sql','sql_sha256','rows']) || $r['sql']!==$sql || $r['sql_sha256']!==hash('sha256',$sql) || !is_array($r['rows']) || !array_is_list($r['rows'])) { throw new SubscriptionSqlFailure('mysql_schema_invalid'); } }
+		$server=self::validateServer($reads['session']['rows'],$plan['database']); $tables=[];
+		foreach($plan['captured_ddl']['statements'] as $sql) {
+			$contract=self::ddlContract($sql); $table=$contract['table']; $tables[]=$table;
+			$columns=$reads[$table.':columns']['rows'];
+			if(count($columns)!==count($contract['columns']) || array_column($columns,'Field')!==array_keys($contract['columns'])) { throw new SubscriptionSqlFailure('mysql_columns_invalid'); }
+			foreach($columns as $row) {
+				$expected=$contract['columns'][$row['Field']];
+				if(!SubscriptionSqlEvidence::exactKeys($row,['Field','Type','Collation','Null','Key','Default','Extra','Privileges','Comment']) || !is_string($row['Extra'])) { throw new SubscriptionSqlFailure('mysql_columns_invalid'); }
+				$extra=trim(strtolower(str_replace('DEFAULT_GENERATED','',$row['Extra']))); $extra=str_replace('current_timestamp()','current_timestamp',$extra);
+				$wantExtra=trim(($expected['auto_increment']?'auto_increment':'').($expected['on_update']?' on update current_timestamp':''));
+				$default=$row['Default']; if(is_string($default) && in_array(strtoupper($default),['CURRENT_TIMESTAMP','CURRENT_TIMESTAMP()'],true)) { $default='CURRENT_TIMESTAMP'; }
+				if($row['Type']!==$expected['type'] || $row['Collation']!==$expected['collation'] || $row['Null']!==($expected['nullable']?'YES':'NO') || $default!==$expected['default'] || $extra!==$wantExtra || ''!==$row['Comment']) { throw new SubscriptionSqlFailure('mysql_columns_invalid'); }
+			}
+			$indexes=[];
+			foreach($reads[$table.':indexes']['rows'] as $row) {
+				if(!is_array($row) || ($row['Table']??null)!==$table || !is_string($row['Key_name']??null) || !in_array($row['Non_unique']??null,['0','1'],true) || !is_string($row['Seq_in_index']??null) || !ctype_digit($row['Seq_in_index']) || (int)$row['Seq_in_index']<1 || !is_string($row['Column_name']??null) || 'A'!==($row['Collation']??null) || !array_key_exists('Sub_part',$row) || null!==$row['Sub_part'] || 'BTREE'!==($row['Index_type']??null) || 'YES'!==($row['Visible']??null) || !array_key_exists('Expression',$row) || null!==$row['Expression']) { throw new SubscriptionSqlFailure('mysql_indexes_invalid'); }
+				$key=$row['Key_name']; $seq=(int)$row['Seq_in_index'];
+				if(isset($indexes[$key]['columns'][$seq]) || (isset($indexes[$key]) && $indexes[$key]['unique']!==('0'===$row['Non_unique']))) { throw new SubscriptionSqlFailure('mysql_indexes_invalid'); }
+				$indexes[$key]['unique']='0'===$row['Non_unique']; $indexes[$key]['columns'][$seq]=$row['Column_name'];
+			}
+			foreach($indexes as &$index) { ksort($index['columns']); if(array_keys($index['columns'])!==range(1,count($index['columns']))) { throw new SubscriptionSqlFailure('mysql_indexes_invalid'); } $index['columns']=array_values($index['columns']); } unset($index);
+			ksort($indexes); ksort($contract['indexes']); if($indexes!==$contract['indexes']) { throw new SubscriptionSqlFailure('mysql_indexes_invalid'); }
+			$create=$reads[$table.':create']['rows'];
+			if(1!==count($create) || !SubscriptionSqlEvidence::exactKeys($create[0],['Table','Create Table']) || $create[0]['Table']!==$table || !is_string($create[0]['Create Table']) || !str_starts_with($create[0]['Create Table'],'CREATE TABLE `'.$table.'` (') || !preg_match('/\) ENGINE=InnoDB(?: AUTO_INCREMENT=[0-9]+)? DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci\z/',$create[0]['Create Table'])) { throw new SubscriptionSqlFailure('mysql_schema_invalid'); }
+			$shown=self::showContract($create[0]['Create Table']); ksort($shown['indexes']);
+			if($shown!==$contract) { throw new SubscriptionSqlFailure('mysql_schema_invalid'); }
+		}
+		$engines=$reads['table-engines']['rows']; $expected=[]; sort($tables,SORT_STRING); foreach($tables as $table) { $expected[]=['table_name'=>$table,'engine'=>'InnoDB']; }
+		if($engines!==$expected || 6!==count($tables)) { throw new SubscriptionSqlFailure('mysql_engine_invalid'); }
+		return $server;
+	}
+	/** A creates only absent owned tables; B independently reads the resulting native metadata. */
+	public static function mysql(SubscriptionSqlSession $db,bool $create):array {
+		$execution=$db->executionReceipt();
+		if($db->isCapture() || null===$execution) { throw new SubscriptionSqlFailure('mysql_session_required'); }
+		$plan=self::metadataPlan($db,$execution['allocation']['database']); $before=[];
+		return $db->observe(static function() use($db,$plan,$create,$before):array {
+			$read=static function(string $sql) use($db):array { $rows=$db->get_results($sql,'ARRAY_A'); if(''!==$db->last_error) { throw new SubscriptionSqlFailure('metadata_read_failed'); } return ['sql'=>$sql,'sql_sha256'=>hash('sha256',$sql),'rows'=>$rows]; };
+			if($create) {
+				$before['session']=$read($plan['queries']['session']); self::validateServer($before['session']['rows'],$plan['database']);
+				$before['table-engines']=$read($plan['queries']['table-engines']);
+				if([]!==$before['table-engines']['rows']) { throw new SubscriptionSqlFailure('schema_collision'); }
+				foreach($plan['captured_ddl']['statements'] as $sql) { self::ddlContract($sql); if(0!==$db->query($sql) || ''!==$db->last_error) { throw new SubscriptionSqlFailure('schema_create_failed'); } }
+			}
+			$reads=[]; foreach($plan['queries'] as $key=>$sql) { $reads[$key]=$read($sql); }
+			$server=self::validateMetadata($plan,$reads);
+			return ['scope'=>'MYSQLI SCHEMA','created'=>$create,'plan'=>$plan,'before'=>$before,'reads'=>$reads,'server'=>$server];
+		},'schema-setup');
+	}
 	/** Finite read contract only. No MySQL SHOW CREATE normalization or schema acceptance is implied. */
 	public static function metadataPlan(SubscriptionSqlSession $db,string $database):array {
 		if(1!==preg_match('/\A[A-Za-z0-9_]{1,64}\z/',$database)) { throw new SubscriptionSqlFailure('metadata_plan_invalid'); }
@@ -46,7 +137,7 @@ final class SubscriptionSqlSchema {
 	}
 	public static function seed( SubscriptionSqlSession $db, array $plan, string $opaqueToken, int $now ): array {
 		if ( $db->prefix !== ( $plan['prefix'] ?? null ) || $plan !== self::plan( $db->prefix ) ) { throw new SubscriptionSqlFailure( 'schema_plan_invalid' ); }
-		if ( ! $db->isCapture() ) { throw new SubscriptionSqlFailure( 'sql_execution_not_authorized_in_checkpoint' ); }
+		if ( ! $db->isCapture() && null===$db->executionReceipt() ) { throw new SubscriptionSqlFailure( 'mysql_session_required' ); }
 		$counts = [];
 		foreach ( $plan['tables'] as $table ) {
 			$count = $db->get_var( 'SELECT COUNT(*) FROM ' . $db->prepare( '%i', $table ) );
@@ -78,7 +169,7 @@ final class SubscriptionSqlSchema {
 		$sentinel = $seed['subscription']; $sentinel['id'] = 42;
 		if ( 1 !== $db->insert( $db->prefix . 'ys_ec_subscriptions', $sentinel ) || '' !== $db->last_error
 			|| 1 !== $db->insert( $db->options, [ 'option_name'=>'ecpay_fixture_sentinel','option_value'=>'preserve-sentinel-bytes','autoload'=>'no' ] ) || '' !== $db->last_error ) { throw new SubscriptionSqlFailure( 'seed_sentinel_failed' ); }
-		return [ 'token_digest' => hash( 'sha256', $opaqueToken ), 'issued_row'=>$issuedRow, 'initial_counts'=>$counts, 'scope' => 'CAPTURE RESULT CONTROL ONLY', 'sql_execution' => 'NOT RUN' ];
+		return [ 'token_digest' => hash( 'sha256', $opaqueToken ), 'issued_row'=>$issuedRow, 'initial_counts'=>$counts, 'scope' => $db->isCapture()?'CAPTURE RESULT CONTROL ONLY':'MYSQLI SEED READBACK', 'sql_execution' => $db->isCapture()?'NOT RUN':'EXECUTED' ];
 	}
 	/** Full raw owned table rows, retaining SQL null and every foreign sibling byte. */
 	public static function snapshot( SubscriptionSqlSession $db ): array {

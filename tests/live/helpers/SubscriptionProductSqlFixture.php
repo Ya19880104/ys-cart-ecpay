@@ -44,6 +44,7 @@ namespace YSCartEcpay\Tests\Live {
 			'tests/regression/v045_subscription_sql_controller_protocol.php',
 			'tests/regression/v046_subscription_sql_seed_fault_boundaries.php',
 			'tests/regression/v047_subscription_sql_evidence_provenance.php',
+			'tests/regression/v048_subscription_mysql_slice_admission.php',
 		];
 		private static function git( string $root, array $args ): string {
 			$process = proc_open( [ 'git', '-C', $root, ...$args ], [ 0 => [ 'pipe', 'r' ], 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );

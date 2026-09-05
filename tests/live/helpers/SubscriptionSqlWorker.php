@@ -25,13 +25,18 @@ final class SubscriptionSqlWorker {
 		$id = $db->identity()['connection_id'];
 		if ( ! is_string( $id ) || 1 !== preg_match( '/\A[1-9][0-9]{0,19}\z/', $id ) ) { throw new SubscriptionSqlFailure( 'worker_identity_missing' ); }
 		$receipt = SubscriptionSqlEvidence::persist( $barrier->path(), strtolower( $p['case'] ) . '-' . $stage . '-receipt.json',
-			[ 'version'=>1,'phase'=>$p['phase'],'case'=>$p['case'],'role'=>$p['role'],'sequence'=>$sequence,'scope'=>'CAPTURE CONTROL FLOW ONLY','data'=>$data ] );
+			[ 'version'=>1,'phase'=>$p['phase'],'case'=>$p['case'],'role'=>$p['role'],'sequence'=>$sequence,'scope'=>$db->isCapture()?'CAPTURE CONTROL FLOW ONLY':'MYSQLI WORKER','data'=>$data ] );
 		return $barrier->publish( $p['case'], $stage, $p['role'], $id, $receipt );
 	}
-	/** Real product code over supplied capture transports. There is deliberately no live lane. */
+	/** The finite product schedules are shared; only admitted B2 sessions may execute SQL. */
 	public static function run( array $packet, SubscriptionSqlSession $a, ?SubscriptionSqlSession $b, SubscriptionSqlBarrier $barrier ): array {
 		$p = self::validatePacket( $packet ); $case = $p['case']; $role = $p['role'];
-		if ( ! $a->isCapture() || ( null !== $b && ! $b->isCapture() ) ) { throw new SubscriptionSqlFailure( 'sql_execution_not_authorized_in_checkpoint' ); }
+		$mysql=!$a->isCapture();
+		if($mysql) {
+			SubscriptionSqlEvidence::assertMysqlCase($case);
+			$execution=$a->executionReceipt();
+			if(null!==$b || null===$execution || $execution['allocation']!==$p['allocation'] || $execution['context']['case']!==$case || $execution['context']['source_heads']!==$p['source_heads']) { throw new SubscriptionSqlFailure('mysql_session_required'); }
+		} elseif(null!==$b && !$b->isCapture()) { throw new SubscriptionSqlFailure('worker_session_invalid'); }
 		if ( ! $a->ready || $a->prefix !== $p['allocation']['prefix'] || basename( $barrier->path() ) !== $p['phase'] || ( null !== $b && ( $b === $a || $b->prefix !== $a->prefix || ! $b->ready ) )
 			|| ( 'A' === $role && in_array( $case, ['P7','P8','P9','P10'], true ) && null === $b ) ) { throw new SubscriptionSqlFailure( 'worker_session_invalid' ); }
 		$sources = SubscriptionProductSqlFixture::inspectSources( [ 'core'=>getenv( 'YS_CORE_ROOT' ),'ecpay'=>getenv( 'YS_ECPAY_ROOT' ),'affiliate'=>getenv( 'YS_AFFILIATE_ROOT' ) ] );
@@ -44,17 +49,19 @@ final class SubscriptionSqlWorker {
 		$oldDb = $GLOBALS['wpdb'] ?? null; $oldPlugin = $GLOBALS['ecpay_sql_plugin'] ?? null;
 		$GLOBALS['wpdb'] = $a; $GLOBALS['ecpay_sql_plugin'] = new \YangSheep\YSCartEcpay\Plugin();
 		$registry = \YangSheep\Ecommerce\Shipping\YSShippingRegistry::class; $enabled = $registry::$enabled; $provider = $registry::$fixtureProvider;
-		$barriers = []; $projection = null; $interference = null; $response = null;
+		$barriers = []; $projection = null; $interference = null; $response = null; $schema=null;
 		$fault = SubscriptionSqlFaults::arm( $case, $role );
 		try {
 			$a->observe( static fn (): mixed => $a->get_row( SubscriptionSqlSession::SESSION_SQL, 'ARRAY_A' ) );
 			if ( 'A' === $role ) {
+				if($mysql) { $schema=SubscriptionSqlSchema::mysql($a,true); }
 				$seed = $a->observe( static fn (): array => SubscriptionSqlSchema::seed( $a, SubscriptionSqlSchema::plan( $a->prefix ), $p['token'], 1788566400 ), 'schema-setup' );
 				if ( 'P11d' === $case ) { $interference = $a->observe( static fn (): array => SubscriptionSqlSchema::interfere( $a, $p['token'], $case ), 'schema-setup' ); }
 				$baseline = $a->observe( static fn (): array => SubscriptionSqlSchema::snapshot( $a ) );
 				$barriers[] = self::signal( $barrier, $p, 'setup-complete', 1, $a, [ 'baseline'=>$baseline,'seed'=>$seed ] );
 			} else {
 				$setup = $barrier->awaitBound( $case, 'setup-complete' ); $baseline = $setup['receipt']['data']['baseline']; $seed = $setup['receipt']['data']['seed'];
+				if($mysql) { $schema=SubscriptionSqlSchema::mysql($a,false); }
 			}
 			$action = static function ( string $name ) use ( $a, $b, $barrier, $p, &$barriers, &$interference ): void {
 				if ( 'none' === $name ) { return; }
@@ -117,11 +124,13 @@ final class SubscriptionSqlWorker {
 				$projection = $a->observe( static function (): array { $row = \YangSheep\Ecommerce\Models\YSSubscription::find(41); return \YangSheep\Ecommerce\Services\Subscription\YSSubscriptionFulfillmentProfileService::renewal_projection( $row ); } );
 			}
 			if ( 'B' === $role ) { $barriers[] = self::signal( $barrier, $p, 'b-complete', 2, $a, [ 'readback_sha256'=>hash( 'sha256', json_encode( $readback, JSON_THROW_ON_ERROR ) ) ] ); }
-			return [ 'version'=>1,'phase'=>$p['phase'],'case'=>$case,'role'=>$role,'topology'=>SubscriptionSqlEvidence::cases()[$case]['topology'],
-				'source_receipt'=>['sources'=>$sources,'products'=>$products,'helpers'=>SubscriptionProductSqlFixture::helperReceipt(__DIR__)], 'runtime_receipt'=>['version'=>PHP_VERSION,'sha256'=>hash_file('sha256',PHP_BINARY),'scope'=>'CAPTURE ONLY'],
+			$receipt=[ 'version'=>1,'phase'=>$p['phase'],'case'=>$case,'role'=>$role,'topology'=>SubscriptionSqlEvidence::cases()[$case]['topology'],
+				'source_receipt'=>['sources'=>$sources,'products'=>$products,'helpers'=>SubscriptionProductSqlFixture::helperReceipt(__DIR__)], 'runtime_receipt'=>['version'=>PHP_VERSION,'sha256'=>hash_file('sha256',PHP_BINARY),'scope'=>$mysql?'MYSQLI EXECUTION':'CAPTURE ONLY'],
 				'session_receipts'=>['identity'=>$a->identity(),'replacements'=>$a->physicalReplacements(),'closes'=>$a->closes(),'ready'=>$a->ready], 'statement_receipts'=>$a->statements(),'barrier_receipts'=>$barriers,
 				'baseline_receipt'=>$baseline,'readback_receipt'=>$readback,'product_response'=>$response,'projection_receipt'=>$projection,'fault_receipt'=>array_merge($fault->finish(),['interference'=>$interference]),
 				'diagnostics'=>['log'=>['path'=>realpath($logPath),'bytes'=>filesize($logPath),'sha256'=>hash_file('sha256',$logPath)]], 'rc'=>0 ];
+			if($mysql) { $receipt['mysql_receipt']=['connector'=>$a->executionReceipt(),'schema'=>$schema]; }
+			return $receipt;
 		} finally {
 			$a->instrument( null, null ); unset( $GLOBALS['ecpay_sql_before_real_claim'] ); $GLOBALS['wpdb'] = $oldDb; $GLOBALS['ecpay_sql_plugin'] = $oldPlugin;
 			$registry::$enabled = $enabled; $registry::$fixtureProvider = $provider; ini_set( 'error_log', (string) $oldLog ); ini_set( 'log_errors', (string) $oldLogErrors );

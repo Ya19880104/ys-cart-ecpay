@@ -35,6 +35,50 @@ final class SubscriptionSqlController {
 		self::$admissions[hash('sha256',json_encode($run,JSON_THROW_ON_ERROR))]=['env'=>$env,'sources'=>$sources];
 		return $run;
 	}
+	/** Reuses the B1 run envelope and supervisor; the parent never owns a database handle. */
+	public static function runMysql(array $admitted,string $phaseRoot):array {
+		$stamp=self::$admissions[hash('sha256',json_encode($admitted,JSON_THROW_ON_ERROR))]??null;
+		if(null===$stamp) { throw new SubscriptionSqlFailure('controller_admission_required'); }
+		self::admit($admitted,$stamp['env'],$stamp['sources']);
+		foreach($admitted['cases'] as $case) {
+			SubscriptionSqlEvidence::assertMysqlCase($case);
+			if('sql-execution'!==$admitted['allocations'][$case]['kind']) { throw new SubscriptionSqlFailure('sql_execution_allocation_required'); }
+		}
+		if(false===getenv('YS_TEST_MYSQL_PASSWORD') || ''===getenv('YS_TEST_MYSQL_PASSWORD')) { throw new SubscriptionSqlFailure('execution_password_required'); }
+		$helpers=SubscriptionProductSqlFixture::helperReceipt(__DIR__);
+		if('CANONICAL'!==$helpers['state'] || $helpers['head']!==$admitted['source_heads']['ecpay']) { throw new SubscriptionSqlFailure('execution_clean_source_required'); }
+		if(!extension_loaded('mysqli')) { throw new SubscriptionSqlFailure('mysqli_required'); }
+		SubscriptionProductSqlFixture::loadProduct($stamp['sources']);
+		$phase=SubscriptionSqlBarrier::createPhase($phaseRoot,$admitted['phase']); $cases=[];
+		foreach($admitted['cases'] as $case) {
+			$children=[]; $token=bin2hex(random_bytes(16)); $allocation=$admitted['allocations'][$case];
+			try {
+				foreach(['A','B'] as $role) {
+					$packet=['version'=>1,'phase'=>$admitted['phase'],'case'=>$case,'role'=>$role,'allocation'=>$allocation,'source_heads'=>$admitted['source_heads'],'token'=>$token,'runtime_sha256'=>$admitted['runtime_sha256']];
+					$base=$phase->path().'/'.strtolower($case.'-'.$role);
+					$command=[PHP_BINARY,'-n','-d','extension_dir='.ini_get('extension_dir'),'-d','extension=mysqli','-d','error_reporting=-1','-d','display_errors=stderr','-d','log_errors=0',dirname(__DIR__).'/live_subscription_product_pair.php','--driver=adapter','--mode=mysql-worker','--role='.$role,'--phase='.$admitted['phase'],'--evidence-root='.$phaseRoot];
+					$env=getenv();
+					foreach(['YS_TEST_MYSQL_DSN'=>$allocation['host'].':'.$allocation['port'],'YS_TEST_MYSQL_DB'=>$allocation['database'],'YS_TEST_MYSQL_USER'=>$allocation['user'],'YS_ECPAY_SQL_PREFIX'=>$allocation['prefix']] as $key=>$value) { $env[$key]=$value; }
+					$process=proc_open($command,[0=>['pipe','r'],1=>['file',$base.'.stdout.txt','x'],2=>['file',$base.'.stderr.txt','x']],$pipes,null,$env);
+					unset($env);
+					if(!is_resource($process)) { throw new SubscriptionSqlFailure('worker_start_failed'); }
+					$children[]=['process'=>$process,'base'=>$base,'case'=>$case,'role'=>$role,'phase'=>$admitted['phase'],'token_digest'=>hash('sha256',$token),'command'=>$command,'mysql'=>true];
+					$private=json_encode($packet,JSON_THROW_ON_ERROR); $written=fwrite($pipes[0],$private); fclose($pipes[0]);
+					if($written!==strlen($private)) { throw new SubscriptionSqlFailure('worker_input_failed'); }
+					unset($private,$packet);
+				}
+				$supervised=self::supervise($children,30000); $workers=[]; $refs=[];
+				foreach($supervised['workers'] as $child) { $role=$child['result']['role']; $refs[$role]=$child['result']['receipt']; $workers[$role]=SubscriptionSqlEvidence::read($phase->path(),$refs[$role]); }
+				$baseline=['version'=>1,'phase'=>$admitted['phase'],'case'=>$case,'prefix'=>$allocation['prefix'],'source_heads'=>$admitted['source_heads'],'runtime_sha256'=>$admitted['runtime_sha256'],'token_digest'=>hash('sha256',$token),'tables'=>$workers['A']['baseline_receipt']];
+				$baseRef=SubscriptionSqlEvidence::persist($phase->path(),strtolower($case).'-baseline.json',$baseline);
+				$verdict=SubscriptionSqlEvidence::evaluateMysql($case,$baseline,$workers,['root'=>$phase->path(),'workers'=>$refs]);
+				$cases[$case]=['baseline'=>$baseRef,'workers'=>$supervised['workers'],'verdict'=>$verdict];
+				SubscriptionSqlEvidence::persist($phase->path(),strtolower($case).'-verdict.json',$cases[$case]);
+				if(!$verdict['matches']) { throw new SubscriptionSqlFailure('mysql_slice_oracle_failed'); }
+			} finally { unset($token); foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
+		}
+		return ['scope'=>'MYSQLI P1/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
+	}
 	/** Launches only the CLI's IPC echo lane, which does not load product or create a Session. */
 	public static function runOffline( array $admitted, string $phaseRoot ): array {
 		$stamp=self::$admissions[hash('sha256',json_encode($admitted,JSON_THROW_ON_ERROR))]??null;
@@ -71,10 +115,17 @@ final class SubscriptionSqlController {
 			$closed = proc_close( $child['process'] ); $rc = $status['exitcode'] >= 0 ? $status['exitcode'] : $closed;
 			$stdout = (string) file_get_contents( $child['base'] . '.stdout.txt' ); $stderr = (string) file_get_contents( $child['base'] . '.stderr.txt' );
 			$result = json_decode( $stdout, true );
+			if(true===($child['mysql']??false)) {
+				if(0!==$rc || ''!==$stderr || !SubscriptionSqlEvidence::exactKeys($result,['version','phase','case','role','scope','token_digest','connection_attempts','sql_execution','receipt']) || 1!==$result['version'] || $child['phase']!==$result['phase'] || $child['case']!==$result['case'] || $child['role']!==$result['role'] || $child['token_digest']!==$result['token_digest'] || 1!==$result['connection_attempts'] || 'MYSQLI WORKER'!==$result['scope'] || 'EXECUTED'!==$result['sql_execution'] || !is_array($result['receipt'])) { throw new SubscriptionSqlFailure('worker_result_invalid'); }
+				SubscriptionSqlEvidence::read(dirname($child['base']),$result['receipt']);
+				$results[]=['rc'=>$rc,'result'=>$result,'command'=>$child['command'],'stdout'=>['path'=>$child['base'].'.stdout.txt','bytes'=>strlen($stdout),'sha256'=>hash('sha256',$stdout)],'stderr'=>['path'=>$child['base'].'.stderr.txt','bytes'=>0,'sha256'=>hash('sha256','')]];
+				continue;
+			}
 			if ( 0 !== $rc || '' !== $stderr || ! SubscriptionSqlEvidence::exactKeys($result,['version','phase','case','role','scope','token_digest','connection_attempts','sql_execution']) || 1!==$result['version'] || $child['phase']!==$result['phase'] || 0!==$result['connection_attempts'] || 'NOT RUN'!==$result['sql_execution'] || 'IPC ONLY' !== ( $result['scope'] ?? null ) || $child['role'] !== ( $result['role'] ?? null ) || $child['case'] !== ( $result['case'] ?? null )
 				|| $child['token_digest'] !== ( $result['token_digest'] ?? null ) ) { throw new SubscriptionSqlFailure( 'worker_result_invalid' ); }
 			$results[] = [ 'rc' => $rc, 'result' => $result, 'command' => $child['command'], 'stdout' => [ 'path' => $child['base'] . '.stdout.txt', 'bytes' => strlen( $stdout ), 'sha256' => hash( 'sha256', $stdout ) ], 'stderr' => [ 'path' => $child['base'] . '.stderr.txt', 'bytes' => strlen( $stderr ), 'sha256' => hash( 'sha256', $stderr ) ] ];
 		}
-		return [ 'scope' => 'IPC ONLY', 'sql_execution' => 'NOT RUN', 'workers' => $results ];
+		$mysql=true===($children[0]['mysql']??false);
+		return [ 'scope' => $mysql?'MYSQLI WORKERS':'IPC ONLY', 'sql_execution' => $mysql?'EXECUTED':'NOT RUN', 'workers' => $results ];
 	}
 }

@@ -1,5 +1,5 @@
 <?php
-/** Transport boundary for the product-SQL harness. This checkpoint cannot open connections. */
+/** Capture transport and separately admitted, loopback-only mysqli worker sessions. */
 declare(strict_types=1);
 namespace YSCartEcpay\Tests\Live;
 
@@ -19,16 +19,53 @@ final class SubscriptionSqlSession {
 	private string $origin = 'product';
 	private int $replacements = 0;
 	private bool $capture = false;
+	private ?array $execution = null;
 	private array $closeReceipts = [];
 	public const SESSION_SQL = 'SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, CAST(@ys_profile_tx_owner AS CHAR) AS owner';
 	private function __construct( public string $prefix, private \Closure $execute, private \Closure $quote, private \Closure $disconnect ) {
 		$this->options = $prefix . 'options';
 	}
 	public static function connectionAttempts(): int { return self::$connectionAttempts; }
-	/** No receipt, environment flag or caller may turn this offline checkpoint into SQL execution. */
-	public static function connect( array $allocation, ?callable $connector = null ): never {
-		unset( $allocation, $connector );
-		throw new SubscriptionSqlFailure( 'sql_execution_not_authorized_in_checkpoint' );
+	/** Pure admission is repeated immediately before each physical connector call. */
+	public static function admitExecution(array $allocation,array $context):array {
+		require_once __DIR__.'/SubscriptionSqlAllocation.php';
+		require_once __DIR__.'/SubscriptionProductSqlFixture.php';
+		require_once __DIR__.'/SubscriptionSqlEvidence.php';
+		$allocation=SubscriptionSqlAllocation::validate($allocation);
+		if('sql-execution'!==$allocation['kind']) { throw new SubscriptionSqlFailure('sql_execution_allocation_required'); }
+		if(!SubscriptionSqlEvidence::exactKeys($context,['case','source_heads','runtime_sha256']) || !is_string($context['case']) || !SubscriptionSqlEvidence::exactKeys($context['source_heads'],['core','ecpay','affiliate']) || !is_string($context['runtime_sha256'])) { throw new SubscriptionSqlFailure('execution_context_invalid'); }
+		SubscriptionSqlEvidence::assertMysqlCase($context['case']);
+		if(!hash_equals(hash_file('sha256',PHP_BINARY),$context['runtime_sha256'])) { throw new SubscriptionSqlFailure('execution_runtime_mismatch'); }
+		foreach(['YS_TEST_MYSQL_DSN'=>$allocation['host'].':'.$allocation['port'],'YS_TEST_MYSQL_DB'=>$allocation['database'],'YS_TEST_MYSQL_USER'=>$allocation['user'],'YS_ECPAY_SQL_PREFIX'=>$allocation['prefix']] as $key=>$value) {
+			if($value!==getenv($key)) { throw new SubscriptionSqlFailure('execution_environment_mismatch'); }
+		}
+		$sources=SubscriptionProductSqlFixture::inspectSources(['core'=>getenv('YS_CORE_ROOT'),'ecpay'=>getenv('YS_ECPAY_ROOT'),'affiliate'=>getenv('YS_AFFILIATE_ROOT')]);
+		if(array_map(static fn(array $s):string=>$s['head'],$sources)!==$context['source_heads']) { throw new SubscriptionSqlFailure('execution_source_mismatch'); }
+		return $allocation;
+	}
+	public static function connect(array $allocation,?callable $connector=null,?array $context=null):self {
+		if(null===$context) { throw new SubscriptionSqlFailure('sql_execution_not_authorized_in_checkpoint'); }
+		if(null!==$connector) { throw new SubscriptionSqlFailure('caller_connector_forbidden'); }
+		self::admitExecution($allocation,$context);
+		$password=getenv('YS_TEST_MYSQL_PASSWORD');
+		if(false===$password || ''===$password) { throw new SubscriptionSqlFailure('execution_password_required'); }
+		if(!extension_loaded('mysqli')) { throw new SubscriptionSqlFailure('mysqli_required'); }
+		$helpers=SubscriptionProductSqlFixture::helperReceipt(__DIR__);
+		if('CANONICAL'!==$helpers['state'] || $helpers['head']!==$context['source_heads']['ecpay']) { throw new SubscriptionSqlFailure('execution_clean_source_required'); }
+		$link=mysqli_init();
+		if(false===$link) { throw new SubscriptionSqlFailure('mysqli_initialization_failed'); }
+		try {
+			$link->options(MYSQLI_OPT_CONNECT_TIMEOUT,5);
+			$link->options(MYSQLI_OPT_READ_TIMEOUT,10);
+			$link->options(MYSQLI_INIT_COMMAND,'SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci');
+			self::admitExecution($allocation,$context);
+			++self::$connectionAttempts;
+			if(!@$link->real_connect($allocation['host'],$allocation['user'],$password,$allocation['database'],$allocation['port'])) { throw new SubscriptionSqlFailure('mysqli_connection_failed'); }
+		} catch(\Throwable $error) { $link->close(); throw new SubscriptionSqlFailure('mysqli_connection_failed'); }
+		finally { unset($password); }
+		$self=self::fromMysqli($link,$allocation['prefix']);
+		$self->execution=['driver'=>'mysqli','allocation'=>$allocation,'context'=>$context,'connection_attempts'=>1,'mysqli_client'=>mysqli_get_client_info(),'init_command'=>'SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci'];
+		return $self;
 	}
 	/** Supplied-handle adapter for a future separately authorized worker; never connects itself. */
 	public static function fromMysqli( \mysqli $link, string $prefix ): self {
@@ -54,8 +91,20 @@ final class SubscriptionSqlSession {
 		return $self;
 	}
 	public function isCapture(): bool { return $this->capture; }
+	public function executionReceipt():?array { return $this->execution; }
 	public function identity(): array { return $this->identity; }
 	public function statements(): array { return $this->trace; }
+	/** A failed worker can retain incomplete native work, but can never award SQL acceptance. */
+	public function failureEvidence(string $root,string $name):array {
+		if($this->capture) { throw new SubscriptionSqlFailure('mysql_session_required'); }
+		require_once __DIR__.'/SubscriptionSqlEvidence.php';
+		$ref=SubscriptionSqlEvidence::persist($root,$name,[
+			'scope'=>'UNPROVEN MYSQLI FAILURE','connector'=>$this->execution,
+			'session'=>['identity'=>$this->identity,'ready'=>$this->ready,'closes'=>$this->closeReceipts],
+			'statement_receipts'=>$this->trace,
+		]);
+		return ['sql_execution'=>'UNPROVEN','sql_statements'=>$this->dispatches,'failure_trace'=>$ref];
+	}
 	public function closes(): array { return $this->closeReceipts; }
 	public function physicalReplacements(): int { return $this->replacements; }
 	public function instrument( ?callable $before, ?callable $after ): void {

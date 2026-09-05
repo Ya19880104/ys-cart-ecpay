@@ -1,9 +1,10 @@
-# Subscription product-SQL harness: offline checkpoint only
+# Subscription product-SQL harness: B1 offline and B2 mysqli slice
 
-This is not the two-session SQL acceptance runner. The CLI can validate an offline
-allocation and exact product sources, or capture product-generated DDL. Every
-`execute` request is hard-refused before any connector can be invoked, even when
-an allocation says `sql-execution`. It never creates, seeds, alters or drops tables.
+The offline modes validate an allocation and exact product sources, or capture
+product-generated DDL, without connecting. B2 adds a separately admitted real
+mysqli execution path for **P1 and P11a–h only**. Its implementation and offline
+regressions do not prove SQL acceptance: each case still requires a reviewed clean
+source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
 its handwritten CAS is not evidence for this product-path checkpoint.
 
@@ -26,24 +27,61 @@ The allocation is a local JSON design receipt with exactly `kind`, `host`, integ
 `port`, `database`, `user`, `prefix` and integer future Unix `expires_at`. All other
 fields, including secret-like fields, are rejected; other five fields must be
 nonempty strings, never coerced scalars. Only
-`offline-design` and `sql-execution` are recognized; neither grants SQL authority
-in this checkpoint. All tuple fields must equal the explicit environment values.
+`offline-design` and `sql-execution` are recognized; offline mode never promotes
+either into execution. All tuple fields must equal the explicit environment values.
 No password or selection token belongs in arguments, allocation or evidence. A
-future SQL implementation needs a fresh root-owned allocation, session-only
-credentials, reviewed connection code and a freshly pinned product pair. Merely
-editing this receipt does not authorize that implementation or execution.
+SQL run needs a fresh root-owned allocation, session-only credentials, reviewed
+connection code and a freshly pinned product pair.
 
 Success is one JSON result and exit 0; rejection is a typed code and exit 2.
-Both report zero connection attempts and SQL statements, `sql_execution=NOT RUN`
+Both offline modes report zero connection attempts and SQL statements, `sql_execution=NOT RUN`
 and `native_wpdb=PREREQUISITE UNSATISFIED`. Existing phases are never reused.
 Captured DDL is retained in the fresh phase with its SHA-256 receipt.
+
+## B2 execution entry
+
+PHP **8.5 is primary**, with PHP 8.2 as the affected compatibility gate. Explicitly
+load `mysqli` in the parent using `-n -d extension_dir=<runtime-ext> -d extension=mysqli`.
+Use the same CLI with `--driver=adapter --mode=execute --phase=<unique-phase>
+--evidence-root=<existing-local-directory>`. `YS_ECPAY_SQL_RUN` points to the
+nonsecret B1 run envelope: exact keys `version,phase,cases,allocations,source_heads,
+runtime_sha256,driver`, version 1, driver `adapter`. Cases are an ordered unique
+subset of `P1,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h`; every case has a distinct
+prefix and its own seven-key `sql-execution` allocation. Every other SQL case is
+rejected before a phase or worker is created.
+
+Supply `YS_TEST_MYSQL_DSN`, `YS_TEST_MYSQL_DB`, `YS_TEST_MYSQL_USER`,
+`YS_TEST_MYSQL_PASSWORD`, and the three source-root environment variables only in
+the current process/session. The parent checks the common literal tuple and gives
+each private child its allocated prefix. No credential defaults, password arguments,
+packet dumps, or retained secret configuration exist. The worker rechecks allocation
+expiry, case, exact tuple, runtime and clean source immediately before connecting.
+Caller connector callbacks and supplied/capture handles cannot acquire admission.
+
+The parent creates no database connection. Each A/B worker owns one physical mysqli
+session; B remains in autocommit and reads after A's completion. A first verifies
+the MySQL 8.4 server/session and absence of all six literal names in the assigned
+existing disposable database, then executes the actual five TableMaker CREATEs and
+the options fixture. Both workers verify all captured columns and indexes plus
+SHOW CREATE and InnoDB metadata. Unsupported DDL shapes fail closed. No CREATE
+DATABASE, ALTER, repair, DROP, reuse, or automatic cleanup is performed. Collision
+and failed runs retain their artifacts and tables; a later run needs fresh prefixes.
+
+Real raw statement results are retained, including MySQL defaults, `option_id`,
+COUNT column names and SELECT row counts. `evaluateMysql` independently validates
+native schema/session traces, distinct A/B connection IDs, finite dispatches,
+actual/presented equality and B's complete six-table readback. P1 requires the
+committed profile/selection pair plus actual renewal projection; P11 requires the
+original finite rejection and unchanged full rows. Re-labeling capture evidence
+cannot satisfy this evaluator. JSON reports only the cases actually accepted,
+lists unrun cases, and keeps WordPress native/reconnect/contention gates unproven.
 
 ## Product custody and permitted fixture boundaries
 
 Core is pinned to `47b07b523445492c163b26ba7047c19d64911c0b`; Affiliate is pinned
 read-only to `18c609a1b94cca28e57c2ce4f225f25662555ccd`. All three roots must be clean.
 ECPay product bytes are pinned to `445adc76c4dc6653abdd228b529bad636eef5d42`;
-only descendants whose entire changed-path set is in the twenty-path explicit
+only descendants whose entire changed-path set is in the twenty-one-path explicit
 harness allowlist are admitted (unknown tests and package paths also reject).
 Each loaded class's raw file blob is checked
 against that revision and its Reflection path checked against the real file.
@@ -65,8 +103,8 @@ not a claim about a pinned native WordPress schema.
 `SubscriptionSqlSession::forCapture` records statements and returns the recorder's
 declared rows/affected count. That is only a statement-origin proof, never SQL,
 locking, storage-engine or commit correctness. `fromMysqli` is a supplied-handle
-adapter for later separately authorized work; it does not connect, is not native
-wpdb, and has not been exercised against a server in this checkpoint. Its limited
+adapter used by the separately admitted connector; it does not itself connect and
+is not native wpdb. Its limited
 prepare contract accepts unquoted `%s`, `%d`, `%f`, `%i`, `%%` and exact arity;
 unsupported forms and noncanonical integers fail closed.
 
@@ -114,9 +152,9 @@ proof. Actual contention must later be observed, not inferred from a sleep.
 requires distinct per-case prefixes, and supervises only its owned IPC children.
 Its `runOffline` launches the `ipc-worker` echo lane, not SQL work. Private worker
 packets travel in stdin; neither token nor password belongs in argv or receipts.
-Both `execute` and native WordPress still refuse unconditionally.
+The B2 `runMysql` path is separately admitted; native WordPress still refuses.
 
-`SubscriptionSqlWorker::run` accepts only explicitly supplied capture sessions.
+The B1 `SubscriptionSqlWorker::run` path uses explicitly supplied capture sessions.
 The v046/v047 control parent launches independent PHP A/B children, invokes real
 coordinator/model/selector/store methods, and supplies finite complete SQL result
 controls. Its capture files simulate committed/interfered rows, not MySQL storage.
@@ -138,16 +176,16 @@ satisfy the oracle; B must return authority_changed, not a postcommit stale repl
 capture boundary, requires six empty-table counts, preserves typed SQL NULL and
 checks the complete issued record. Full table snapshots retain immutable rows,
 sentinels, options bytes and zero orders/outbox. Setup and controlled interference
-are separately labeled from product writes. There is no automatic CREATE or cleanup.
+are separately labeled from product writes. The capture path performs no CREATE;
+neither path performs cleanup.
 
 `metadataPlan` enumerates exactly twenty read statements: server/session settings,
 the six literal table engines and six sets of SHOW CREATE / FULL COLUMNS / INDEX.
 `captureMetadata` binds the exact plan, captures raw rows and SQL hashes with observer
 origin, and returns `UNVALIDATED CAPTURE METADATA` / `schema_acceptance=UNSATISFIED`.
 It is a raw capture contract only, not a MySQL metadata normalizer or schema validator.
-Actual MySQL8.4 version/settings admission, before-CREATE collision handling, full
-product-column/index/default/engine comparison and worker acceptance integration
-remain a separately reviewed prerequisite before any future SQL execution unlock.
+The separate B2 path supplies MySQL8.4 version/settings admission, before-CREATE
+collision handling and full product-column/index/default/engine comparison.
 The metadata contract is intentionally not accepted by the scenario oracle as server
 proof. No supplied capture row, even one labeled InnoDB, can complete that gate.
 
@@ -178,9 +216,9 @@ parent/child stderr. These are source-only offline tests, not SQL acceptance.
 
 Still NOT RUN: every true MySQL seed/commit/rollback/locking/reconnect scenario,
 actual server/schema/engine acceptance and genuine native WordPress reconnect.
-Still NOT IMPLEMENTED: reviewed SQL connector/unlock and integrated metadata/schema
-acceptance, historical dbeb split-state loader/control, materialized-period/YSOrder
+Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.
-There is no automatic DDL or cleanup path. ECPay remains subscription logistics /
+Only the separately allocated B2 slice may execute its six CREATEs; there is no
+automatic cleanup path. ECPay remains subscription logistics /
 member selection only (`supports_token=false`), not recurring-payment capability.
