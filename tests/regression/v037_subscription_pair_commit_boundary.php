@@ -592,12 +592,13 @@ namespace {
 		echo "FAIL {$label}\n";
 	};
 
-	// error_log() reaches STDERR under CLI; the strict pair gate requires zero
-	// unexpected STDERR, so typed evidence is captured in a scratch file.
+	// Keep application logs separate from strict PHP STDERR, but retain every
+	// raw byte and make unexpected diagnostics fail the normal test verdict.
+	require_once __DIR__ . '/helpers/SubscriptionApplicationLog.php';
 	$pair_error_log_previous = ini_get( 'error_log' );
-	$pair_error_log_file = sys_get_temp_dir() . '/yscart-v037-pair-' . getmypid() . '.log';
-	@unlink( $pair_error_log_file );
-	ini_set( 'error_log', $pair_error_log_file );
+	$pair_error_log_file = \YSCartEcpay\Tests\SubscriptionApplicationLog::start(
+		defined( 'V037_FIXTURE_ONLY' ) && V037_FIXTURE_ONLY ? 'yscart-v039-application' : 'yscart-v037-application'
+	);
 
 	$GLOBALS['v037_plugin'] = new Plugin();
 
@@ -975,13 +976,19 @@ namespace {
 			&& 0 === $GLOBALS['wpdb']->cas_updates
 	);
 
-	$pair_evidence = is_file( $pair_error_log_file ) ? (string) file_get_contents( $pair_error_log_file ) : '';
 	ini_set( 'error_log', is_string( $pair_error_log_previous ) ? $pair_error_log_previous : '' );
-	@unlink( $pair_error_log_file );
+	$pair_log_receipt = \YSCartEcpay\Tests\SubscriptionApplicationLog::inspect( $pair_error_log_file, [
+		'[YS CART][subscription] profile_update_commit_indeterminate subscription_id=41' => 2,
+		'[YS-EC] [error] [subscription] subscription_db_boundary_poisoned reason=profile_update_rollback_unacknowledged subscription_id=41 order_id=0' => 1,
+		'[YS CART][subscription] profile_update_rollback_resolved_by_disconnect subscription_id=41' => 3,
+		'[YS CART][subscription] profile_update_session_drift subscription_id=41' => 1,
+		'[YS CART][subscription] profile_update_commit_indeterminate reason=session_drift subscription_id=41' => 1,
+	] );
 	$check(
-		'both ambiguous COMMIT outcomes left typed non-DB reconciliation evidence',
-		2 === substr_count( $pair_evidence, 'profile_update_commit_indeterminate subscription_id=41' )
+		'application log contains exactly the named intentional fault events and counts, with all raw bytes retained',
+		$pair_log_receipt['ok']
 	);
+	echo 'APPLICATION_LOG ' . json_encode( $pair_log_receipt, JSON_UNESCAPED_SLASHES ) . "\n";
 
 	echo "subscription pair commit boundary: {$pass} PASS / {$fail} FAIL\n";
 	exit( $fail > 0 ? 1 : 0 );

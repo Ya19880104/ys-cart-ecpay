@@ -192,8 +192,10 @@ namespace {
 		&& [ 'account_handlers', 'ecpay_subscription_fulfillment' ] === array_keys( $assets['scripts'] ?? [] ) );
 
 	ini_set( 'error_log', is_string( $pair_error_log_previous ) ? $pair_error_log_previous : '' );
-	if ( is_file( $pair_error_log_file ) ) { unlink( $pair_error_log_file ); }
+	$vertical_log_receipt = \YSCartEcpay\Tests\SubscriptionApplicationLog::inspect( $pair_error_log_file, [] );
+	$check( 'application log is expected-empty with all raw bytes retained', $vertical_log_receipt['ok'] );
 	echo implode( "\n", $assertions ) . "\n";
+	echo 'APPLICATION_LOG ' . json_encode( $vertical_log_receipt, JSON_UNESCAPED_SLASHES ) . "\n";
 	echo "subscription account to renewal vertical: {$pass} PASS / {$fail} FAIL\n";
 	exit( $fail > 0 ? 1 : 0 );
 }
