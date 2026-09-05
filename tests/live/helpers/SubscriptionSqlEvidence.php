@@ -95,10 +95,20 @@ final class SubscriptionSqlEvidence {
 			$id=$session['identity'];
 			self::need(is_string($id['connection_id']) && 1===preg_match('/\A[1-9][0-9]{0,19}\z/',$id['connection_id']) && is_string($id['database']) && 1===preg_match('/\A[A-Za-z0-9_]{1,64}\z/',$id['database']) && (null===$id['owner_nonce'] || (is_string($id['owner_nonce']) && 1===preg_match('/\A[a-f0-9]{32}\z/',$id['owner_nonce']))), 'session_receipt_invalid');
 			self::need('' === self::raw($artifacts['root'],$w['diagnostics']['stderr']) && self::logMatches(self::raw($artifacts['root'],$w['diagnostics']['log']),self::events($case,$role)), 'unexpected_diagnostics');
+			self::statements($case,$role,$w['statement_receipts']);
+			if(in_array($case,['P12a','P12b'],true)) {
+				$i=$w['fault_receipt']['interference']??null;
+				self::need(self::exactKeys($i,['case','option_name','before_bytes','after_bytes','sql_sha256']) && $i['case']===$case && is_string($i['option_name']) && is_string($i['before_bytes']) && is_string($i['after_bytes']) && is_string($i['sql_sha256']) && 1===preg_match('/\A[a-f0-9]{64}\z/',$i['sql_sha256']), 'interference_invalid');
+			}
+			self::faultProof($case,$role,$w);
+		}
+		// Admit both workers before dispatch consumes any peer identity or interference bytes.
+		foreach(['A','B'] as $role) {
+			$w=$workers[$role];
+			self::dispatchProof($case,$role,$base,$workers,$artifacts['root']);
 			self::counts($case,$role,$w['statement_receipts']);
 			self::statementAuthority($w['statement_receipts'],$base['prefix'],$before);
 			self::barriers($case,$role,$w['barrier_receipts'],$artifacts['root']);
-			self::faultProof($case,$role,$w);
 		}
 		$afterTables=$workers['B']['readback_receipt']; self::need(is_array($afterTables),'readback_missing');
 		$after=self::pair($afterTables,$base['prefix'],$base['token_digest']);
@@ -128,7 +138,9 @@ final class SubscriptionSqlEvidence {
 			self::need($wait['marker']['connection_id']===$aid && $locked['marker']['connection_id']===$bid,'contention_proof_unavailable');
 			self::need($aid !== $bid && ($r['requesting_id'] ?? null) === $bid && ($r['blocking_id'] ?? null) === $aid && ($r['schema_name'] ?? null) === $workers['A']['session_receipts']['identity']['database'] && ($r['table_name'] ?? null) === $base['prefix'].'ys_ec_subscriptions' && ($r['index_name'] ?? null) === 'PRIMARY' && ($r['lock_data'] ?? null) === '41', 'contention_proof_unavailable');
 			$lock=array_values(array_filter($workers['B']['statement_receipts'],static fn(array $s):bool=>'product'===$s['origin'] && 'locked-read'===$s['kind']));
-			$observed=array_values(array_filter($workers['A']['statement_receipts'],static fn(array $s):bool=>'observer'===$s['origin'] && $s['sql_sha256']===$proof['sql_sha256'] && $s['actual']['rows']===$proof['rows']));
+			$waitSql=self::waitSql($base['prefix'],$workers['A']['session_receipts']['identity'],$bid);
+			self::need(hash('sha256',$waitSql)===$proof['sql_sha256'],'contention_proof_unavailable');
+			$observed=array_values(array_filter($workers['A']['statement_receipts'],static fn(array $s):bool=>'observer'===$s['origin'] && $s['sql']===$waitSql && true===$s['sent'] && ''===$s['actual']['error'] && $s['actual']['rows']===$proof['rows']));
 			self::need(1===count($lock) && $lock[0]['sql_sha256']===($locked['receipt']['data']['lock_sql_sha256'] ?? null) && 1===count($observed) && $observed[0]['actual']['rows']===$proof['rows'], 'contention_proof_unavailable');
 		} elseif(null !== $workers['B']['product_response']) { throw new SubscriptionSqlFailure('observer_response_invalid'); }
 		if('P1' === $case) { self::projection($workers['B']['projection_receipt'],$after); }
@@ -182,11 +194,159 @@ final class SubscriptionSqlEvidence {
 		self::need(is_array($v) && in_array($v['state']??null,['issued','consumed'],true) && is_array($v['record']??null) && 41===($v['record']['subscription_id']??null) && in_array($r['fulfillment_profile_generation']??null,[3,4,'3','4'],true),'snapshot_authority_invalid');
 		return ['ok'=>true,'subscription_id'=>41,'contract_kind'=>$r['fulfillment_contract_kind'],'generation'=>(int)$r['fulfillment_profile_generation'],'profile_bytes'=>$r['fulfillment_profile'],'profile_hash'=>$r['fulfillment_profile_hash'],'shipping_total'=>$r['renewal_shipping_total'],'profile_updated_at'=>$r['fulfillment_profile_updated_at'],'updated_at'=>$r['updated_at'],'selection_bytes'=>$option['option_value'],'selection_sha256'=>hash('sha256',$option['option_value']),'selection_state'=>$v['state'],'selection_generation'=>$v['consumed']['generation']??null,'token_digest'=>$digest];
 	}
+	/** All capture sends succeed; only the finite presentation faults may report failure. */
+	private static function result(mixed $r):bool {
+		if(!self::exactKeys($r,['error','rows','affected']) || !is_string($r['error']) || !is_array($r['rows']) || !array_is_list($r['rows']) || (!is_int($r['affected']) && false!==$r['affected'])) { return false; }
+		foreach($r['rows'] as $row) {
+			if(!is_array($row) || []===$row) { return false; }
+			foreach($row as $key=>$value) { if(!is_string($key) || (!is_string($value) && !is_int($value) && !is_float($value) && null!==$value)) { return false; } }
+		}
+		return ''===$r['error'] ? is_int($r['affected']) && $r['affected']>=0 : false===$r['affected'] && []===$r['rows'];
+	}
+	private static function statements(string $case,string $role,array $rows):void {
+		foreach($rows as $i=>$s) {
+			self::need(self::exactKeys($s,['sequence','origin','kind','sql','sql_sha256','before_identity','after_identity','sent','actual','presented','fault']) && $s['sequence']===$i+1 && is_string($s['sql']) && hash('sha256',$s['sql'])===$s['sql_sha256'] && is_bool($s['sent']) && is_string($s['kind']) && in_array($s['origin'],['product','schema-setup','observer','fault-control'],true) && (null===$s['fault'] || is_string($s['fault'])) && self::result($s['presented']), 'statement_receipt_invalid');
+			self::need($s['sent'] ? self::result($s['actual']) && ''===$s['actual']['error'] : null===$s['actual'],'statement_result_invalid');
+			$suppressed='A'===$role && 'product'===$s['origin'] ? match(true) {
+				in_array($case,['P3','P6'],true) && 'session-verify'===$s['kind'] && 'precommit-unreadable'===$s['fault']=>'fixture_precommit_unreadable',
+				'P5'===$case && 'commit'===$s['kind'] && 'commit-suppressed'===$s['fault']=>'fixture_commit_suppressed',
+				'P6'===$case && 'rollback'===$s['kind'] && 'rollback-suppressed'===$s['fault']=>'fixture_rollback_suppressed',
+				default=>null,
+			} : null;
+			$ack='A'===$role && 'P4'===$case && 'product'===$s['origin'] && 'commit'===$s['kind'];
+			self::need($s['sent']===(null===$suppressed),'statement_result_invalid');
+			$presented=null!==$suppressed ? ['error'=>$suppressed,'rows'=>[],'affected'=>false] : ($ack ? ['error'=>'fixture_ack_lost','rows'=>[],'affected'=>false] : $s['actual']);
+			self::need($s['presented']===$presented,'statement_presentation_invalid');
+			foreach(['before_identity','after_identity'] as $key) {
+				$id=$s[$key]; self::need(self::exactKeys($id,['connection_id','database','owner_nonce']),'statement_identity_invalid');
+				if(['connection_id'=>null,'database'=>null,'owner_nonce'=>null]===$id) { continue; }
+				self::need(is_string($id['connection_id']) && 1===preg_match('/\A[1-9][0-9]{0,19}\z/',$id['connection_id']) && is_string($id['database']) && 1===preg_match('/\A[A-Za-z0-9_]{1,64}\z/',$id['database']) && (null===$id['owner_nonce'] || (is_string($id['owner_nonce']) && 1===preg_match('/\A[a-f0-9]{32}\z/',$id['owner_nonce']))),'statement_identity_invalid');
+			}
+		}
+	}
+	private static function quote(string $v):string { return "'".str_replace(['\\',"'"],['\\\\',"\\'"],$v)."'"; }
+	private static function waitSql(string $prefix,array $id,string $bid):string {
+		return 'SELECT rt.PROCESSLIST_ID AS requesting_id, bt.PROCESSLIST_ID AS blocking_id, rl.OBJECT_SCHEMA AS schema_name, rl.OBJECT_NAME AS table_name, rl.INDEX_NAME AS index_name, rl.LOCK_DATA AS lock_data FROM performance_schema.data_lock_waits w JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID JOIN performance_schema.data_locks rl ON rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID AND rl.ENGINE = w.ENGINE WHERE rt.PROCESSLIST_ID = '.$bid.' AND bt.PROCESSLIST_ID = '.$id['connection_id'].' AND rl.OBJECT_SCHEMA = '.self::quote($id['database']).' AND rl.OBJECT_NAME = '.self::quote($prefix.'ys_ec_subscriptions')." AND rl.INDEX_NAME = 'PRIMARY' AND rl.LOCK_DATA = '41'";
+	}
+	/** Reconstruct finite complete dispatches from owned rows, never from the producer's SQL hash. */
+	private static function dispatchProof(string $case,string $role,array $base,array $workers,string $root):void {
+		$w=$workers[$role]; $rows=$w['statement_receipts']; $prefix=$base['prefix']; $tables=$base['tables'];
+		$q=self::quote(...); $key='ys_ec_ecpay_subsel_'.$base['token_digest']; $optionRead='SELECT option_value FROM '.$prefix.'options WHERE option_name = '.$q($key);
+		$subRead='SELECT * FROM '.$prefix.'ys_ec_subscriptions WHERE id = '; $show='SHOW TABLE STATUS WHERE Name = '.$q($prefix.'options');
+		$sessionSql='SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, CAST(@ys_profile_tx_owner AS CHAR) AS owner';
+		$emptyId=['connection_id'=>null,'database'=>null,'owner_nonce'=>null]; $state=$emptyId;
+		$first='P7'===$case && 'B'===$role ? 11 : 0;
+		self::need(isset($rows[$first]) && 'observer'===$rows[$first]['origin'] && 'session-verify'===$rows[$first]['kind'],'dispatch_schedule_invalid');
+		$backend=$rows[$first]['after_identity']; self::need(null!==$backend['connection_id'] && null===$backend['owner_nonce'],'statement_identity_invalid');
+		$slots=[];
+		$add=static function(string $origin,string $kind,?string $sql,?array $resultRows=[],int $affected=0,?string $fault=null,?array $after=null,?array $before=null) use(&$slots,&$state,&$backend,$sessionSql):void {
+			$prior=$before??$state;
+			if('session-verify'===$kind && !in_array($fault,['precommit-unreadable'],true)) { $after=$backend; $resultRows=[['cid'=>$backend['connection_id'],'dbname'=>$backend['database'],'owner'=>$backend['owner_nonce']]]; }
+			$state=$after??$state;
+			$slots[]=['origin'=>$origin,'kind'=>$kind,'sql'=>$sql,'rows'=>$resultRows,'affected'=>$affected,'fault'=>$fault,'before'=>$prior,'after'=>$state];
+		};
+		$read=static function(string $sql,array $resultRows,string $origin='product') use($add):void { $add($origin,'read-or-setup',$sql,$resultRows); };
+		$snapshot=static function(array $snapshot) use($read,$prefix):void {
+			foreach(['ys_ec_products','ys_ec_subscriptions','ys_ec_orders','ys_ec_order_items','ys_ec_order_created_outbox','options'] as $suffix) {
+				$table=$prefix.$suffix; self::need(is_array($snapshot[$table]??null),'readback_missing');
+				$read('SELECT * FROM `'.$table.'` ORDER BY `'.('options'===$suffix?'option_name':'id').'`',$snapshot[$table],'observer');
+			}
+		};
+		$option=static function(string $bytes,int $count=1,string $origin='product') use($read,$optionRead):void { for($i=0;$i<$count;++$i) { $read($optionRead,[['option_value'=>$bytes]],$origin); } };
+		$original=$tables[$prefix.'options'][1]['option_value'];
+		// P7's switched global handle legitimately precedes B's own worker observation.
+		if('P7'===$case && 'B'===$role) { $read($show,[['Engine'=>'InnoDB']]); $option($original,4); $snapshot($tables); }
+		$add('observer','session-verify',$sessionSql);
+		if('A'===$role) {
+			$barrier=SubscriptionSqlBarrier::attach(dirname($root),$base['phase']); $setup=$barrier->awaitBound($case,'setup-complete',1); $seed=$setup['receipt']['data']['seed']??null;
+			self::need(self::exactKeys($seed,['token_digest','issued_row','initial_counts','scope','sql_execution']) && $seed['token_digest']===$base['token_digest'] && self::exactKeys($seed['issued_row'],['option_name','option_value','autoload']) && $seed['issued_row']['option_name']===$key && is_string($seed['issued_row']['option_value']) && 'no'===$seed['issued_row']['autoload'] && 'CAPTURE RESULT CONTROL ONLY'===$seed['scope'] && 'NOT RUN'===$seed['sql_execution'] && $setup['receipt']['data']['baseline']===$tables && $setup['marker']['connection_id']===$backend['connection_id'],'seed_dispatch_invalid');
+			$issued=$seed['issued_row']; $expectedIssued=$issued;
+			if('P11d'===$case) { $v=json_decode($issued['option_value'],true); self::need(is_array($v) && is_int($v['record']['expires_at']??null) && $v['record']['expires_at']>1,'seed_dispatch_invalid'); $v['record']['expires_at']=1; $expectedIssued['option_value']=json_encode($v,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR); }
+			self::need($expectedIssued===$tables[$prefix.'options'][1],'seed_dispatch_invalid');
+			$counts=[];
+			foreach(array_keys($tables) as $table) { $read('SELECT COUNT(*) FROM `'.$table.'`',[['count'=>'0']],'schema-setup'); $counts[$table]='0'; }
+			self::need($seed['initial_counts']===$counts,'seed_dispatch_invalid');
+			$insert=static function(string $table,array $row) use($add,$q):void {
+				$values=[]; foreach($row as $column=>$v) { self::need(is_string($column) && 1===preg_match('/\A[a-z_]+\z/',$column) && (null===$v || is_int($v) || is_string($v)),'seed_dispatch_invalid'); $values[]=null===$v?'NULL':(is_int($v)?(string)$v:$q($v)); }
+				$add('schema-setup','read-or-setup','INSERT INTO `'.$table.'` (`'.implode('`, `',array_keys($row)).'`) VALUES ('.implode(', ',$values).')',[],1);
+			};
+			$insert($prefix.'ys_ec_products',$tables[$prefix.'ys_ec_products'][0]); $insert($prefix.'ys_ec_subscriptions',$tables[$prefix.'ys_ec_subscriptions'][0]);
+			$read($show,[['Engine'=>'InnoDB']],'schema-setup');
+			$read('SELECT option_name, option_value FROM '.$prefix.'options WHERE option_name LIKE '.$q('ys\\_ec\\_ecpay\\_subsel\\_%').' LIMIT 20',[],'schema-setup');
+			$insert($prefix.'options',$issued); $read('SELECT option_name, option_value, autoload FROM '.$prefix.'options WHERE option_name = '.$q($key),[$issued],'schema-setup');
+			$insert($prefix.'ys_ec_subscriptions',$tables[$prefix.'ys_ec_subscriptions'][1]); $insert($prefix.'options',$tables[$prefix.'options'][0]);
+			if('P11d'===$case) { $option($issued['option_value'],1,'schema-setup'); $add('schema-setup','read-or-setup','UPDATE '.$prefix.'options SET option_value = '.$q($original).' WHERE option_name = '.$q($key).' AND option_value = BINARY '.$q($issued['option_value']),[],1); $option($original,1,'schema-setup'); }
+			$snapshot($tables);
+		}
+		if('B'===$role && in_array($case,['P12a','P12b'],true)) {
+			$i=$w['fault_receipt']['interference']??null;
+			self::need(self::exactKeys($i,['case','option_name','before_bytes','after_bytes','sql_sha256']) && $i['case']===$case && $i['option_name']===$key && $i['before_bytes']===$original && is_string($i['after_bytes']),'interference_invalid');
+			$sql='UPDATE '.$prefix.'options SET option_value = '.$q($i['after_bytes']).' WHERE option_name = '.$q($key).' AND option_value = BINARY '.$q($original);
+			self::need(hash('sha256',$sql)===$i['sql_sha256'] && $workers['A']['fault_receipt']['interference']===$i,'interference_dispatch_invalid');
+			$barrier=SubscriptionSqlBarrier::attach(dirname($root),$base['phase']); $bound=$barrier->awaitBound($case,'b-seam',1);
+			self::need(($bound['receipt']['data']['interference']??null)===$i && $bound['marker']['connection_id']===$backend['connection_id'],'interference_dispatch_invalid');
+			$option($original,1,'fault-control'); $add('fault-control','read-or-setup',$sql,[],1); $option($i['after_bytes'],1,'fault-control');
+		}
+		if('A'===$role || 'P2'===$case) {
+			if('P11h'===$case) { $option($original,2); }
+			elseif('P12b'!==$case) {
+				$id='P11b'===$case?42:41; $read($subRead.$id,[$tables[$prefix.'ys_ec_subscriptions'][42===$id?1:0]]);
+				if('P2'===$case && 'B'===$role) { $read($show,[['Engine'=>'InnoDB']]); }
+				if('P11e'===$case) {
+					$s=$rows[count($slots)]??null; self::need(is_array($s) && 1===preg_match('/\ASELECT option_value FROM '.preg_quote($prefix,'/')."options WHERE option_name = 'ys_ec_ecpay_subsel_([a-f0-9]{64})'\\z/",$s['sql'],$m) && $m[1]!==$base['token_digest'],'unissued_lookup_invalid');
+					$read($s['sql'],[]);
+				} elseif(!in_array($case,['P11a','P11c','P11f'],true)) { $option($original,in_array($case,['P11b','P11d'],true)?1:2); }
+			}
+			if(!str_starts_with($case,'P11')) {
+				$s=$rows[count($slots)]??null; self::need(is_array($s) && 1===preg_match("/\ASET @ys_profile_tx_owner = '([a-f0-9]{32})'\z/",$s['sql'],$m),'owner_dispatch_invalid');
+				$nonce=$m[1]; $add('product','owner-set',"SET @ys_profile_tx_owner = '".$nonce."'"); $backend['owner_nonce']=$nonce;
+				$add('product','begin','START TRANSACTION'); $add('product','session-verify',$sessionSql);
+				if('P12b'!==$case) {
+					$fence='CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST('.$q($state['connection_id']).' AS BINARY) AND CAST(DATABASE() AS BINARY) = CAST('.$q($state['database']).' AS BINARY) AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST('.$q($nonce).' AS BINARY)';
+					$locked='B'===$role?$w['readback_receipt'][$prefix.'ys_ec_subscriptions'][0]:$tables[$prefix.'ys_ec_subscriptions'][0];
+					$add('product','locked-read',$subRead.'41 AND '.$fence.' FOR UPDATE',[$locked]);
+					if('A'===$role) { $add('product','profile-cas',null,[],1); }
+				}
+				if('B'===$role || 'P7'===$case || 'P12a'===$case) {
+					if('P12a'===$case) { $option($workers['B']['fault_receipt']['interference']['after_bytes']); }
+					$add('product','rollback','ROLLBACK'); $add('product','session-verify',$sessionSql);
+				} else {
+					if('P12b'!==$case) { $option($original,4); }
+					$replacement=$w['session_receipts']['identity'];
+					if('P8'===$case) { $backend=$replacement; }
+					$add('product','consume',null,[],in_array($case,['P8','P12b'],true)?0:1,'P8'===$case?'replace-before-consume':null,'P8'===$case?$replacement:null);
+					if('P8'===$case) { $add('observer','session-verify',$sessionSql,[],0,null,null,$emptyId); }
+					if(!in_array($case,['P8','P12b'],true)) {
+						if('P9'===$case) { $backend=$replacement; }
+						$add('product','session-verify',$sessionSql,[],0,in_array($case,['P3','P6'],true)?'precommit-unreadable':('P9'===$case?'replace-before-verify':null));
+						if('P9'===$case) { $add('observer','session-verify',$sessionSql,[],0,null,null,$emptyId); }
+					}
+					if(in_array($case,['P1','P2','P4','P5','P10'],true)) {
+						if('P10'===$case) { $backend=$replacement; }
+						$add('product','commit','COMMIT',[],0,match($case){'P2'=>'pause-before-commit','P5'=>'commit-suppressed','P10'=>'replace-before-commit',default=>null},'P10'===$case?$replacement:null);
+						if('P10'===$case) { $add('observer','session-verify',$sessionSql,[],0,null,null,$emptyId); }
+						if('P2'===$case) {
+							$bid=$workers['B']['session_receipts']['identity']['connection_id']; $sql=self::waitSql($prefix,$state,$bid); $n=0;
+							do { $s=$rows[count($slots)]??null; self::need(is_array($s) && $s['sql']===$sql && ++$n<=10000,'contention_proof_unavailable'); $found=$s['actual']['rows']; self::need([]===$found || $found===[['requesting_id'=>$bid,'blocking_id'=>$state['connection_id'],'schema_name'=>$state['database'],'table_name'=>$prefix.'ys_ec_subscriptions','index_name'=>'PRIMARY','lock_data'=>'41']],'contention_proof_unavailable'); $read($sql,$found,'observer'); } while([]===$found);
+						}
+					}
+					if(!in_array($case,['P1','P2','P10'],true)) { $add('product','rollback','ROLLBACK',[],0,'P6'===$case?'rollback-suppressed':null); }
+					if(!in_array($case,['P6','P12b'],true)) { $add('product','session-verify',$sessionSql); }
+				}
+			}
+		}
+		if('B'===$role || !in_array($case,['P6','P7'],true)) { self::need(is_array($w['readback_receipt']),'readback_missing'); $snapshot($w['readback_receipt']); }
+		if('P1'===$case && 'B'===$role) { $read($subRead.'41',[$w['readback_receipt'][$prefix.'ys_ec_subscriptions'][0]],'observer'); $read('SELECT * FROM '.$prefix.'ys_ec_products WHERE id = 501',[$tables[$prefix.'ys_ec_products'][0]],'observer'); }
+		self::need(count($slots)===count($rows) && $state===$w['session_receipts']['identity'],'dispatch_schedule_invalid');
+		foreach($slots as $i=>$slot) {
+			$s=$rows[$i];
+			self::need($s['origin']===$slot['origin'] && $s['kind']===$slot['kind'] && (null===$slot['sql'] || $s['sql']===$slot['sql']) && $s['fault']===$slot['fault'] && $s['before_identity']===$slot['before'] && $s['after_identity']===$slot['after'],'dispatch_schedule_invalid');
+			if($s['sent']) { self::need($s['actual']===['error'=>'','rows'=>$slot['rows'],'affected'=>$slot['affected']],'dispatch_result_invalid'); }
+		}
+	}
 	private static function counts(string $case,string $role,array $statements):void {
 		$count=['profile-cas'=>[0,0,0],'consume'=>[0,0,0],'commit'=>[0,0,0],'rollback'=>[0,0,0]];
-		foreach($statements as $i=>$s) {
-			self::need(self::exactKeys($s,['sequence','origin','kind','sql','sql_sha256','before_identity','after_identity','sent','actual','presented','fault']) && $s['sequence']===$i+1 && is_string($s['sql']) && hash('sha256',$s['sql'])===$s['sql_sha256'] && is_bool($s['sent']) && in_array($s['origin'],['product','schema-setup','observer','fault-control'],true) && is_array($s['presented']), 'statement_receipt_invalid');
-			self::need($s['sent'] ? self::exactKeys($s['actual'],['error','rows','affected']) : null===$s['actual'],'statement_receipt_invalid');
+		foreach($statements as $s) {
 			if('product'!==$s['origin']) { continue; }
 			if(isset($count[$s['kind']])) { ++$count[$s['kind']][0]; $count[$s['kind']][1]+=$s['sent']?1:0; $count[$s['kind']][2]+=1===($s['actual']['affected']??null)?1:0; }
 			elseif(1===preg_match('/\A(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)\b/',$s['sql'])) { throw new SubscriptionSqlFailure('unclassified_product_write'); }

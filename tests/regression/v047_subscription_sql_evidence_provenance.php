@@ -62,6 +62,45 @@ if ( $available ) {
 					'fault-role'=>static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { $value['fault_receipt']['role']='B'; } return $value; },
 					'session-extra'=>static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'B'===$name) { $value['session_receipts']['unknown']=true; } return $value; },
 				];
+				// Independent, fully rehashed contradictions: a valid artifact hash is not SQL proof.
+				if('P1'===$case) {
+					foreach(['actual-failed','presented-untyped','actual-error-type','actual-affected-type','actual-extra','presented-diverged','kind-untyped','observer-write','setup-unknown-write'] as $break) {
+						$changes['dispatch-'.$break]=static function(string $kind,string $name,mixed $value) use($break):mixed {
+							if('worker'!==$kind || 'A'!==$name) { return $value; }
+							foreach($value['statement_receipts'] as &$s) {
+								if('commit'!==$s['kind']) { continue; }
+								if('actual-failed'===$break) { $s['actual']=['error'=>'fixture_actual_commit_failed','rows'=>[],'affected'=>false]; $s['presented']=$s['actual']; }
+								if('presented-untyped'===$break) { $s['presented']=['unrelated'=>true]; }
+								if('actual-error-type'===$break) { $s['actual']['error']=null; $s['presented']=$s['actual']; }
+								if('actual-affected-type'===$break) { $s['actual']['affected']='0'; $s['presented']=$s['actual']; }
+								if('actual-extra'===$break) { $s['presented']['extra']=true; }
+								if('presented-diverged'===$break) { $s['presented']['rows']=[['unrelated'=>'value']]; }
+								if(in_array($break,['kind-untyped','observer-write','setup-unknown-write'],true)) {
+									$extra=$s; $extra['sequence']=count($value['statement_receipts'])+1; $extra['origin']='setup-unknown-write'===$break?'schema-setup':'observer'; $extra['kind']='kind-untyped'===$break?0:'read-or-setup';
+									$extra['sql']='UPDATE unrelated_fixture SET value = 1'; $extra['sql_sha256']=hash('sha256',$extra['sql']); $value['statement_receipts'][]=$extra;
+								} break;
+							} unset($s); return $value;
+						};
+					}
+				}
+				if('P4'===$case) { $changes['ackloss-failed-actual']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if('commit'===$s['kind']) { $s['actual']=['error'=>'fixture_actual_commit_failed','rows'=>[],'affected'=>false]; $value['fault_receipt']['actual_commit']=$s['actual']; } } unset($s); } return $value; }; }
+				if('P5'===$case) {
+					foreach(['observer','schema-setup','fault-control'] as $origin) { $changes['hidden-commit-'.$origin]=static function(string $kind,string $name,mixed $value) use($origin):mixed { if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as $s) { if('commit'===$s['kind']) { $s['sequence']=count($value['statement_receipts'])+1; $s['origin']=$origin; $s['sent']=true; $s['actual']=['error'=>'','rows'=>[],'affected'=>0]; $s['presented']=$s['actual']; $s['fault']=null; $value['statement_receipts'][]=$s; break; } } } return $value; }; }
+				}
+				if(in_array($case,['P3','P5','P6'],true)) { $changes['suppressed-presentation']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if(!$s['sent']) { $s['presented']['error']='unrelated_failure'; break; } } unset($s); } return $value; }; }
+				if(in_array($case,['P12a','P12b'],true)) {
+					foreach(['missing','zero-affected','predicate','readback','receipt-hash'] as $break) { $changes['interference-dispatch-'.$break]=static function(string $kind,string $name,mixed $value) use($break):mixed {
+						if('worker'!==$kind || 'B'!==$name) { return $value; }
+						if('missing'===$break) { $value['statement_receipts']=array_values(array_filter($value['statement_receipts'],static fn(array $s):bool=>'fault-control'!==$s['origin'])); foreach($value['statement_receipts'] as $i=>&$s) { $s['sequence']=$i+1; } unset($s); }
+						if('receipt-hash'===$break) { $value['fault_receipt']['interference']['sql_sha256']=str_repeat('0',64); }
+						$wrote=false;
+						foreach($value['statement_receipts'] as &$s) { if('fault-control'!==$s['origin']) { continue; }
+							if(str_starts_with($s['sql'],'UPDATE ')) { $wrote=true; if('zero-affected'===$break) { $s['actual']['affected']=0; $s['presented']=$s['actual']; } if('predicate'===$break) { $s['sql'].=' '; $s['sql_sha256']=hash('sha256',$s['sql']); $value['fault_receipt']['interference']['sql_sha256']=$s['sql_sha256']; } }
+							elseif($wrote && 'readback'===$break) { $s['actual']['rows']=[['option_value'=>'unrelated']]; $s['presented']=$s['actual']; }
+						} unset($s); return $value;
+					}; }
+				}
+				if('P2'===$case) { $changes['wait-unrelated-sql']=static function(string $kind,string $name,mixed $value):mixed { $sql='SELECT 1'; if('artifact'===$kind && 'p2-wait-observed-receipt.json'===$name) { $value['data']['sql_sha256']=hash('sha256',$sql); } if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if('observer'===$s['origin'] && isset($s['actual']['rows'][0]['blocking_id'])) { $s['sql']=$sql; $s['sql_sha256']=hash('sha256',$sql); } } unset($s); } return $value; }; }
 				if('P2'===$case) {
 					$changes['wait-marker-identity']=static function(string $kind,string $name,mixed $value):mixed { if('marker'===$kind && 'p2-wait-observed.json'===$name) { $value['connection_id']='9102'; } return $value; };
 					$changes['b-response']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'B'===$name) { $value['product_response']['code']='stale_generation'; } return $value; };
@@ -92,6 +131,29 @@ if ( $available ) {
 				if('P4'===$case) { $changes['actual-commit']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { $value['fault_receipt']['actual_commit']=null; } return $value; }; }
 				if('P6'===$case) { $changes['poison-before-close']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { $value['session_receipts']['closes'][0]['poisoned']=false; } return $value; }; }
 				if([]!==Evidence::events($case,'A')) { $changes['event-count']=static fn(string $kind,string $name,mixed $value):mixed=>'raw'===$kind && str_ends_with($name,'-a-application.log') ? $value.$value : $value; }
+				// Peer fields must reject before A reconstructs a schedule from B's metadata.
+				$peerFields='P2'===$case?['connection_id']:(in_array($case,['P12a','P12b'],true)?['interference','after_bytes']:[]);
+				foreach($peerFields as $field) {
+					foreach(['array','integer','null','missing'] as $variant) {
+						$label='peer-'.$field.'-'.$variant;
+						$bad=ecpay_b1_fork_evidence($control,$label,static function(string $kind,string $name,mixed $value) use($field,$variant):mixed {
+							if('worker'!==$kind || 'B'!==$name) { return $value; }
+							if('connection_id'===$field) { $target=&$value['session_receipts']['identity']; $key='connection_id'; }
+							elseif('interference'===$field) { $target=&$value['fault_receipt']; $key='interference'; }
+							else { $target=&$value['fault_receipt']['interference']; $key='after_bytes'; }
+							if('missing'===$variant) { unset($target[$key]); }
+							else { $target[$key]=match($variant){'array'=>[],'integer'=>0,'null'=>null}; }
+							unset($target); return $value;
+						});
+						$v=null;
+						set_error_handler(static function(int $severity,string $message,string $file,int $line):never { throw new ErrorException($message,0,$severity,$file,$line); });
+						try { $v=Evidence::evaluate($case,$bad['base'],$bad['workers'],$bad['artifacts']); }
+						catch(Throwable $error) { echo 'PEER_EXCEPTION '.json_encode(['case'=>$case,'field'=>$label,'class'=>get_class($error)],JSON_UNESCAPED_SLASHES)."\n"; }
+						finally { restore_error_handler(); }
+						$expected='connection_id'===$field?'session_receipt_invalid':'interference_invalid';
+						$check($case.' rehashed '.$label.' receives a typed ordinary rejection',null!==$v && false===$v['matches'] && [$expected]===$v['errors'] && 'NOT RUN'===$v['sql_execution']);
+					}
+				}
 				foreach($changes as $label=>$change) {
 					$bad=ecpay_b1_fork_evidence($control,$label,$change); $v=Evidence::evaluate($case,$bad['base'],$bad['workers'],$bad['artifacts']);
 					$check($case.' rehashed '.$label.' tamper fails a normal independent verdict',false===$v['matches']);
