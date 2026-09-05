@@ -173,7 +173,7 @@ namespace {
 		}
 
 		private function capture(): void {
-			$row = \YangSheep\Ecommerce\Models\YSSubscription::$rows[41] ?? null;
+			$row = \YangSheep\Ecommerce\Models\V037SubscriptionState::$rows[41] ?? null;
 			$this->snapshot = [ $row ? clone $row : null, $this->rows, $this->autoload ];
 		}
 
@@ -183,7 +183,7 @@ namespace {
 			}
 			[ $row, $rows, $autoload ] = $this->snapshot;
 			if ( $row ) {
-				\YangSheep\Ecommerce\Models\YSSubscription::$rows[41] = clone $row;
+				\YangSheep\Ecommerce\Models\V037SubscriptionState::$rows[41] = clone $row;
 			}
 			$this->rows = $rows;
 			$this->autoload = $autoload;
@@ -219,6 +219,11 @@ namespace {
 		public function get_row( string $sql, string $output = 'OBJECT' ): mixed {
 			[ $template, $args ] = $this->decode( $sql );
 			$this->last_error = '';
+			if ( str_starts_with( $template, 'SELECT * FROM wp_ys_ec_subscriptions WHERE id = %d' ) ) {
+				[ $args, $fence_ok ] = $this->split_fence( $template, $args );
+				$row = \YangSheep\Ecommerce\Models\V037SubscriptionState::$rows[ (int) ( $args[0] ?? 0 ) ] ?? null;
+				return $fence_ok && $row ? clone $row : null;
+			}
 			if ( str_contains( $template, ') AS cid,' ) ) {
 				unset( $args );
 				$row = [
@@ -301,6 +306,21 @@ namespace {
 				$this->session_vars['@ys_profile_tx_owner'] = (string) ( $args[0] ?? '' );
 				return 0;
 			}
+			if ( str_starts_with( $template, 'UPDATE wp_ys_ec_subscriptions' ) ) {
+				++\YangSheep\Ecommerce\Models\V037SubscriptionState::$cas_calls;
+				[ $args, $fence_ok ] = $this->split_fence( $template, $args );
+				[ $canonical, $hash, $total, $updated, , $id, $generation ] = $args;
+				$row = \YangSheep\Ecommerce\Models\V037SubscriptionState::$rows[ (int) $id ] ?? null;
+				if ( ! $fence_ok || \YangSheep\Ecommerce\Models\V037SubscriptionState::$force_cas_loss
+					|| ! $row || (int) $row->fulfillment_profile_generation !== (int) $generation
+					|| ! in_array( $row->status, [ 'pending', 'active', 'on-hold', 'suspended' ], true ) ) { return 0; }
+				$row->fulfillment_profile = $canonical;
+				$row->fulfillment_profile_hash = $hash;
+				$row->renewal_shipping_total = $total;
+				$row->fulfillment_profile_updated_at = $updated;
+				$row->fulfillment_profile_generation = (int) $generation + 1;
+				return 1;
+			}
 			if ( 'START TRANSACTION' === $template ) {
 				++$this->starts;
 				$this->capture();
@@ -380,54 +400,45 @@ namespace YangSheep\Ecommerce\Models {
 		}
 	}
 
-	final class YSSubscription {
-		/** @var array<int,object> */
+	/** In-memory database rows only; production Core owns reads, locks and CAS. */
+	final class V037SubscriptionState {
 		public static array $rows = [];
 		public static bool $force_cas_loss = false;
 		public static int $cas_calls = 0;
-
-		public static function find( int $id ): ?object {
-			return isset( self::$rows[ $id ] ) ? clone self::$rows[ $id ] : null;
-		}
-		public static function find_for_fulfillment_profile_update( int $id ): ?object {
-			return isset( self::$rows[ $id ] ) ? clone self::$rows[ $id ] : null;
-		}
-		public static function update_fulfillment_profile_cas(
-			int $id,
-			int $expected_generation,
-			string $canonical,
-			string $hash,
-			string $shipping_total,
-			string $updated_at
-		): bool {
-			++self::$cas_calls;
-			$row = self::$rows[ $id ] ?? null;
-			if ( self::$force_cas_loss || ! $row
-				|| (int) $row->fulfillment_profile_generation !== $expected_generation ) {
-				return false;
-			}
-			$row->fulfillment_profile = $canonical;
-			$row->fulfillment_profile_hash = $hash;
-			$row->renewal_shipping_total = $shipping_total;
-			$row->fulfillment_profile_updated_at = $updated_at;
-			$row->fulfillment_profile_generation = $expected_generation + 1;
-			return true;
-		}
 	}
+
 }
 
 namespace YangSheep\Ecommerce\Shipping {
 	final class YSShippingRegistry {
+		public static bool $enabled = true;
+		public static string $provider = 'ecpay';
+		public static array $availability_log = [];
+		public static function configured_enabled_method_ids(): array {
+			return self::$enabled ? [ 'ys_ec_ecpay_ship_unimart' ] : [];
+		}
+		public static function get_available_for_subscription_profile( array $data, ?array $allowed ): array {
+			self::$availability_log[] = $data;
+			$id = 'ys_ec_ecpay_ship_unimart';
+			$method = self::get_operable( $id );
+			return self::$enabled && $method && ( null === $allowed || in_array( $id, $allowed, true ) )
+				? [ $id => $method ] : [];
+		}
+		public static function get( string $id ): ?object { return self::get_operable( $id ); }
 		public static function is_method_allowed_for_cart( string $id, array $items ): bool {
 			unset( $id, $items );
 			return true;
 		}
 		public static function get_operable( string $id ): ?object {
-			if ( 'ys_ec_ecpay_ship_unimart' !== $id ) {
+			if ( ! self::$enabled || 'ys_ec_ecpay_ship_unimart' !== $id ) {
 				return null;
 			}
 			return new class() {
-				public function get_provider(): string { return 'ecpay'; }
+				public function get_id(): string { return 'ys_ec_ecpay_ship_unimart'; }
+				public function get_provider(): string { return YSShippingRegistry::$provider; }
+				public function get_type(): string { return 'cvs'; }
+				public function get_title(): string { return 'ECPay Store'; }
+				public function supports_cod(): bool { return false; }
 				public function calculate_cost( array $items, array $address = [] ): float {
 					unset( $items, $address );
 					return 65.0;
@@ -533,6 +544,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 
 namespace {
 	use YangSheep\Ecommerce\Models\YSSubscription;
+	use YangSheep\Ecommerce\Models\V037SubscriptionState;
 	use YangSheep\Ecommerce\Services\Subscription\YSSubscriptionFulfillmentProfileCoordinator;
 	use YangSheep\Ecommerce\Services\Subscription\YSSubscriptionFulfillmentProfileService;
 	use YangSheep\YSCartEcpay\Plugin;
@@ -546,7 +558,7 @@ namespace {
 		exit( 1 );
 	}
 
-	$ecpay_root = dirname( __DIR__, 2 );
+	$ecpay_root = (string) ( getenv( 'YS_ECPAY_ROOT' ) ?: dirname( __DIR__, 2 ) );
 	require_once $ecpay_root . '/src/Support/CartScope.php';
 	$store_path = $ecpay_root . '/src/Shipping/Ecpay/EcpaySubscriptionSelectionStore.php';
 	if ( is_file( $store_path ) ) {
@@ -555,6 +567,9 @@ namespace {
 	require_once $ecpay_root . '/src/Shipping/Ecpay/EcpayStoreSelector.php';
 	require_once $ecpay_root . '/src/Plugin.php';
 
+	require_once $core_root . '/src/Models/YSSubscription.php';
+	require_once $core_root . '/src/Services/Shipping/YSShippingIdentifier.php';
+	require_once $core_root . '/src/Services/Subscription/YSSubscriptionRecurringAmount.php';
 	require_once $core_root . '/src/Utils/YSUtf8.php';
 	require_once $core_root . '/src/Services/Shipping/YSFulfillmentSnapshotService.php';
 	require_once $core_root . '/src/Services/Checkout/YSCheckoutFulfillmentService.php';
@@ -594,7 +609,6 @@ namespace {
 		$reflection = new \ReflectionClass( $boundary_class );
 		foreach ( [ 'poisoned' => false, 'reason' => '' ] as $property_name => $value ) {
 			$property = $reflection->getProperty( $property_name );
-			$property->setAccessible( true );
 			$property->setValue( null, $value );
 		}
 	};
@@ -618,6 +632,7 @@ namespace {
 	$base_profile = [
 		'contract_version' => 1,
 		'contract_kind' => 'physical',
+		'allowed_shipping_methods' => [ 'home_old', 'ys_ec_ecpay_ship_unimart' ],
 		'billing' => [
 			'name' => 'Billing Owner', 'phone' => '0900000000', 'email' => 'owner@example.test',
 			'country' => 'TW', 'postcode' => '100', 'state' => '', 'city' => 'Taipei',
@@ -656,8 +671,8 @@ namespace {
 	}
 
 	$reset_subscription = static function () use ( $normalized ): void {
-		YSSubscription::$rows = [ 41 => (object) [
-			'id' => 41, 'customer_id' => 91, 'user_id' => 92,
+		V037SubscriptionState::$rows = [ 41 => (object) [
+			'id' => 41, 'customer_id' => 91, 'user_id' => 7,
 			'status' => 'active',
 			'product_id' => 501, 'variant_id' => 0, 'quantity' => 2,
 			'amount' => '500.00', 'next_amount' => null, 'gateway_id' => 'ys_ec_ecpay_credit',
@@ -668,12 +683,11 @@ namespace {
 			'renewal_shipping_total' => '75.00',
 			'fulfillment_profile_updated_at' => '2026-08-30 11:00:00',
 		] ];
-		YSSubscription::$force_cas_loss = false;
-		YSSubscription::$cas_calls = 0;
+		V037SubscriptionState::$force_cas_loss = false;
+		V037SubscriptionState::$cas_calls = 0;
 	};
 
 	$issue = new \ReflectionMethod( EcpayStoreSelector::class, 'issue_selection_token' );
-	$issue->setAccessible( true );
 	$mint_token = static function () use ( $issue ): string {
 		return (string) $issue->invoke( null, [
 			'shipping_id'       => 'ys_ec_ecpay_ship_unimart',
@@ -701,7 +715,10 @@ namespace {
 			'cvs_store_id'        => '991122',
 		];
 	};
-	$generation = static fn (): int => (int) ( YSSubscription::$rows[41]->fulfillment_profile_generation ?? -1 );
+	$generation = static fn (): int => (int) ( V037SubscriptionState::$rows[41]->fulfillment_profile_generation ?? -1 );
+
+	// Shared local-only fixture for the account-to-renewal vertical oracle.
+	if ( defined( 'V037_FIXTURE_ONLY' ) && V037_FIXTURE_ONLY ) { return; }
 
 	// ── p1: positive pair — CAS N->N+1 and issued->consumed commit together ──
 	$reset_subscription();
@@ -774,10 +791,10 @@ namespace {
 	$reset_subscription();
 	$GLOBALS['wpdb'] = new V037PairWpdb();
 	$token = $mint_token();
-	YSSubscription::$force_cas_loss = true;
+	V037SubscriptionState::$force_cas_loss = true;
 	$claims_before = $GLOBALS['v037_claim_calls'];
 	$cas_lost = YSSubscriptionFulfillmentProfileCoordinator::update( 41, $update_input( $token ) );
-	YSSubscription::$force_cas_loss = false;
+	V037SubscriptionState::$force_cas_loss = false;
 	$check(
 		'CAS loss rolls back before any claim; the durable token stays issued',
 		false === ( $cas_lost['success'] ?? true )
@@ -918,21 +935,16 @@ namespace {
 	);
 
 	// The fence must be ONE cross-repo spelling: ECPay's consume predicate uses
-	// byte-for-byte the fragment the Core model freezes. (The Core model class
-	// cannot be loaded here — this file fakes it — so the Core side is proven
-	// by its distinctive source pieces; the ECPay side by constant equality.)
+	// byte-for-byte the fragment the loaded production Core model freezes.
 	$fence_fragment = 'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(DATABASE() AS BINARY) = CAST(%s AS BINARY)'
 		. ' AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST(%s AS BINARY)';
-	$core_model_source = (string) file_get_contents( $core_root . '/src/Models/YSSubscription.php' );
 	$store_fence_class = 'YangSheep\\YSCartEcpay\\Shipping\\Ecpay\\EcpaySubscriptionSelectionStore';
 	$check(
 		'Core model and ECPay store freeze the identical physical-session fence spelling',
 		defined( $store_fence_class . '::PROFILE_SESSION_FENCE_SQL_V1' )
 			&& constant( $store_fence_class . '::PROFILE_SESSION_FENCE_SQL_V1' ) === $fence_fragment
-			&& str_contains( $core_model_source, 'PROFILE_SESSION_FENCE_SQL_V1' )
-			&& str_contains( $core_model_source, "'CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST(%s AS BINARY)'" )
-			&& str_contains( $core_model_source, '@ys_profile_tx_owner' )
+			&& YSSubscription::PROFILE_SESSION_FENCE_SQL_V1 === $fence_fragment
 	);
 
 	// ── p5: a legacy ordinary transient token cannot enter the subscription scope ──

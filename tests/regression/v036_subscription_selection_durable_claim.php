@@ -356,7 +356,6 @@ namespace {
 		}
 		$reflection = new \ReflectionClass( $store_class );
 		$property = $reflection->getProperty( 'proof_handle' );
-		$property->setAccessible( true );
 		$property->setValue( null, null );
 	};
 	// The durable row is keyed by the token DIGEST; raw token bytes never enter
@@ -423,7 +422,6 @@ namespace {
 	$payment = 'ys_ec_ecpay_credit';
 	$scope = 'sub_41';
 	$issue = new \ReflectionMethod( EcpayStoreSelector::class, 'issue_selection_token' );
-	$issue->setAccessible( true );
 	$subscription_selection = [
 		'shipping_id'       => $shipping,
 		'cvs_type'          => 'UNIMARTC2C',

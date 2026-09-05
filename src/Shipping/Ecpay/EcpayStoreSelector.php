@@ -1178,11 +1178,6 @@ final class EcpayStoreSelector {
 	 * @param array<string,mixed> $store_info
 	 */
 	private static function render_callback_page( array $store_info, string $result_code = '' ): void {
-		// 🔴 提領碼要交給前端，但**不能**混進 `$store_info`——那份資料會被
-		// JSON 印進頁面，也會被 postMessage 送出去，而提領碼是憑證。
-		// 這裡分開帶，並且只放在 headless 用得到的地方。
-		$json_data    = wp_json_encode( $store_info );
-		$origin       = esc_url( home_url() );
 		$checkout_url = esc_url_raw( $store_info['return_url'] ?? self::checkout_url() );
 		$context      = (string) ( $store_info['context'] ?? 'checkout' );
 
@@ -1197,6 +1192,31 @@ final class EcpayStoreSelector {
 		header_remove( 'Content-Type' );
 		header( 'Content-Type: text/html; charset=UTF-8' );
 		nocache_headers();
+
+		// Subscription account selection never serializes provider/store bytes into
+		// callback HTML. The popup receives only a short-lived result code and the
+		// root-bound account client exchanges it exactly once on our REST endpoint.
+		if ( 'subscription' === $context ) {
+			?>
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+	<meta charset="utf-8">
+	<title>ECPay Store Selected</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<noscript><meta http-equiv="refresh" content="0;url=<?php echo esc_attr( $checkout_url ); ?>"></noscript>
+</head>
+<body>
+<script>window.location.replace(<?php echo wp_json_encode( $checkout_url ); ?>);</script>
+</body>
+</html>
+			<?php
+			exit;
+		}
+
+		// Legacy checkout/admin contexts retain their established payload transport.
+		$json_data = wp_json_encode( $store_info );
+		$origin    = esc_url( home_url() );
 
 		if ( in_array( $context, [ 'admin', 'frontend_change' ], true ) ) {
 			?>

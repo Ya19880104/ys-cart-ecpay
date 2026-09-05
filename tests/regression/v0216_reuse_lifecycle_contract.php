@@ -362,7 +362,6 @@ function v0216l_fence_precedes( string $source, string $effect, int $minimum_fen
 }
 
 $apply = new ReflectionMethod( EcpaySettings::class, 'apply_api_tab_atomically' );
-$apply->setAccessible( true );
 
 /** @return string settings_error（''＝成功）；$provider_enabled 由 $_POST['ys_ec_ecpay_enabled'] 推 */
 function v0216l_apply(): string {
@@ -894,7 +893,6 @@ v0216l_check( 'P8d2 credential-derived store cache identity is leased and fenced
 v0216l_reset( v0216l_full_c2c() );
 $GLOBALS['v0216l_cache_probe'] = true;
 $cached_store_list = new ReflectionMethod( EcpayStoreDirectory::class, 'cached_store_list' );
-$cached_store_list->setAccessible( true );
 $cached_store_list->invoke( null, 'UNIMARTC2C' );
 v0216l_check( 'P8d3 writer cannot interleave between credential cache-key derivation and transient read',
 	false === $GLOBALS['v0216l_cache_writer_acquired'],

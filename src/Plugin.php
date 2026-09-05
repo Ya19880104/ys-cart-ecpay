@@ -12,6 +12,7 @@ use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
 use YangSheep\Ecommerce\Models\YSSubscription;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Security\YSRateLimiter;
+use YangSheep\Ecommerce\Services\Storefront\YSSubscriptionFulfillmentOptionsService;
 use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
 use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
@@ -213,6 +214,56 @@ final class Plugin {
 		add_filter( 'ys_ec_claim_store_selection', [ $this, 'claim_store_selection' ], 10, 5 );
 		add_filter( 'ys_ec_resolve_fulfillment_selection_v1', [ $this, 'resolve_fulfillment_selection' ], 10, 3 );
 		add_filter( 'ys_ec_claim_fulfillment_selection_v1', [ $this, 'claim_fulfillment_selection' ], 10, 4 );
+		add_action( 'wp_enqueue_scripts', [ $this, 'register_account_fulfillment_assets' ], 5 );
+		add_action( 'ys_ec_enqueue_account_assets', [ $this, 'enqueue_account_fulfillment_assets' ] );
+		add_filter( 'ys_ec_account_ui_assets', [ $this, 'append_account_fulfillment_assets' ] );
+	}
+
+	/** Register the provider adapter without deciding whether the current page needs it. */
+	public function register_account_fulfillment_assets(): void {
+		if ( ! function_exists( 'wp_register_script' ) ) {
+			return;
+		}
+
+		wp_register_script(
+			'ys-cart-ecpay-account-fulfillment',
+			YS_CART_ECPAY_URL . 'assets/js/ys-cart-ecpay-account-fulfillment.js',
+			[ 'ys-ec-account-handlers' ],
+			YS_CART_ECPAY_VERSION,
+			true
+		);
+	}
+
+	/** Native account page seam fired by Core after its root-scoped handler is enqueued. */
+	public function enqueue_account_fulfillment_assets(): void {
+		if ( ! $this->has_enabled_shipping_methods() || ! function_exists( 'wp_enqueue_script' ) ) {
+			return;
+		}
+
+		wp_enqueue_script( 'ys-cart-ecpay-account-fulfillment' );
+	}
+
+	/**
+	 * Append the provider adapter to the SDK account asset envelope.
+	 *
+	 * Associative insertion order is part of this boundary: the Core handler must
+	 * execute first so the provider can register against its public registry.
+	 *
+	 * @param mixed $assets
+	 * @return mixed
+	 */
+	public function append_account_fulfillment_assets( $assets ) {
+		if ( ! $this->has_enabled_shipping_methods()
+			|| ! is_array( $assets )
+			|| ! is_array( $assets['scripts'] ?? null )
+			|| ! array_key_exists( 'account_handlers', $assets['scripts'] ) ) {
+			return $assets;
+		}
+
+		$assets['scripts']['ecpay_subscription_fulfillment'] = YS_CART_ECPAY_URL
+			. 'assets/js/ys-cart-ecpay-account-fulfillment.js?ver=' . rawurlencode( YS_CART_ECPAY_VERSION );
+
+		return $assets;
 	}
 
 	/**
@@ -900,7 +951,10 @@ final class Plugin {
 		// 電子地圖表單——使用者選完門市、callback 也寫進 session 與 localStorage，
 		// 直到送單才被擋。fail-closed：購物車讀取失敗亦視為不允許。
 		$shipping_allowed = $is_subscription_context
-			? true
+			? $this->is_shipping_available_for_subscription(
+				is_object( $subscription_context['subscription'] ?? null ) ? $subscription_context['subscription'] : null,
+				$shipping_id
+			)
 			: $this->is_shipping_allowed_for_cart( $shipping_id, $cart_scope );
 		if ( ! $shipping_allowed ) {
 			return YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。' );
@@ -1036,6 +1090,12 @@ final class Plugin {
 				'response' => YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。', 400 ),
 			];
 		}
+		if ( ! $this->is_shipping_available_for_subscription( $subscription, $shipping_id ) ) {
+			return [
+				'ok'       => false,
+				'response' => YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。', 400 ),
+			];
+		}
 
 		return [
 			'ok'             => true,
@@ -1045,6 +1105,7 @@ final class Plugin {
 			'cart_scope'     => $cart_scope,
 			'payment_method' => $payment_method,
 			'item'           => $item,
+			'subscription'   => $subscription,
 		];
 	}
 
@@ -1220,6 +1281,14 @@ final class Plugin {
 			$params['shipping_id']    = (string) $authority['shipping_id'];
 			$params['cart_scope']     = (string) $authority['cart_scope'];
 			$params['payment_method'] = (string) $authority['payment_method'];
+			if ( ! $this->is_shipping_available_for_subscription(
+				is_object( $authority['subscription'] ?? null ) ? $authority['subscription'] : null,
+				(string) $authority['shipping_id']
+			) ) {
+				$response = YSRestResponder::error( 'shipping_method_not_allowed', '購物車內商品不支援此物流方式。', 400 );
+				$response->header( 'Cache-Control', 'no-store, private' );
+				return $response;
+			}
 		} else {
 			$legacy_scope = CartScope::resolve( $params );
 			if ( is_string( $legacy_scope ) && EcpayStoreSelector::subscription_id_from_scope( $legacy_scope ) > 0 ) {
@@ -1351,6 +1420,39 @@ final class Plugin {
 		}
 
 		return YSShippingRegistry::is_method_allowed_for_cart( $shipping_id, [ $item ] );
+	}
+
+	/**
+	 * Ask Core for the same server-owned availability projection rendered by the
+	 * subscription account GET endpoint. Missing capability or malformed output
+	 * is not evidence of availability and therefore fails closed.
+	 */
+	private function is_shipping_available_for_subscription( ?object $subscription, string $shipping_id ): bool {
+		if ( null === $subscription
+			|| ! class_exists( YSSubscriptionFulfillmentOptionsService::class )
+			|| ! method_exists( YSSubscriptionFulfillmentOptionsService::class, 'get_options' ) ) {
+			return false;
+		}
+
+		try {
+			$options = YSSubscriptionFulfillmentOptionsService::get_options( $subscription );
+		} catch ( \Throwable $error ) {
+			unset( $error );
+			return false;
+		}
+		if ( true !== ( $options['success'] ?? false ) || ! is_array( $options['data']['methods'] ?? null ) ) {
+			return false;
+		}
+
+		foreach ( $options['data']['methods'] as $method ) {
+			if ( is_array( $method )
+				&& $shipping_id === (string) ( $method['id'] ?? '' )
+				&& 'ecpay' === (string) ( $method['provider'] ?? '' ) ) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

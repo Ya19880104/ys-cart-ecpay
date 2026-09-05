@@ -125,6 +125,27 @@ namespace YangSheep\Ecommerce\Security {
 	}
 }
 
+namespace YangSheep\Ecommerce\Services\Storefront {
+	final class YSSubscriptionFulfillmentOptionsService {
+		public static bool $available = true;
+		/** @var list<int> */
+		public static array $calls = [];
+
+		/** @return array<string,mixed> */
+		public static function get_options( object $subscription ): array {
+			self::$calls[] = (int) ( $subscription->id ?? 0 );
+			return [
+				'success' => true,
+				'data'    => [
+					'methods' => self::$available
+						? [ [ 'id' => 'ys_ec_ecpay_ship_unimart', 'provider' => 'ecpay' ] ]
+						: [],
+				],
+			];
+		}
+	}
+}
+
 namespace YangSheep\Ecommerce\Shipping {
 	final class YSShippingRegistry {
 		public static bool $allowed = true;
@@ -197,6 +218,7 @@ namespace YangSheep\YSCartEcpay\Shipping\Ecpay {
 namespace {
 	use YangSheep\Ecommerce\Gateways\YSGatewayRegistry;
 	use YangSheep\Ecommerce\Models\YSSubscription;
+	use YangSheep\Ecommerce\Services\Storefront\YSSubscriptionFulfillmentOptionsService;
 	use YangSheep\Ecommerce\Shipping\YSShippingRegistry;
 	use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreSelector;
 
@@ -220,6 +242,7 @@ namespace {
 	$map = static function ( array $body ) use ( $plugin ): WP_REST_Response {
 		EcpayStoreSelector::reset();
 		YSShippingRegistry::$calls = [];
+		YSSubscriptionFulfillmentOptionsService::$calls = [];
 		YSSubscription::$find_calls = 0;
 		return $plugin->ecpay_map_url( new WP_REST_Request( $body ) );
 	};
@@ -347,6 +370,17 @@ namespace {
 	);
 	YSShippingRegistry::$allowed = true;
 
+	YSSubscriptionFulfillmentOptionsService::$available = false;
+	$response = $map( $base );
+	$check(
+		'Core subscription availability oracle blocks map mint even when product allow-list passes',
+		400 === $response->get_status()
+			&& 'shipping_method_not_allowed' === ( $response->data['code'] ?? '' )
+			&& [ 41 ] === YSSubscriptionFulfillmentOptionsService::$calls
+			&& [] === EcpayStoreSelector::$map_calls
+	);
+	YSSubscriptionFulfillmentOptionsService::$available = true;
+
 	$response = $map( $base );
 	$args = EcpayStoreSelector::$map_calls[0] ?? [];
 	$check(
@@ -363,6 +397,7 @@ namespace {
 				41,
 			] === $args
 			&& [ 'sub_41' ] === EcpayStoreSelector::$principal_scopes
+			&& [ 41, 41 ] === YSSubscriptionFulfillmentOptionsService::$calls
 	);
 
 	$GLOBALS['v034_user_id'] = 99;

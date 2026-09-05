@@ -275,6 +275,24 @@ namespace YangSheep\Ecommerce\Services\Setup {
 	}
 }
 
+namespace YangSheep\Ecommerce\Services\Storefront {
+	final class YSSubscriptionFulfillmentOptionsService {
+		/** @return array<string,mixed> */
+		public static function get_options( object $subscription ): array {
+			unset( $subscription );
+			return [
+				'success' => true,
+				'data'    => [
+					'methods' => [
+						[ 'id' => 'ys_ec_ecpay_ship_unimart', 'provider' => 'ecpay' ],
+						[ 'id' => 'ys_ec_ecpay_ship_hilife', 'provider' => 'ecpay' ],
+					],
+				],
+			];
+		}
+	}
+}
+
 namespace YangSheep\Ecommerce\Gateways {
 	final class YSGatewayRegistry {
 		public static function get( string $id ): ?object {
@@ -481,7 +499,6 @@ namespace {
 	);
 
 	$authority_check = new \ReflectionMethod( EcpayStoreSelector::class, 'has_valid_scope_authority' );
-	$authority_check->setAccessible( true );
 	$old_map_record = is_array( $map_record ) ? $map_record : [];
 	unset( $old_map_record['authority_marker'], $old_map_record['subscription_id'] );
 	$id_map_record = is_array( $map_record ) ? $map_record : [];
@@ -497,7 +514,6 @@ namespace {
 	);
 
 	$issue = new \ReflectionMethod( EcpayStoreSelector::class, 'issue_selection_token' );
-	$issue->setAccessible( true );
 	$new_token = (string) $issue->invoke( null, [
 		'shipping_id'       => $shipping,
 		'cvs_type'          => 'UNIMARTC2C',
