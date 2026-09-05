@@ -43,12 +43,12 @@ Captured DDL is retained in the fresh phase with its SHA-256 receipt.
 Core is pinned to `47b07b523445492c163b26ba7047c19d64911c0b`; Affiliate is pinned
 read-only to `18c609a1b94cca28e57c2ce4f225f25662555ccd`. All three roots must be clean.
 ECPay product bytes are pinned to `445adc76c4dc6653abdd228b529bad636eef5d42`;
-only descendants whose entire changed-path set is in the twelve-path explicit
+only descendants whose entire changed-path set is in the twenty-path explicit
 harness allowlist are admitted (unknown tests and package paths also reject).
 Each loaded class's raw file blob is checked
 against that revision and its Reflection path checked against the real file.
 The resulting receipts name the actual candidate HEAD/tree and all loaded paths,
-Git blobs and SHA-256 values. A separate receipt names all six actual helper files,
+Git blobs and SHA-256 values. A separate receipt names all eleven actual helper files,
 HEAD blobs and raw SHA-256 values. `CANONICAL` requires a clean helper worktree and
 all raw files equal its HEAD; dirty precommit controls are `UNFROZEN AUTHORING`.
 Helpers are test code, not product authority. A helper override requires a named
@@ -98,15 +98,66 @@ oracles. Old-pair comparison is byte-exact; new-pair comparison restricts the fu
 typed JSON value to the literal allowed transition, preserving object/list identity
 and all other fields. Counts, diagnostics and sentinel equality are checked. These
 are synthetic oracle unit tests, not independently observed SQL facts. Evidence
-labels are required descriptor inputs, not verified server receipts. P2's response
-slot describes winning A; competitor response/session/wait provenance still needs
-the future controller. P11 currently describes a stale-admission unit, not all
-admission variants; P12 describes binding-recheck rejection, not its standalone
-actual-store CAS subcase. No descriptor launches a process or executes a scenario.
+labels are required descriptor inputs, not verified server receipts. These legacy
+unit descriptors are not used to accept B1 worker evidence: their P2 slot describes
+only winning A, P11 a stale-admission unit, and P12 binding recheck only. The B1
+collector below separately validates both role envelopes and all explicit subcases.
+No descriptor itself launches a process or executes a scenario.
 
 The barrier uses create-exclusive stage markers, fixed nonsecret fields and
 bounded monotonic deadlines. Offline timeout/signal tests are not real lock-wait
 proof. Actual contention must later be observed, not inferred from a sleep.
+
+## B1 supplied capture workers and independent evidence
+
+`SubscriptionSqlController` admits exact run/source/runtime/environment tuples,
+requires distinct per-case prefixes, and supervises only its owned IPC children.
+Its `runOffline` launches the `ipc-worker` echo lane, not SQL work. Private worker
+packets travel in stdin; neither token nor password belongs in argv or receipts.
+Both `execute` and native WordPress still refuse unconditionally.
+
+`SubscriptionSqlWorker::run` accepts only explicitly supplied capture sessions.
+The v046/v047 control parent launches independent PHP A/B children, invokes real
+coordinator/model/selector/store methods, and supplies finite complete SQL result
+controls. Its capture files simulate committed/interfered rows, not MySQL storage.
+All twenty P1-P12 subcases now have actual product call schedules and independent
+offline receipt oracles. P7 is one worker with two independent supplied handles,
+not two-process contention. P11h is narrowly the actual legacy claim missing-fence
+rejection. P12b invokes the actual store CAS with retained old bytes, not a replaced
+coordinator or handwritten product CAS. P1 calls the real normal renewal projection
+with global explicitly B; the half-credential projection form remains a negative.
+
+The finite fault state distinguishes attempted/sent/affected, actual versus presented
+results, poison-before-close and stable wrapper/changed transport. B1 replacement
+handles and connection IDs are capture controls, never native reconnect proof.
+P2 has a concrete read-only `data_lock_waits` join and bound A/B wait/lock statement
+receipts. Its capture fixture cannot prove real contention. Sleep alone cannot
+satisfy the oracle; B must return authority_changed, not a postcommit stale replay.
+
+`SubscriptionSqlSchema::seed` dispatches real selector issuance through the supplied
+capture boundary, requires six empty-table counts, preserves typed SQL NULL and
+checks the complete issued record. Full table snapshots retain immutable rows,
+sentinels, options bytes and zero orders/outbox. Setup and controlled interference
+are separately labeled from product writes. There is no automatic CREATE or cleanup.
+
+`metadataPlan` enumerates exactly twenty read statements: server/session settings,
+the six literal table engines and six sets of SHOW CREATE / FULL COLUMNS / INDEX.
+`captureMetadata` binds the exact plan, captures raw rows and SQL hashes with observer
+origin, and returns `UNVALIDATED CAPTURE METADATA` / `schema_acceptance=UNSATISFIED`.
+It is a raw capture contract only, not a MySQL metadata normalizer or schema validator.
+Actual MySQL8.4 version/settings admission, before-CREATE collision handling, full
+product-column/index/default/engine comparison and worker acceptance integration
+remain a separately reviewed prerequisite before any future SQL execution unlock.
+The metadata contract is intentionally not accepted by the scenario oracle as server
+proof. No supplied capture row, even one labeled InnoDB, can complete that gate.
+
+`SubscriptionSqlEvidence` reopens immutable phase-confined raw artifacts, validates
+exact roles/source/runtime/session/fault keys, rehashes barriers and compares exact
+product write SQL. It independently checks complete product responses, full typed
+profile transition, sibling/row bytes, P2 competitor/wait provenance, P8 replay
+bytes and P12 interference baselines. Expected application log messages and counts
+are exact; stderr and unknown log bytes always fail. Rehashed tamper controls must
+fail a normal verdict rather than relying on a stale hash or a child crash.
 
 ## Verification and remaining work
 
@@ -119,12 +170,17 @@ oracles, requiring a retained exactly empty application log. Test-only
 `YS_ECPAY_SQL_HARNESS_HELPER_ROOT` requires `YS_ECPAY_SQL_MUTATION_PHASE=mutation-*`;
 it does not change product roots or disable product blob checks. Clear both for a
 normal run and set `YS_ECPAY_SQL_REQUIRE_CANONICAL_HELPERS=1` for final v044 custody.
+v045 covers controller/IPC/barrier admission; v046 covers typed setup, true issuance,
+finite faults and raw metadata capture; v047 runs all twenty capture schedules and
+independent rehashed adversarial evidence controls. Source mutations use retained
+named helper copies and require green controls, rc1 ordinary failures, and empty
+parent/child stderr. These are source-only offline tests, not SQL acceptance.
 
-Still absent / NOT RUN: real SQL seed writers, full successful coordinator commit,
-P1-P12 worker processes/controller and session fault injection, actual
-MySQL schema/engine/SQL acceptance, historical-source split-state replay control,
-native WordPress `class-wpdb.php`/WordPress version pins and reconnect acceptance.
-Live driver observation provenance, complete admission/standalone-store subcases,
-real renewal projection and fault log event manifests also remain future work.
+Still NOT RUN: every true MySQL seed/commit/rollback/locking/reconnect scenario,
+actual server/schema/engine acceptance and genuine native WordPress reconnect.
+Still NOT IMPLEMENTED: reviewed SQL connector/unlock and integrated metadata/schema
+acceptance, historical dbeb split-state loader/control, materialized-period/YSOrder
+guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
+Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.
 There is no automatic DDL or cleanup path. ECPay remains subscription logistics /
 member selection only (`supports_token=false`), not recurring-payment capability.

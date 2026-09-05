@@ -54,7 +54,7 @@ final class SubscriptionSqlScenario {
 		} elseif ( false !== ( $response['success'] ?? null ) || ! is_string( $response['code'] ?? null ) || '' === $response['code'] ) { $errors[] = 'typed_rejection_missing'; }
 		return [ 'matches' => [] === $errors, 'errors' => $errors, 'acceptance' => 'NOT RUN', 'scope' => 'OFFLINE ORACLE UNIT ONLY' ];
 	}
-	private static function newPair( array $before, array $pair ): bool {
+	public static function newPair( array $before, array $pair ): bool {
 		if ( ! is_string( $pair['profile_updated_at'] ?? null ) || $pair['profile_updated_at'] === ( $before['profile_updated_at'] ?? null )
 			|| 1 !== preg_match( '/\A[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\z/', $pair['profile_updated_at'] )
 			|| $pair['profile_updated_at'] !== ( $pair['updated_at'] ?? null ) ) { return false; }
@@ -76,7 +76,7 @@ final class SubscriptionSqlScenario {
 		return self::sameJsonValue( $expected, $new ) && self::sameJsonValue( $expectedSelection, $newSelection );
 	}
 	/** Ignore object-key order only; retain scalar types, every key and object/list identity. */
-	private static function sameJsonValue( mixed $expected, mixed $actual ): bool {
+	public static function sameJsonValue( mixed $expected, mixed $actual ): bool {
 		if ( get_debug_type( $expected ) !== get_debug_type( $actual ) ) { return false; }
 		if ( $expected instanceof \stdClass ) {
 			$left = get_object_vars( $expected ); $right = get_object_vars( $actual );

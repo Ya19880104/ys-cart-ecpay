@@ -1,0 +1,80 @@
+<?php
+/** Offline controller admission and owned IPC supervision; no database handle lives here. */
+declare(strict_types=1);
+namespace YSCartEcpay\Tests\Live;
+require_once __DIR__ . '/SubscriptionSqlAllocation.php';
+require_once __DIR__ . '/SubscriptionSqlBarrier.php';
+require_once __DIR__ . '/SubscriptionSqlEvidence.php';
+final class SubscriptionSqlController {
+	private static array $admissions = [];
+	public static function admit( array $run, array $env, array $sources ): array {
+		if ( ! SubscriptionSqlEvidence::exactKeys( $run, [ 'version','phase','cases','allocations','source_heads','runtime_sha256','driver' ] ) || 1 !== $run['version']
+			|| 'adapter' !== $run['driver'] || ! is_string( $run['phase'] ) || 1 !== preg_match( '/\A[a-z0-9][a-z0-9-]{0,79}\z/', $run['phase'] )
+			|| ! is_array( $run['cases'] ) || ! array_is_list( $run['cases'] ) || [] === $run['cases'] || ! is_array( $run['allocations'] )
+			|| ! SubscriptionSqlEvidence::exactKeys( $run['source_heads'], [ 'core','ecpay','affiliate' ] ) || ! is_string( $run['runtime_sha256'] )
+			|| ! hash_equals( hash_file( 'sha256', PHP_BINARY ), $run['runtime_sha256'] ) ) { throw new SubscriptionSqlFailure( 'controller_packet_invalid' ); }
+		foreach ( $run['source_heads'] as $role => $head ) { if ( ! is_string( $head ) || 1 !== preg_match( '/\A[a-f0-9]{40}\z/', $head ) || $head !== ( $sources[$role]['head'] ?? null ) ) { throw new SubscriptionSqlFailure( 'controller_source_mismatch' ); } }
+		$roots=[];
+		foreach(['core','ecpay','affiliate'] as $role) { if(!is_string($sources[$role]['root']??null)) { throw new SubscriptionSqlFailure('controller_source_mismatch'); } $roots[$role]=$sources[$role]['root']; }
+		if(SubscriptionProductSqlFixture::inspectSources($roots)!==$sources) { throw new SubscriptionSqlFailure('controller_source_mismatch'); }
+		$seen = []; $prefixes = [];
+		foreach ( $run['cases'] as $case ) {
+			if ( ! is_string( $case ) || ! isset( SubscriptionSqlEvidence::cases()[$case] ) || isset( $seen[$case] ) ) { throw new SubscriptionSqlFailure( 'controller_case_invalid' ); }
+			$seen[$case] = true;
+			$allocation = SubscriptionSqlAllocation::validate( $run['allocations'][$case] ?? null );
+			if ( isset( $prefixes[$allocation['prefix']] ) ) { throw new SubscriptionSqlFailure( 'controller_prefix_reused' ); }
+			$prefixes[$allocation['prefix']] = true;
+		}
+		if ( ! SubscriptionSqlEvidence::exactKeys( $run['allocations'], array_keys( $seen ) ) ) { throw new SubscriptionSqlFailure( 'controller_case_invalid' ); }
+		$environments=SubscriptionSqlEvidence::exactKeys($env,$run['cases']) ? $env : (1===count($run['cases']) ? [$run['cases'][0]=>$env]:[]);
+		foreach($run['allocations'] as $case=>$allocation) {
+			foreach ( [ 'YS_TEST_MYSQL_DSN' => $allocation['host'] . ':' . $allocation['port'], 'YS_TEST_MYSQL_DB' => $allocation['database'], 'YS_TEST_MYSQL_USER' => $allocation['user'], 'YS_ECPAY_SQL_PREFIX' => $allocation['prefix'] ] as $key => $value ) {
+				if ( $value !== ( $environments[$case][$key] ?? null ) ) { throw new SubscriptionSqlFailure( 'controller_environment_mismatch' ); }
+			}
+		}
+		self::$admissions[hash('sha256',json_encode($run,JSON_THROW_ON_ERROR))]=['env'=>$env,'sources'=>$sources];
+		return $run;
+	}
+	/** Launches only the CLI's IPC echo lane, which does not load product or create a Session. */
+	public static function runOffline( array $admitted, string $phaseRoot ): array {
+		$stamp=self::$admissions[hash('sha256',json_encode($admitted,JSON_THROW_ON_ERROR))]??null;
+		if(null===$stamp) { throw new SubscriptionSqlFailure('controller_admission_required'); }
+		self::admit($admitted,$stamp['env'],$stamp['sources']);
+		$phase = SubscriptionSqlBarrier::createPhase( $phaseRoot, $admitted['phase'] ?? '' );
+		$children = [];
+		try {
+		foreach ( $admitted['cases'] as $case ) {
+			$token = bin2hex( random_bytes( 16 ) );
+			foreach ( [ 'A','B' ] as $role ) {
+				$packet = [ 'version' => 1, 'phase' => $admitted['phase'], 'case' => $case, 'role' => $role, 'allocation' => $admitted['allocations'][$case], 'source_heads' => $admitted['source_heads'], 'token' => $token ];
+				$base = $phase->path() . '/' . strtolower( $case . '-' . $role );
+				$command = [ PHP_BINARY, '-n','-d','error_reporting=-1','-d','display_errors=stderr','-d','log_errors=0', dirname( __DIR__ ) . '/live_subscription_product_pair.php', '--driver=adapter', '--mode=ipc-worker', '--role=' . $role ];
+				$process = proc_open( $command, [ 0 => [ 'pipe','r' ], 1 => [ 'file',$base . '.stdout.txt','x' ], 2 => [ 'file',$base . '.stderr.txt','x' ] ], $pipes );
+				if ( ! is_resource( $process ) ) { throw new SubscriptionSqlFailure( 'worker_start_failed' ); }
+				$private = json_encode( $packet, JSON_THROW_ON_ERROR );
+				if ( strlen( $private ) !== fwrite( $pipes[0], $private ) ) { fclose( $pipes[0] ); proc_terminate( $process ); proc_close( $process ); throw new SubscriptionSqlFailure( 'worker_input_failed' ); }
+				fclose( $pipes[0] ); unset( $private, $packet );
+				$children[] = [ 'process' => $process, 'base' => $base, 'case' => $case, 'role' => $role, 'phase'=>$admitted['phase'], 'token_digest' => hash( 'sha256', $token ), 'command' => $command ];
+			}
+			unset( $token );
+		}
+		return self::supervise($children,30000);
+		} finally { foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
+	}
+	/** Only handles owned proc_open resources; no process-name or foreign-PID termination. */
+	private static function supervise(array $children,int $deadlineMs):array {
+		if($deadlineMs<1 || $deadlineMs>30000) { throw new SubscriptionSqlFailure('worker_deadline_invalid'); }
+		$results = []; $until = hrtime( true ) + $deadlineMs*1000000;
+		foreach ( $children as $child ) {
+			do { $status = proc_get_status( $child['process'] ); if ( ! $status['running'] ) { break; } usleep( 1000 ); } while ( hrtime( true ) < $until );
+			if ( $status['running'] ) { foreach ( $children as $owned ) { if ( is_resource( $owned['process'] ) ) { proc_terminate( $owned['process'] ); proc_close( $owned['process'] ); } } throw new SubscriptionSqlFailure( 'worker_timeout' ); }
+			$closed = proc_close( $child['process'] ); $rc = $status['exitcode'] >= 0 ? $status['exitcode'] : $closed;
+			$stdout = (string) file_get_contents( $child['base'] . '.stdout.txt' ); $stderr = (string) file_get_contents( $child['base'] . '.stderr.txt' );
+			$result = json_decode( $stdout, true );
+			if ( 0 !== $rc || '' !== $stderr || ! SubscriptionSqlEvidence::exactKeys($result,['version','phase','case','role','scope','token_digest','connection_attempts','sql_execution']) || 1!==$result['version'] || $child['phase']!==$result['phase'] || 0!==$result['connection_attempts'] || 'NOT RUN'!==$result['sql_execution'] || 'IPC ONLY' !== ( $result['scope'] ?? null ) || $child['role'] !== ( $result['role'] ?? null ) || $child['case'] !== ( $result['case'] ?? null )
+				|| $child['token_digest'] !== ( $result['token_digest'] ?? null ) ) { throw new SubscriptionSqlFailure( 'worker_result_invalid' ); }
+			$results[] = [ 'rc' => $rc, 'result' => $result, 'command' => $child['command'], 'stdout' => [ 'path' => $child['base'] . '.stdout.txt', 'bytes' => strlen( $stdout ), 'sha256' => hash( 'sha256', $stdout ) ], 'stderr' => [ 'path' => $child['base'] . '.stderr.txt', 'bytes' => strlen( $stderr ), 'sha256' => hash( 'sha256', $stderr ) ] ];
+		}
+		return [ 'scope' => 'IPC ONLY', 'sql_execution' => 'NOT RUN', 'workers' => $results ];
+	}
+}

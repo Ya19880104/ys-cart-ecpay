@@ -13,11 +13,24 @@ $rc = 2;
 try {
 	$options = [];
 	foreach ( array_slice( $argv, 1 ) as $argument ) {
-		if ( 1 !== preg_match( '/\A--(driver|mode|phase|evidence-root)=(.*)\z/s', $argument, $match ) ) { throw new SubscriptionSqlFailure( 'argument_unknown' ); }
+		if ( 1 !== preg_match( '/\A--(driver|mode|phase|evidence-root|role)=(.*)\z/s', $argument, $match ) ) { throw new SubscriptionSqlFailure( 'argument_unknown' ); }
 		$options[$match[1]] = $match[2];
 	}
 	if ( ! in_array( $options['driver'] ?? '', [ 'adapter', 'wordpress' ], true ) ) { throw new SubscriptionSqlFailure( 'driver_unknown' ); }
 	if ( 'wordpress' === $options['driver'] ) { throw new SubscriptionSqlFailure( 'native_wpdb_prerequisite_unsatisfied' ); }
+	if ( 'ipc-worker' === ( $options['mode'] ?? '' ) ) {
+		require_once __DIR__ . '/helpers/SubscriptionSqlWorker.php';
+		if ( ! \YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::exactKeys( $options, [ 'driver','mode','role' ] ) ) { throw new SubscriptionSqlFailure( 'worker_packet_invalid' ); }
+		$private = stream_get_contents( STDIN, 32769 );
+		if ( ! is_string( $private ) || strlen( $private ) > 32768 ) { throw new SubscriptionSqlFailure( 'worker_packet_invalid' ); }
+		$packet = \YSCartEcpay\Tests\Live\SubscriptionSqlWorker::validatePacket( json_decode( $private, true ) );
+		if ( $options['role'] !== $packet['role'] ) { throw new SubscriptionSqlFailure( 'worker_packet_invalid' ); }
+		$protocol = \YSCartEcpay\Tests\Live\SubscriptionSqlWorker::protocol( $packet );
+		unset( $packet, $private );
+		echo json_encode( $protocol, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR ) . "\n";
+		exit( 0 );
+	}
+	if ( isset( $options['role'] ) ) { throw new SubscriptionSqlFailure( 'argument_unknown' ); }
 	if ( ! in_array( $options['mode'] ?? '', [ 'preflight', 'capture-ddl', 'execute' ], true ) ) { throw new SubscriptionSqlFailure( 'mode_unknown' ); }
 	$allocationPath = (string) getenv( 'YS_ECPAY_SQL_ALLOCATION' );
 	if ( '' === $allocationPath || ! is_file( $allocationPath ) ) { throw new SubscriptionSqlFailure( 'allocation_required' ); }

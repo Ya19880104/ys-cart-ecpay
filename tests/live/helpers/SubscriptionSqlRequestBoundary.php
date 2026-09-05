@@ -12,12 +12,19 @@ namespace {
 	function get_current_user_id(): int { return 7; }
 	function is_user_logged_in(): bool { return true; }
 	function current_time( string $type ): int|string { return 'timestamp' === $type ? 1788566400 : '2026-09-05 00:00:00'; }
+	/** Explicit synthetic randomness boundary for the real private selector issuer only. */
+	function wp_generate_password( int $length = 12, bool $special = true, bool $extra = false ): string {
+		$token = $GLOBALS['ecpay_sql_issuance_token'] ?? null;
+		if ( 32 !== $length || $special || $extra || ! is_string( $token ) || 1 !== preg_match( '/\A[A-Za-z0-9]{32}\z/', $token ) ) { throw new \YSCartEcpay\Tests\Live\SubscriptionSqlFailure( 'issuance_randomness_invalid' ); }
+		return $token;
+	}
 	function apply_filters( string $hook, mixed $value, mixed ...$args ): mixed {
 		$plugin = $GLOBALS['ecpay_sql_plugin'] ?? null;
 		if ( null === $plugin ) { return $value; }
 		if ( 'ys_ec_resolve_fulfillment_selection_v1' === $hook ) { return $plugin->resolve_fulfillment_selection( $value, $args[0] ?? [], $args[1] ?? [] ); }
 		if ( 'ys_ec_claim_fulfillment_selection_v1' === $hook ) {
 			$GLOBALS['ecpay_sql_claim_calls'] = (int) ( $GLOBALS['ecpay_sql_claim_calls'] ?? 0 ) + 1;
+			if ( isset( $GLOBALS['ecpay_sql_before_real_claim'] ) ) { ( $GLOBALS['ecpay_sql_before_real_claim'] )(); }
 			return $plugin->claim_fulfillment_selection( $value, $args[0] ?? [], $args[1] ?? [], $args[2] ?? [] );
 		}
 		return $value;
@@ -30,6 +37,7 @@ namespace YangSheep\Ecommerce\Shipping {
 	/** Fixed catalog boundary, not the real registry/lifecycle/restriction-engine integration. */
 	final class YSShippingRegistry {
 		public static bool $enabled = true;
+		public static string $fixtureProvider = 'ecpay';
 		public static function configured_enabled_method_ids(): array { return self::$enabled ? [ 'home_old', 'ys_ec_ecpay_ship_unimart' ] : []; }
 		public static function get( string $id ): ?object { return self::get_operable( $id ); }
 		public static function get_operable( string $id ): ?object {
@@ -37,7 +45,7 @@ namespace YangSheep\Ecommerce\Shipping {
 			return new class( $id ) {
 				public function __construct( private string $id ) {}
 				public function get_id(): string { return $this->id; }
-				public function get_provider(): string { return 'home_old' === $this->id ? 'provider-old' : 'ecpay'; }
+				public function get_provider(): string { return 'home_old' === $this->id ? 'provider-old' : YSShippingRegistry::$fixtureProvider; }
 				public function get_type(): string { return 'home_old' === $this->id ? 'home' : 'cvs'; }
 				public function calculate_cost( array $items, array $address = [] ): float { return 'home_old' === $this->id ? 75.0 : 65.0; }
 			};

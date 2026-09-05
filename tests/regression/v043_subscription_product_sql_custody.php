@@ -26,6 +26,11 @@ $cases = [
 	'forbidden-package-descendant' => [ 'manifest.php', true, 'pair_path_not_allowed' ],
 	'unknown-test-descendant' => [ 'tests/live/not-allocated.php', true, 'pair_path_not_allowed' ],
 ];
+foreach ( [
+	'tests/live/helpers/SubscriptionSqlController.php', 'tests/live/helpers/SubscriptionSqlWorker.php',
+	'tests/live/helpers/SubscriptionSqlSchema.php', 'tests/live/helpers/SubscriptionSqlFaults.php', 'tests/live/helpers/SubscriptionSqlEvidence.php',
+	'tests/regression/v045_subscription_sql_controller_protocol.php', 'tests/regression/v046_subscription_sql_seed_fault_boundaries.php', 'tests/regression/v047_subscription_sql_evidence_provenance.php',
+] as $i => $path ) { $cases['b1-exact-path-' . $i] = [$path,true,'accepted']; }
 $pass = 0; $fail = 0; $receipts = [];
 $helperReceipt = Fixture::helperReceipt( $helperRoot );
 $savedOverride = getenv( 'YS_ECPAY_SQL_HARNESS_HELPER_ROOT' ); $savedPhase = getenv( 'YS_ECPAY_SQL_MUTATION_PHASE' );

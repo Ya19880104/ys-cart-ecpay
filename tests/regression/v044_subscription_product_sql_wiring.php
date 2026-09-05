@@ -23,7 +23,7 @@ if ( $hasWiring && $hasScenario ) {
 	$products = Fixture::loadProduct( $sources );
 	$helperReceipt = method_exists( Fixture::class, 'helperReceipt' ) ? Fixture::helperReceipt( $helpers ) : [];
 	$check( 'helper receipt names every actual helper hash and canonical or named mutation state',
-		6 === count( $helperReceipt['files'] ?? [] ) && is_string( $helperReceipt['state'] ?? null )
+		11 === count( $helperReceipt['files'] ?? [] ) && is_string( $helperReceipt['state'] ?? null )
 		&& ( '1' !== getenv( 'YS_ECPAY_SQL_REQUIRE_CANONICAL_HELPERS' ) || 'CANONICAL' === $helperReceipt['state'] ) );
 	$prefix = 'ecps_0123456789ab_'; $now = time(); $token = str_repeat( 'T', 32 );
 	$seed = Fixture::seedPlan( $prefix, $now, $token );

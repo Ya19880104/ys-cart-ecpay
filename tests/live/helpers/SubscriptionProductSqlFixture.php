@@ -36,6 +36,14 @@ namespace YSCartEcpay\Tests\Live {
 			'tests/regression/v042_subscription_product_sql_capture_behavior.php',
 			'tests/regression/v043_subscription_product_sql_custody.php',
 			'tests/regression/v044_subscription_product_sql_wiring.php',
+			'tests/live/helpers/SubscriptionSqlController.php',
+			'tests/live/helpers/SubscriptionSqlWorker.php',
+			'tests/live/helpers/SubscriptionSqlSchema.php',
+			'tests/live/helpers/SubscriptionSqlFaults.php',
+			'tests/live/helpers/SubscriptionSqlEvidence.php',
+			'tests/regression/v045_subscription_sql_controller_protocol.php',
+			'tests/regression/v046_subscription_sql_seed_fault_boundaries.php',
+			'tests/regression/v047_subscription_sql_evidence_provenance.php',
 		];
 		private static function git( string $root, array $args ): string {
 			$process = proc_open( [ 'git', '-C', $root, ...$args ], [ 0 => [ 'pipe', 'r' ], 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );
@@ -114,7 +122,8 @@ namespace YSCartEcpay\Tests\Live {
 				$clean = '' === self::git( $root, [ 'status', '--porcelain=v1', '--untracked-files=all' ] );
 			}
 			$rows = [];
-			foreach ( [ 'SubscriptionSqlSession.php','SubscriptionSqlAllocation.php','SubscriptionSqlBarrier.php','SubscriptionProductSqlFixture.php','SubscriptionSqlRequestBoundary.php','SubscriptionSqlScenario.php' ] as $name ) {
+			foreach ( [ 'SubscriptionSqlSession.php','SubscriptionSqlAllocation.php','SubscriptionSqlBarrier.php','SubscriptionProductSqlFixture.php','SubscriptionSqlRequestBoundary.php','SubscriptionSqlScenario.php',
+				'SubscriptionSqlController.php','SubscriptionSqlWorker.php','SubscriptionSqlSchema.php','SubscriptionSqlFaults.php','SubscriptionSqlEvidence.php' ] as $name ) {
 				$path = $directory . '/' . $name;
 				if ( ! is_file( $path ) ) { throw new SubscriptionSqlFailure( 'helper_file_missing' ); }
 				$blob = null;
