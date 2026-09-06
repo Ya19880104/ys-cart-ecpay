@@ -114,6 +114,19 @@ if ( $available ) {
 					$changes['interference-bytes']=static function(string $kind,string $name,mixed $value) use($case,$control):mixed { if('worker'===$kind && 'B'===$name) { $i=&$value['fault_receipt']['interference']; $i['after_bytes'].=' '; $value['readback_receipt'][$control['base']['prefix'].'options'][1]['option_value']=$i['after_bytes']; } return $value; };
 				}
 				if('P8'===$case) { $changes['replay-bytes']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if('consume'===$s['kind']) { $s['sql'].=' '; $s['sql_sha256']=hash('sha256',$s['sql']); } } unset($s); } return $value; }; }
+				if(in_array($case,['P8','P9','P10'],true)) {
+					foreach(['old-id','sequence','reason','poison','duplicate','owner'] as $break) { $changes['replacement-close-'.$break]=static function(string $kind,string $name,mixed $value) use($break):mixed {
+						if('worker'!==$kind || 'A'!==$name) { return $value; }
+						if('old-id'===$break) { $value['session_receipts']['closes'][0]['identity']['connection_id']='9199'; }
+						if('sequence'===$break) { ++$value['session_receipts']['closes'][0]['sequence']; }
+						if('reason'===$break) { $value['session_receipts']['closes'][0]['reason']='close'; }
+						if('poison'===$break) { $value['session_receipts']['closes'][0]['poisoned']=true; }
+						if('duplicate'===$break) { $value['session_receipts']['closes'][]=$value['session_receipts']['closes'][0]; }
+						if('owner'===$break) { $value['session_receipts']['identity']['owner_nonce']=str_repeat('f',32); }
+						return $value;
+					}; }
+					if('P8'!==$case) { $changes['forbidden-terminal']=static function(string $kind,string $name,mixed $value) use($case):mixed { if('worker'===$kind && 'A'===$name) { $s=end($value['statement_receipts']); $s['sequence']=count($value['statement_receipts'])+1; $s['origin']='product'; $s['kind']='P9'===$case?'commit':'rollback'; $s['sql']=strtoupper($s['kind']); $s['sql_sha256']=hash('sha256',$s['sql']); $s['actual']=$s['presented']=['error'=>'','rows'=>[],'affected'=>0]; $s['sent']=true; $s['fault']=null; $value['statement_receipts'][]=$s; } return $value; }; }
+				}
 				if('P1'===$case) {
 					foreach(['scalar','numeric-key-object','payment'] as $tamper) {
 						$changes['profile-'.$tamper]=static function(string $kind,string $name,mixed $value) use($control,$tamper):mixed {

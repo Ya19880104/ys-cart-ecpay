@@ -120,18 +120,27 @@ final class SubscriptionSqlSession {
 	/** Transfer an already supplied transport. This method never invokes any connector. */
 	public function replaceWith( self $replacement ): void {
 		if ( $replacement === $this || ! $this->ready || ! $replacement->ready || $this->prefix !== $replacement->prefix || $this->capture !== $replacement->capture ) { throw new SubscriptionSqlFailure( 'replacement_invalid' ); }
+		if(!$this->capture) {
+			if(null===$this->execution || null===$replacement->execution || 0!==$this->replacements || 0!==$replacement->replacements
+				|| array_key_exists('replacement',$this->execution) || array_key_exists('replacement',$replacement->execution) || 0!==$replacement->dispatches || []!==$replacement->closes()
+				|| !in_array($this->execution['context']['case'],['P8','P9','P10'],true) || $this->execution['allocation']!==$replacement->execution['allocation'] || $this->execution['context']!==$replacement->execution['context']) { throw new SubscriptionSqlFailure('replacement_not_admitted'); }
+			// Preserve both canonical admissions even if the checked old close fails.
+			$this->execution['replacement']=$replacement->execution;
+		}
 		$old = $this->identity;
 		if ( true !== ( $this->disconnect )() ) { throw new SubscriptionSqlFailure( 'replacement_close_failed' ); }
 		$this->execute = $replacement->execute; $this->quote = $replacement->quote; $this->disconnect = $replacement->disconnect;
 		$this->identity = $replacement->identity; $replacement->ready = false; ++$this->replacements;
 		$this->closeReceipts[] = [ 'sequence'=>count( $this->trace ), 'reason'=>'controlled-replacement', 'identity'=>$old, 'poisoned'=>false ];
 	}
-	private static function kind( string $sql ): string {
+	private static function kind( string $sql, string $origin ): string {
 		if ( 'COMMIT' === $sql ) { return 'commit'; }
 		if ( 'ROLLBACK' === $sql ) { return 'rollback'; }
 		if ( 'START TRANSACTION' === $sql ) { return 'begin'; }
 		if ( self::SESSION_SQL === $sql ) { return 'session-verify'; }
 		if ( 1 === preg_match( "/\\ASET @ys_profile_tx_owner = '[a-f0-9]{32}'\\z/", $sql ) ) { return 'owner-set'; }
+		// Nested observer reads belong to their own origin, not the pending product caller.
+		if('product'!==$origin) { return 'read-or-setup'; }
 		// Classification is provenance, not SQL admission. The capture recorder still independently
 		// admits complete statements. Only genuine loaded model/store callsites classify the writes.
 		foreach ( debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 12 ) as $frame ) {
@@ -174,7 +183,7 @@ final class SubscriptionSqlSession {
 	}
 	private function dispatch( string $sql ): array {
 		if ( ! $this->ready ) { throw new SubscriptionSqlFailure( 'session_closed' ); }
-		$kind = self::kind( $sql ); $index = count( $this->trace ); $origin = $this->origin;
+		$origin = $this->origin; $kind = self::kind( $sql, $origin ); $index = count( $this->trace );
 		$this->trace[] = [ 'sequence'=>$index + 1, 'origin'=>$origin, 'kind'=>$kind, 'sql'=>$sql, 'sql_sha256'=>hash( 'sha256', $sql ), 'before_identity'=>$this->identity,
 			'after_identity'=>null, 'sent'=>false, 'actual'=>null, 'presented'=>null, 'fault'=>null ];
 		$decision = 'product' === $origin && null !== $this->before ? ( $this->before )( $kind, $sql, $this->identity ) : [ 'send'=>true,'action'=>'none','fault'=>null,'presented'=>null ];

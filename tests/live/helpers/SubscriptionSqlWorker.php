@@ -38,7 +38,7 @@ final class SubscriptionSqlWorker {
 			if(null!==$b || null===$execution || $execution['allocation']!==$p['allocation'] || $execution['context']['case']!==$case || $execution['context']['source_heads']!==$p['source_heads']) { throw new SubscriptionSqlFailure('mysql_session_required'); }
 		} elseif(null!==$b && !$b->isCapture()) { throw new SubscriptionSqlFailure('worker_session_invalid'); }
 		if ( ! $a->ready || $a->prefix !== $p['allocation']['prefix'] || basename( $barrier->path() ) !== $p['phase'] || ( null !== $b && ( $b === $a || $b->prefix !== $a->prefix || ! $b->ready ) )
-			|| ( 'A' === $role && in_array( $case, ['P7','P8','P9','P10'], true ) && null === $b ) ) { throw new SubscriptionSqlFailure( 'worker_session_invalid' ); }
+			|| ( !$mysql && 'A' === $role && in_array( $case, ['P7','P8','P9','P10'], true ) && null === $b ) ) { throw new SubscriptionSqlFailure( 'worker_session_invalid' ); }
 		$sources = SubscriptionProductSqlFixture::inspectSources( [ 'core'=>getenv( 'YS_CORE_ROOT' ),'ecpay'=>getenv( 'YS_ECPAY_ROOT' ),'affiliate'=>getenv( 'YS_AFFILIATE_ROOT' ) ] );
 		foreach ( $p['source_heads'] as $name=>$head ) { if ( $sources[$name]['head'] !== $head ) { throw new SubscriptionSqlFailure( 'worker_source_drift' ); } }
 		$products = SubscriptionProductSqlFixture::loadProduct( $sources ); require_once __DIR__ . '/SubscriptionSqlRequestBoundary.php';
@@ -49,7 +49,7 @@ final class SubscriptionSqlWorker {
 		$oldDb = $GLOBALS['wpdb'] ?? null; $oldPlugin = $GLOBALS['ecpay_sql_plugin'] ?? null;
 		$GLOBALS['wpdb'] = $a; $GLOBALS['ecpay_sql_plugin'] = new \YangSheep\YSCartEcpay\Plugin();
 		$registry = \YangSheep\Ecommerce\Shipping\YSShippingRegistry::class; $enabled = $registry::$enabled; $provider = $registry::$fixtureProvider;
-		$barriers = []; $projection = null; $interference = null; $response = null; $schema=null;
+		$barriers = []; $projection = null; $interference = null; $response = null; $schema=null; $replacementServer=null;
 		$fault = SubscriptionSqlFaults::arm( $case, $role );
 		try {
 			$a->observe( static fn (): mixed => $a->get_row( SubscriptionSqlSession::SESSION_SQL, 'ARRAY_A' ) );
@@ -63,12 +63,22 @@ final class SubscriptionSqlWorker {
 				$setup = $barrier->awaitBound( $case, 'setup-complete' ); $baseline = $setup['receipt']['data']['baseline']; $seed = $setup['receipt']['data']['seed'];
 				if($mysql) { $schema=SubscriptionSqlSchema::mysql($a,false); }
 			}
-			$action = static function ( string $name ) use ( $a, $b, $barrier, $p, &$barriers, &$interference ): void {
+			$action = static function ( string $name ) use ( $a, $b, $barrier, $p, $mysql, $schema, &$barriers, &$interference, &$replacementServer ): void {
 				if ( 'none' === $name ) { return; }
 				if ( 'swap-global' === $name ) { $GLOBALS['wpdb'] = $b; return; }
 				if ( in_array( $name, ['replace-before-consume','replace-before-verify','replace-before-commit'], true ) ) {
-					if ( null === $b ) { throw new SubscriptionSqlFailure( 'replacement_required' ); }
-					$a->replaceWith( $b ); $a->observe( static fn (): mixed => $a->get_row( SubscriptionSqlSession::SESSION_SQL, 'ARRAY_A' ) ); return;
+					$replacement=$mysql ? SubscriptionSqlSession::connect($p['allocation'],null,$a->executionReceipt()['context']) : $b;
+					if(null===$replacement) { throw new SubscriptionSqlFailure('replacement_required'); }
+					try {
+						$a->replaceWith($replacement);
+						$a->observe(static fn():mixed=>$a->get_row(SubscriptionSqlSession::SESSION_SQL,'ARRAY_A'));
+						if($mysql) {
+							$sql=$schema['plan']['queries']['session'];
+							$rows=$a->observe(static function() use($a,$sql):array { $rows=$a->get_results($sql,'ARRAY_A'); if(''!==$a->last_error) { throw new SubscriptionSqlFailure('mysql_server_invalid'); } return $rows; });
+							$replacementServer=['sql'=>$sql,'sql_sha256'=>hash('sha256',$sql),'rows'=>$rows,'server'=>SubscriptionSqlSchema::validateServer($rows,$p['allocation']['database'])];
+						}
+					} finally { if($mysql && $replacement->ready) { $replacement->close(); } }
+					return;
 				}
 				if ( ! in_array( $name, ['pause-before-commit','pause-before-claim'], true ) ) { throw new SubscriptionSqlFailure( 'fault_action_invalid' ); }
 				$barriers[] = self::signal( $barrier, $p, 'a-seam', 2, $a, [ 'action'=>$name ] );
@@ -129,7 +139,7 @@ final class SubscriptionSqlWorker {
 				'session_receipts'=>['identity'=>$a->identity(),'replacements'=>$a->physicalReplacements(),'closes'=>$a->closes(),'ready'=>$a->ready], 'statement_receipts'=>$a->statements(),'barrier_receipts'=>$barriers,
 				'baseline_receipt'=>$baseline,'readback_receipt'=>$readback,'product_response'=>$response,'projection_receipt'=>$projection,'fault_receipt'=>array_merge($fault->finish(),['interference'=>$interference]),
 				'diagnostics'=>['log'=>['path'=>realpath($logPath),'bytes'=>filesize($logPath),'sha256'=>hash_file('sha256',$logPath)]], 'rc'=>0 ];
-			if($mysql) { $receipt['mysql_receipt']=['connector'=>$a->executionReceipt(),'schema'=>$schema]; }
+			if($mysql) { $receipt['mysql_receipt']=['connector'=>$a->executionReceipt(),'schema'=>$schema]; if(null!==$replacementServer) { $receipt['mysql_receipt']['replacement_server']=$replacementServer; } }
 			return $receipt;
 		} finally {
 			$a->instrument( null, null ); unset( $GLOBALS['ecpay_sql_before_real_claim'] ); $GLOBALS['wpdb'] = $oldDb; $GLOBALS['ecpay_sql_plugin'] = $oldPlugin;

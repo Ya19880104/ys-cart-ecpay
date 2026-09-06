@@ -2,7 +2,7 @@
 
 The offline modes validate an allocation and exact product sources, or capture
 product-generated DDL, without connecting. B2 adds a separately admitted real
-mysqli execution path for **P1, P3–P6 and P11a–h only**. Its implementation and offline
+mysqli execution path for **P1, P3–P6, P8–P10 and P11a–h only**. Its implementation and offline
 regressions do not prove SQL acceptance: each case still requires a reviewed clean
 source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
@@ -226,9 +226,18 @@ named helper copies and require green controls, rc1 ordinary failures, and empty
 parent/child stderr. These are source-only offline tests, not SQL acceptance.
 
 P1/P11a–h have retained MySQL 8.4.11 acceptance at ECPay `ff255d6069f9904446079695e92c9654c126511a`,
-paired with the fixed Core/Affiliate anchors. P3–P6 engineering and offline controls
-still require their own clean-source real SQL receipts. P2/P7/P8–P10/P12a–b and
-genuine native WordPress reconnect remain NOT RUN.
+paired with the fixed Core/Affiliate anchors. P3–P6 have separate retained MySQL 8.4.11
+acceptance at ECPay `bd4f7189ac83032049b35a7dfb1fd6cfcf5a303c` with those same anchors.
+P8–P10 engineering and offline controls still require their own clean-source real SQL
+receipts. Their scope literal is `MYSQLI P1/P3-P6/P8-P10/P11 SLICE`; only the returned
+case list identifies the cases actually executed. Each P8–P10 A uses one fresh canonical
+second connection at its named consume/preverify/COMMIT seam. The same wrapper retains
+both connector admissions, one checked old close, the original schema CID and a fixed
+new-server read. Old A, new A and observer B must have three distinct physical IDs;
+A has two connector attempts and B one. The pending product SQL stays byte-identical,
+including its old fence; every dispatched result must equal its presentation. No replacement
+transaction/owner initialization or generic replay is added. P2/P7/P12a–b and genuine
+native WordPress reconnect remain NOT RUN.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.

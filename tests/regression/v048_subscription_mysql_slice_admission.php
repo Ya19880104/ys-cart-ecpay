@@ -32,13 +32,13 @@ try {
             $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case]));
             $check($case.' admits exact source runtime and allocated tuple without a secret or connection',$admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P3','P4','P5','P6'] as $case) {
+        foreach(['P3','P4','P5','P6','P8','P9','P10'] as $case) {
             $admitted=null; $code='';
             try { $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case])); }
             catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
-            $check($case.' terminal allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
+            $check($case.' slice allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P2','P7','P8','P9','P10','P12a','P12b','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
+        foreach(['P2','P7','P12a','P12b','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['kind'=>'offline-design']),$context),'sql_execution_allocation_required');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$context),'allocation_invalid');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['host'=>'localhost']),$context),'allocation_invalid');
@@ -154,6 +154,29 @@ try {
         $code=null; try { $call(); } catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
         $check($label,$code===$expected && 0===Session::connectionAttempts());
     };
+    // Protocol-only children cannot satisfy Evidence::evaluateMysql: their receipt is empty.
+    // This checks the existing supervisor's exact per-role attempt count without a connector.
+    $supervisor=new ReflectionMethod(Controller::class,'supervise');
+    $supervisorRoot=sys_get_temp_dir().'/ecpay-b2-replacement-protocol-'.bin2hex(random_bytes(8)); mkdir($supervisorRoot);
+    $emptyReceipt=Evidence::persist($supervisorRoot,'empty-worker.json',[]);
+    foreach([['P8','A',2,true],['P9','A',2,true],['P10','A',2,true],['P8','A',1,false],['P8','A',3,false],['P8','B',1,true],['P8','B',2,false],['P1','A',2,false]] as $i=>[$case,$role,$attempts,$valid]) {
+        $base=$supervisorRoot.'/protocol-'.$i;
+        $protocol=['version'=>1,'phase'=>'replacement-protocol','case'=>$case,'role'=>$role,'scope'=>'MYSQLI WORKER','token_digest'=>str_repeat('a',64),'connection_attempts'=>$attempts,'sql_execution'=>'EXECUTED','receipt'=>$emptyReceipt];
+        $command=[PHP_BINARY,'-n','-r','echo stream_get_contents(STDIN);'];
+        $child=proc_open($command,[0=>['pipe','r'],1=>['file',$base.'.stdout.txt','x'],2=>['file',$base.'.stderr.txt','x']],$pipes);
+        if(!is_resource($child)) { throw new RuntimeException('protocol control process unavailable'); }
+        fwrite($pipes[0],json_encode($protocol,JSON_THROW_ON_ERROR)); fclose($pipes[0]);
+        $owned=['process'=>$child,'base'=>$base,'case'=>$case,'role'=>$role,'phase'=>'replacement-protocol','token_digest'=>str_repeat('a',64),'command'=>$command,'mysql'=>true];
+        $oracleCheck($case.'/'.$role.' supervisor count '.$attempts.' is '.($valid?'admitted only as protocol':'rejected'),
+            static fn()=>$supervisor->invoke(null,[$owned],1000),$valid?null:'worker_result_invalid');
+    }
+    foreach(['P8','P9','P10'] as $case) {
+        $replacementContext=array_replace($context,['case'=>$case]);
+        $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$replacementContext),'allocation_invalid');
+        $reject(static fn()=>Session::admitExecution(array_replace($grant,['database'=>'other_fixture']),$replacementContext),'execution_environment_mismatch');
+        $reject(static fn()=>Session::admitExecution($grant,array_replace($replacementContext,['runtime_sha256'=>str_repeat('0',64)])),'execution_runtime_mismatch');
+        $reject(static fn()=>Session::connect($grant,$callback,$replacementContext),'caller_connector_forbidden');
+    }
     foreach($fragments as $case=>$trace) {
         $oracleCheck($case.' exact terminal actual/presented contract',static fn()=>$statements->invoke(null,$case,'A',$trace,true));
         $oracleCheck($case.' terminal fault cannot move to B',static fn()=>$statements->invoke(null,$case,'B',$trace,true),
@@ -178,6 +201,43 @@ try {
     }
     $ordinary=[$statement('commit','COMMIT','unrelated-fault',$ok,$ok)];
     $oracleCheck('mysqli does not accept an arbitrary fault on ordinary SQL',static fn()=>$statements->invoke(null,'P1','A',$ordinary,true),'mysql_statement_invalid');
+    // Native replacement fragments test precise oracle boundaries, never SQL acceptance.
+    $newId=['connection_id'=>'9103','database'=>$grant['database'],'owner_nonce'=>null];
+    foreach(['P8'=>['consume','replace-before-consume'],'P9'=>['session-verify','replace-before-verify'],'P10'=>['commit','replace-before-commit']] as $case=>[$kind,$label]) {
+        $actual='P9'===$case?['error'=>'','rows'=>[['cid'=>'9103','dbname'=>$grant['database'],'owner'=>null]],'affected'=>1]:$ok;
+        $trace=[$statement($kind,'P9'===$case?Session::SESSION_SQL:('P10'===$case?'COMMIT':'finite old consume bytes'),$label,$actual,$actual)];
+        $trace[0]['after_identity']=$newId;
+        $oracleCheck($case.' exact native replacement label retains sent actual presentation',static fn()=>$statements->invoke(null,$case,'A',$trace,true));
+        foreach(['role','case','kind','origin','label','unsent','presentation'] as $break) {
+            $bad=$trace; $role='A'; $testCase=$case;
+            if('role'===$break) { $role='B'; }
+            if('case'===$break) { $testCase='P1'; }
+            if('kind'===$break) { $bad[0]['kind']='read-or-setup'; }
+            if('origin'===$break) { $bad[0]['origin']='observer'; }
+            if('label'===$break) { $bad[0]['fault']='unrelated-replacement'; }
+            if('unsent'===$break) { $bad[0]['sent']=false; $bad[0]['actual']=null; }
+            if('presentation'===$break) { $bad[0]['presented']['affected']=7; }
+            $expected=match($break){'unsent'=>'statement_result_invalid','presentation'=>'statement_presentation_invalid',default=>'mysql_statement_invalid'};
+            $oracleCheck($case.' native replacement rejects '.$break,static fn()=>$statements->invoke(null,$testCase,$role,$bad,true),$expected);
+        }
+        $worker=['fault_receipt'=>['case'=>$case,'role'=>'A','trigger_count'=>1,'triggered'=>[$label],'actual_commit'=>null,'interference'=>null],
+            'session_receipts'=>['identity'=>$newId,'replacements'=>1,'closes'=>[['sequence'=>1,'reason'=>'controlled-replacement','identity'=>$id,'poisoned'=>false]],'ready'=>true],
+            'statement_receipts'=>$trace,'readback_receipt'=>[],
+            'mysql_receipt'=>['schema'=>['server'=>['connection_id'=>'9101','database_name'=>$grant['database']]]]];
+        $oracleCheck($case.' native replacement binds one old close to its pending seam',static fn()=>$faultProof->invoke(null,$case,'A',$worker,true));
+        foreach(['old-id','close-sequence','close-reason','poison','duplicate-close','count','nonce','duplicate-fault'] as $break) {
+            $bad=$worker;
+            if('old-id'===$break) { $bad['session_receipts']['closes'][0]['identity']['connection_id']='9104'; }
+            if('close-sequence'===$break) { $bad['session_receipts']['closes'][0]['sequence']=2; }
+            if('close-reason'===$break) { $bad['session_receipts']['closes'][0]['reason']='close'; }
+            if('poison'===$break) { $bad['session_receipts']['closes'][0]['poisoned']=true; }
+            if('duplicate-close'===$break) { $bad['session_receipts']['closes'][]=$bad['session_receipts']['closes'][0]; }
+            if('count'===$break) { $bad['session_receipts']['replacements']=2; }
+            if('nonce'===$break) { $bad['session_receipts']['identity']['owner_nonce']=str_repeat('b',32); }
+            if('duplicate-fault'===$break) { $bad['fault_receipt']['triggered'][]=$label; ++$bad['fault_receipt']['trigger_count']; }
+            $oracleCheck($case.' native replacement rejects '.$break,static fn()=>$faultProof->invoke(null,$case,'A',$bad,true),'duplicate-fault'===$break?'fault_proof_invalid':'replacement_proof_invalid');
+        }
+    }
     $p6=['fault_receipt'=>['case'=>'P6','role'=>'A','trigger_count'=>2,'triggered'=>['precommit-unreadable','rollback-suppressed'],'actual_commit'=>null,'interference'=>null],
         'session_receipts'=>['identity'=>$id,'replacements'=>0,'closes'=>[['sequence'=>2,'reason'=>'close','identity'=>$id,'poisoned'=>true]],'ready'=>false],
         'statement_receipts'=>$fragments['P6'],'readback_receipt'=>null];
@@ -204,6 +264,38 @@ try {
     $oracleCheck('P6 closed-session exception cannot move to B',static fn()=>$faultProof->invoke(null,'P6','B',$bad,true),'mysql_server_invalid');
     $bad=$p6; $bad['fault_receipt']=['case'=>'P3','role'=>'A','trigger_count'=>1,'triggered'=>['precommit-unreadable'],'actual_commit'=>null,'interference'=>null];
     $oracleCheck('P6 closed-session exception cannot move to P3',static fn()=>$faultProof->invoke(null,'P3','A',$bad,true),'mysql_server_invalid');
+    // Actual Store::claim call stack: the nested server observer must not inherit consume.
+    // Reuse the existing request stubs and exact SQL capture; no native execution is claimed.
+    require_once $helpers.'/SubscriptionSqlRequestBoundary.php';
+    $store=\YangSheep\YSCartEcpay\Shipping\Ecpay\EcpaySubscriptionSelectionStore::class;
+    $probeSql=$metadata['queries']['session']; $token=str_repeat('T',32);
+    $issued=['state'=>'issued','record'=>['subscription_id'=>41,'expires_at'=>time()+300]];
+    $bytes=json_encode($issued,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+    $consumed=$issued; $consumed['state']='consumed'; $consumed['consumed']=['subscription_id'=>41,'generation'=>4,'at'=>'2026-09-05 00:00:00'];
+    $q=static fn(string $v):string=>"'".str_replace(['\\',"'"],['\\\\',"\\'"],$v)."'";
+    $update='UPDATE '.$grant['prefix'].'options SET option_value = '.$q(json_encode($consumed,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)).' WHERE option_name = '.$q('ys_ec_ecpay_subsel_'.hash('sha256',$token)).' AND option_value = BINARY '.$q($bytes)." AND CAST(CAST(CONNECTION_ID() AS CHAR) AS BINARY) = CAST('9101' AS BINARY) AND CAST(DATABASE() AS BINARY) = CAST('ecpay_b2_fixture' AS BINARY) AND CAST(CAST(@ys_profile_tx_owner AS CHAR) AS BINARY) = CAST('".str_repeat('a',32)."' AS BINARY)";
+    $nestedDb=Session::forCapture($grant['prefix'],static function(string $sql) use($probeSql,$update,$grant):array {
+        if($sql===$probeSql) { return ['error'=>'','rows'=>[['version'=>'CONTROL ONLY']],'affected'=>0]; }
+        if($sql==="SHOW TABLE STATUS WHERE Name = '".$grant['prefix']."options'") { return ['error'=>'','rows'=>[['Engine'=>'InnoDB']],'affected'=>0]; }
+        if($sql===$update) { return ['error'=>'','rows'=>[],'affected'=>1]; }
+        throw new RuntimeException('undeclared nested observer control SQL');
+    });
+    $oldDb=$GLOBALS['wpdb']??null; $GLOBALS['wpdb']=$nestedDb;
+    try {
+        $check('actual store nested observer control has a finite InnoDB setup',$store::storage_ready($nestedDb));
+        $nestedDb->observe(static fn():array=>$nestedDb->get_results($probeSql,'ARRAY_A'));
+        $action=static function() use($nestedDb,$probeSql):void { $nestedDb->observe(static function() use($nestedDb,$probeSql):array { return $nestedDb->get_results($probeSql,'ARRAY_A'); }); };
+        $nestedDb->instrument(static function(string $kind,string $sql,array $id) use($action,$update):array {
+            if('consume'===$kind && $sql===$update) { $action(); }
+            return ['send'=>true,'action'=>'none','fault'=>null,'presented'=>null];
+        },null);
+        $claimed=$store::claim($token,$bytes,41,4,['transaction_db'=>$nestedDb,'connection_id'=>'9101','database'=>$grant['database'],'owner_nonce'=>str_repeat('a',32)]);
+        $probes=array_values(array_filter($nestedDb->statements(),static fn(array $s):bool=>$s['sql']===$probeSql));
+        $check('ordinary server observer retains read-or-setup kind',2===count($probes) && 'read-or-setup'===$probes[0]['kind']);
+        $check('server observer inside actual claim cannot inherit outer consume kind',2===count($probes) && 'read-or-setup'===$probes[1]['kind'] && 'observer'===$probes[1]['origin']);
+        $trace=$nestedDb->statements();
+        $check('pending actual claim retains consume provenance and original dispatch bytes',$claimed && 4===count($trace) && 'consume'===$trace[2]['kind'] && $update===$trace[2]['sql'] && $trace[2]['sequence']<$trace[3]['sequence']);
+    } finally { $nestedDb->instrument(null,null); $nestedDb->close(); $GLOBALS['wpdb']=$oldDb; }
     $failureEvidence=method_exists(Session::class,'failureEvidence');
     $check('post-dispatch failure retains partial schema trace with unproven execution',$failureEvidence);
     if($failureEvidence) {
@@ -224,6 +316,12 @@ try {
                 public function close():bool { return true; }
             }
             $ddl=$plan['ddl']['statements'][0]; $read=$metadata['queries'][$grant['prefix'].'ys_ec_products:columns'];
+            $unadmitted=Session::fromMysqli(new mysqli($ddl,$read),$grant['prefix']);
+            $unadmittedReplacement=Session::fromMysqli(new mysqli($ddl,$read),$grant['prefix']);
+            $reject(static fn()=>$unadmitted->replaceWith($unadmittedReplacement),'replacement_not_admitted');
+            $check('raw mysqli adapters cannot transfer without canonical execution receipts',
+                0===$unadmitted->physicalReplacements() && []===$unadmitted->closes() && $unadmittedReplacement->ready && 0===$unadmitted->dispatches);
+            $unadmitted->close(); $unadmittedReplacement->close();
             $db=Session::fromMysqli(new mysqli($ddl,$read),$grant['prefix']);
             $db->observe(static function() use($db,$ddl,$read):void { $db->query($ddl); $db->get_results($read,'ARRAY_A'); },'schema-setup');
             $db->close();

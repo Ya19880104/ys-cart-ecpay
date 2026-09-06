@@ -77,7 +77,7 @@ final class SubscriptionSqlController {
 				if(!$verdict['matches']) { throw new SubscriptionSqlFailure('mysql_slice_oracle_failed'); }
 			} finally { unset($token); foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
 		}
-		return ['scope'=>'MYSQLI P1/P3-P6/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
+		return ['scope'=>'MYSQLI P1/P3-P6/P8-P10/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
 	}
 	/** Launches only the CLI's IPC echo lane, which does not load product or create a Session. */
 	public static function runOffline( array $admitted, string $phaseRoot ): array {
@@ -116,7 +116,8 @@ final class SubscriptionSqlController {
 			$stdout = (string) file_get_contents( $child['base'] . '.stdout.txt' ); $stderr = (string) file_get_contents( $child['base'] . '.stderr.txt' );
 			$result = json_decode( $stdout, true );
 			if(true===($child['mysql']??false)) {
-				if(0!==$rc || ''!==$stderr || !SubscriptionSqlEvidence::exactKeys($result,['version','phase','case','role','scope','token_digest','connection_attempts','sql_execution','receipt']) || 1!==$result['version'] || $child['phase']!==$result['phase'] || $child['case']!==$result['case'] || $child['role']!==$result['role'] || $child['token_digest']!==$result['token_digest'] || 1!==$result['connection_attempts'] || 'MYSQLI WORKER'!==$result['scope'] || 'EXECUTED'!==$result['sql_execution'] || !is_array($result['receipt'])) { throw new SubscriptionSqlFailure('worker_result_invalid'); }
+				$attempts='A'===$child['role'] && in_array($child['case'],['P8','P9','P10'],true)?2:1;
+				if(0!==$rc || ''!==$stderr || !SubscriptionSqlEvidence::exactKeys($result,['version','phase','case','role','scope','token_digest','connection_attempts','sql_execution','receipt']) || 1!==$result['version'] || $child['phase']!==$result['phase'] || $child['case']!==$result['case'] || $child['role']!==$result['role'] || $child['token_digest']!==$result['token_digest'] || $attempts!==$result['connection_attempts'] || 'MYSQLI WORKER'!==$result['scope'] || 'EXECUTED'!==$result['sql_execution'] || !is_array($result['receipt'])) { throw new SubscriptionSqlFailure('worker_result_invalid'); }
 				SubscriptionSqlEvidence::read(dirname($child['base']),$result['receipt']);
 				$results[]=['rc'=>$rc,'result'=>$result,'command'=>$child['command'],'stdout'=>['path'=>$child['base'].'.stdout.txt','bytes'=>strlen($stdout),'sha256'=>hash('sha256',$stdout)],'stderr'=>['path'=>$child['base'].'.stderr.txt','bytes'=>0,'sha256'=>hash('sha256','')]];
 				continue;
