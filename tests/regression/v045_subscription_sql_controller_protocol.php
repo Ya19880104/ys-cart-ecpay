@@ -101,6 +101,43 @@ if ( $available ) {
 	$check( 'duplicate phase cannot overwrite controller evidence', 'phase_exists' === $code );
 	$path = $scratch . '/protocol-receipt.json'; file_put_contents( $path, json_encode( $protocol, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
 	echo 'PROTOCOL_RECEIPTS ' . json_encode( [ 'path' => $path, 'sha256' => hash_file( 'sha256', $path ) ], JSON_UNESCAPED_SLASHES ) . "\n";
+	// Native-shaped IPC ONLY: both child receipts are empty and cannot prove SQL execution.
+	foreach([['P12a','normal'],['P12b','normal'],['P12a','missing'],['P12a','scope'],['P12a','duplicate']] as [$case,$failure]) {
+		$phase='release-'.strtolower($case).'-'.$failure;
+		$barrier=\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::createPhase($scratch,$phase);
+		foreach([['setup-complete','A',1,'9101'],['a-seam','A',2,'9101'],['b-seam','B',1,'9102']] as [$stage,$role,$sequence,$cid]) {
+			if('missing'===$failure && 'b-seam'===$stage) { continue; }
+			$payload=['version'=>1,'phase'=>$phase,'case'=>$case,'role'=>$role,'sequence'=>$sequence,'scope'=>'scope'===$failure && 'b-seam'===$stage?'FOREIGN CONTROL':'MYSQLI WORKER','data'=>[]];
+			$ref=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),strtolower($case).'-'.$stage.'-receipt.json',$payload);
+			$barrier->publish($case,$stage,$role,$cid,$ref);
+		}
+		if('duplicate'===$failure) {
+			$proof=$barrier->awaitBound($case,'b-seam',1);
+			$ref=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),strtolower($case).'-release-receipt.json',['version'=>1,'phase'=>$phase,'case'=>$case,'role'=>'controller','sequence'=>1,'scope'=>'MYSQLI INTERFERENCE RELEASE','prior_sha256'=>hash('sha256',json_encode($proof))]);
+			$barrier->publish($case,'release','controller','9102',$ref);
+		}
+		$empty=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),'empty-worker.json',[]);
+		$owned=[]; $caught=''; $result=null;
+		foreach(['A','B'] as $role) {
+			$base=$barrier->path().'/'.$role;
+			$body=['version'=>1,'phase'=>$phase,'case'=>$case,'role'=>$role,'scope'=>'MYSQLI WORKER','token_digest'=>str_repeat('a',64),'connection_attempts'=>1,'sql_execution'=>'EXECUTED','receipt'=>$empty];
+			$code='$until=hrtime(true)+1000000000; while(!is_file($argv[1]) && hrtime(true)<$until) { usleep(1000); } if(!is_file($argv[1])) { exit(3); } echo stream_get_contents(STDIN);';
+			$command=[PHP_BINARY,'-n','-r',$code,$barrier->path().'/'.strtolower($case).'-release.json'];
+			$child=proc_open($command,[0=>['pipe','r'],1=>['file',$base.'.stdout.txt','x'],2=>['file',$base.'.stderr.txt','x']],$pipes);
+			if(!is_resource($child)) { throw new RuntimeException('release IPC process unavailable'); }
+			fwrite($pipes[0],json_encode($body)); fclose($pipes[0]);
+			$owned[]=['process'=>$child,'base'=>$base,'case'=>$case,'role'=>$role,'phase'=>$phase,'token_digest'=>str_repeat('a',64),'command'=>$command,'mysql'=>true];
+		}
+		try { $result=$supervisor->invoke(null,$owned,500,$barrier); }
+		catch(SubscriptionSqlFailure $error) { $caught=$error->getMessage(); }
+		finally { foreach($owned as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
+		$expected=match($failure){'normal'=>'','missing'=>'worker_timeout','scope'=>'controller_release_invalid','duplicate'=>'evidence_exists'};
+		$check($case.' owned release pump '.$failure.' is a bounded zero-DB control',$caught===$expected && 0===Session::connectionAttempts());
+		if('normal'===$failure && ''===$caught) {
+			$release=$barrier->awaitBound($case,'release',1); $prior=$barrier->awaitBound($case,'b-seam',1);
+			$check($case.' release binds exact B proof and never claims a parent connection',2===count($result['workers']) && $release['marker']['connection_id']===$prior['marker']['connection_id'] && $release['receipt']['scope']==='MYSQLI INTERFERENCE RELEASE' && $release['receipt']['prior_sha256']===hash('sha256',json_encode($prior)));
+		}
+	}
 }
 $check( 'bound barriers have exact phase role and receipt custody', method_exists( \YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::class, 'publish' ) );
 if(method_exists(\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::class,'publish')) {

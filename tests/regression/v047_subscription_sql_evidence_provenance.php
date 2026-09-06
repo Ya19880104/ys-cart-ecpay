@@ -89,6 +89,15 @@ if ( $available ) {
 				}
 				if(in_array($case,['P3','P5','P6'],true)) { $changes['suppressed-presentation']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if(!$s['sent']) { $s['presented']['error']='unrelated_failure'; break; } } unset($s); } return $value; }; }
 				if(in_array($case,['P12a','P12b'],true)) {
+					foreach(['prior','scope','extra','identity'] as $break) { $changes['release-'.$break]=static function(string $kind,string $name,mixed $value) use($break):mixed {
+						if('artifact'===$kind && str_ends_with($name,'-release-receipt.json')) {
+							if('prior'===$break) { $value['prior_sha256']=str_repeat('0',64); }
+							if('scope'===$break) { $value['scope']='FOREIGN CONTROL'; }
+							if('extra'===$break) { $value['unrelated']=true; }
+						}
+						if('identity'===$break && 'marker'===$kind && str_ends_with($name,'-release.json')) { $value['connection_id']='9199'; }
+						return $value;
+					}; }
 					foreach(['missing','zero-affected','predicate','readback','receipt-hash'] as $break) { $changes['interference-dispatch-'.$break]=static function(string $kind,string $name,mixed $value) use($break):mixed {
 						if('worker'!==$kind || 'B'!==$name) { return $value; }
 						if('missing'===$break) { $value['statement_receipts']=array_values(array_filter($value['statement_receipts'],static fn(array $s):bool=>'fault-control'!==$s['origin'])); foreach($value['statement_receipts'] as $i=>&$s) { $s['sequence']=$i+1; } unset($s); }

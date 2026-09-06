@@ -67,7 +67,7 @@ final class SubscriptionSqlController {
 					if($written!==strlen($private)) { throw new SubscriptionSqlFailure('worker_input_failed'); }
 					unset($private,$packet);
 				}
-				$supervised=self::supervise($children,30000); $workers=[]; $refs=[];
+				$supervised=self::supervise($children,30000,$phase); $workers=[]; $refs=[];
 				foreach($supervised['workers'] as $child) { $role=$child['result']['role']; $refs[$role]=$child['result']['receipt']; $workers[$role]=SubscriptionSqlEvidence::read($phase->path(),$refs[$role]); }
 				$baseline=['version'=>1,'phase'=>$admitted['phase'],'case'=>$case,'prefix'=>$allocation['prefix'],'source_heads'=>$admitted['source_heads'],'runtime_sha256'=>$admitted['runtime_sha256'],'token_digest'=>hash('sha256',$token),'tables'=>$workers['A']['baseline_receipt']];
 				$baseRef=SubscriptionSqlEvidence::persist($phase->path(),strtolower($case).'-baseline.json',$baseline);
@@ -77,7 +77,7 @@ final class SubscriptionSqlController {
 				if(!$verdict['matches']) { throw new SubscriptionSqlFailure('mysql_slice_oracle_failed'); }
 			} finally { unset($token); foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
 		}
-		return ['scope'=>'MYSQLI P1/P3-P6/P8-P10/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
+		return ['scope'=>'MYSQLI P1/P3-P6/P8-P10/P11/P12 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
 	}
 	/** Launches only the CLI's IPC echo lane, which does not load product or create a Session. */
 	public static function runOffline( array $admitted, string $phaseRoot ): array {
@@ -106,11 +106,22 @@ final class SubscriptionSqlController {
 		} finally { foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
 	}
 	/** Only handles owned proc_open resources; no process-name or foreign-PID termination. */
-	private static function supervise(array $children,int $deadlineMs):array {
+	private static function supervise(array $children,int $deadlineMs,?SubscriptionSqlBarrier $phase=null):array {
 		if($deadlineMs<1 || $deadlineMs>30000) { throw new SubscriptionSqlFailure('worker_deadline_invalid'); }
-		$results = []; $until = hrtime( true ) + $deadlineMs*1000000;
+		$results = []; $until = hrtime( true ) + $deadlineMs*1000000; $released=false;
 		foreach ( $children as $child ) {
-			do { $status = proc_get_status( $child['process'] ); if ( ! $status['running'] ) { break; } usleep( 1000 ); } while ( hrtime( true ) < $until );
+			do {
+				if(null!==$phase && !$released && true===($child['mysql']??false) && in_array($child['case'],['P12a','P12b'],true) && is_file($phase->path().'/'.strtolower($child['case']).'-b-seam.json')) {
+					if(realpath(dirname($child['base']))!==realpath($phase->path()) || $child['phase']!==basename($phase->path())) { throw new SubscriptionSqlFailure('controller_release_invalid'); }
+					$setup=$phase->awaitBound($child['case'],'setup-complete',1); $a=$phase->awaitBound($child['case'],'a-seam',1); $b=$phase->awaitBound($child['case'],'b-seam',1);
+					if('MYSQLI WORKER'!==($setup['receipt']['scope']??null) || 'MYSQLI WORKER'!==($a['receipt']['scope']??null) || 'MYSQLI WORKER'!==($b['receipt']['scope']??null)
+						|| $setup['marker']['connection_id']!==$a['marker']['connection_id'] || $a['marker']['connection_id']===$b['marker']['connection_id']) { throw new SubscriptionSqlFailure('controller_release_invalid'); }
+					$ref=SubscriptionSqlEvidence::persist($phase->path(),strtolower($child['case']).'-release-receipt.json',['version'=>1,'phase'=>$child['phase'],'case'=>$child['case'],'role'=>'controller','sequence'=>1,'scope'=>'MYSQLI INTERFERENCE RELEASE','prior_sha256'=>hash('sha256',json_encode($b))]);
+					// This control marker references B's identity; the parent owns no connection.
+					$phase->publish($child['case'],'release','controller',$b['marker']['connection_id'],$ref); $released=true;
+				}
+				$status = proc_get_status( $child['process'] ); if ( ! $status['running'] ) { break; } usleep( 1000 );
+			} while ( hrtime( true ) < $until );
 			if ( $status['running'] ) { foreach ( $children as $owned ) { if ( is_resource( $owned['process'] ) ) { proc_terminate( $owned['process'] ); proc_close( $owned['process'] ); } } throw new SubscriptionSqlFailure( 'worker_timeout' ); }
 			$closed = proc_close( $child['process'] ); $rc = $status['exitcode'] >= 0 ? $status['exitcode'] : $closed;
 			$stdout = (string) file_get_contents( $child['base'] . '.stdout.txt' ); $stderr = (string) file_get_contents( $child['base'] . '.stderr.txt' );

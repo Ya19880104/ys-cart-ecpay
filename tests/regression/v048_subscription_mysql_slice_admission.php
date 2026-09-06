@@ -32,13 +32,13 @@ try {
             $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case]));
             $check($case.' admits exact source runtime and allocated tuple without a secret or connection',$admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P3','P4','P5','P6','P8','P9','P10'] as $case) {
+        foreach(['P3','P4','P5','P6','P8','P9','P10','P12a','P12b'] as $case) {
             $admitted=null; $code='';
             try { $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case])); }
             catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
             $check($case.' slice allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P2','P7','P12a','P12b','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
+        foreach(['P2','P7','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['kind'=>'offline-design']),$context),'sql_execution_allocation_required');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$context),'allocation_invalid');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['host'=>'localhost']),$context),'allocation_invalid');

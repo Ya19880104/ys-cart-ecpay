@@ -5,13 +5,13 @@ namespace YSCartEcpay\Tests\Live;
 require_once __DIR__ . '/SubscriptionSqlScenario.php';
 final class SubscriptionSqlEvidence {
 	public static function assertMysqlCase(string $case):void {
-		if(!in_array($case,['P1','P3','P4','P5','P6','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
+		if(!in_array($case,['P1','P3','P4','P5','P6','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
 	}
 	public static function evaluateMysql(string $case,array $baseline,array $workers,array $artifacts):array {
 		$errors=[];
 		try { self::assertMysqlCase($case); self::collect($case,$baseline,$workers,$artifacts,true); }
 		catch(SubscriptionSqlFailure $e) { $errors[]=$e->getMessage(); }
-		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P6/P8-P10/P11 SLICE'];
+		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P6/P8-P10/P11/P12 SLICE'];
 	}
 	public static function cases(): array {
 		$names = [ 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b' ];
@@ -121,7 +121,7 @@ final class SubscriptionSqlEvidence {
 			self::dispatchProof($case,$role,$base,$workers,$artifacts['root'],$mysql);
 			self::counts($case,$role,$w['statement_receipts']);
 			self::statementAuthority($w['statement_receipts'],$base['prefix'],$before,$mysql);
-			self::barriers($case,$role,$w['barrier_receipts'],$artifacts['root']);
+			self::barriers($case,$role,$w['barrier_receipts'],$artifacts['root'],$mysql);
 		}
 		$afterTables=$workers['B']['readback_receipt']; self::need(is_array($afterTables),'readback_missing');
 		// P6's poisoned A cannot query again. Its null readback/close proof was checked above;
@@ -206,7 +206,7 @@ final class SubscriptionSqlEvidence {
 			foreach($s['plan']['captured_ddl']['statements'] as $ddl) { $contract=SubscriptionSqlSchema::ddlContract($ddl); foreach($snapshot[$contract['table']]??[] as $row) { self::need(is_array($row) && array_keys($row)===array_keys($contract['columns']),'mysql_snapshot_invalid'); foreach($row as $value) { self::need(null===$value || is_string($value),'mysql_snapshot_invalid'); } } }
 		}
 	}
-	private static function barriers(string $case,string $role,mixed $refs,string $root):void {
+	private static function barriers(string $case,string $role,mixed $refs,string $root,bool $mysql=false):void {
 		self::need(is_array($refs) && array_is_list($refs),'barrier_manifest_invalid');
 		$expected='A'===$role?['setup-complete','a-complete']:['b-complete'];
 		if(in_array($case,['P2','P12a','P12b'],true)) { $expected[]='A'===$role?'a-seam':'b-seam'; }
@@ -218,7 +218,16 @@ final class SubscriptionSqlEvidence {
 			self::need($barrier->awaitBound($case,$m['stage'],1)['marker']===$m,'barrier_manifest_invalid'); $stages[]=$m['stage'];
 		}
 		sort($stages); sort($expected); self::need($stages===$expected,'barrier_manifest_invalid');
-		if(in_array($case,['P2','P12a','P12b'],true)) { $barrier->awaitBound($case,'release',1); }
+		if(in_array($case,['P2','P12a','P12b'],true)) {
+			$release=$barrier->awaitBound($case,'release',1);
+			if('P2'!==$case) {
+				$prior=$barrier->awaitBound($case,'b-seam',1); $payload=$release['receipt'];
+				self::need(self::exactKeys($payload,['version','phase','case','role','sequence','scope','prior_sha256'])
+					&& $payload['scope']===($mysql?'MYSQLI INTERFERENCE RELEASE':'IPC CAPTURE CONTROL ONLY')
+					&& $payload['prior_sha256']===hash('sha256',json_encode($prior))
+					&& $release['marker']['connection_id']===($mysql?$prior['marker']['connection_id']:'1'),'release_proof_invalid');
+			}
+		}
 	}
 	private static function statementAuthority(array $rows,string $prefix,array $before,bool $mysql=false):void {
 		$q=static fn(string $v):string=>self::quote($v,$mysql);

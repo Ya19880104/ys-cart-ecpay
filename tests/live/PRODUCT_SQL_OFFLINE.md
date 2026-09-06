@@ -2,7 +2,7 @@
 
 The offline modes validate an allocation and exact product sources, or capture
 product-generated DDL, without connecting. B2 adds a separately admitted real
-mysqli execution path for **P1, P3–P6, P8–P10 and P11a–h only**. Its implementation and offline
+mysqli execution path for **P1, P3–P6, P8–P10, P11a–h and P12a–b only**. Its implementation and offline
 regressions do not prove SQL acceptance: each case still requires a reviewed clean
 source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
@@ -46,7 +46,7 @@ Use the same CLI with `--driver=adapter --mode=execute --phase=<unique-phase>
 --evidence-root=<existing-local-directory>`. `YS_ECPAY_SQL_RUN` points to the
 nonsecret B1 run envelope: exact keys `version,phase,cases,allocations,source_heads,
 runtime_sha256,driver`, version 1, driver `adapter`. Cases are an ordered unique
-subset of `P1,P3,P4,P5,P6,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h`; every case has a distinct
+subset of `P1,P3,P4,P5,P6,P8,P9,P10,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h,P12a,P12b`; every case has a distinct
 prefix and its own seven-key `sql-execution` allocation. Every other SQL case is
 rejected before a phase or worker is created.
 
@@ -58,8 +58,8 @@ packet dumps, or retained secret configuration exist. The worker rechecks alloca
 expiry, case, exact tuple, runtime and clean source immediately before connecting.
 Caller connector callbacks and supplied/capture handles cannot acquire admission.
 
-The parent creates no database connection. Each A/B worker owns one physical mysqli
-session; B remains in autocommit and reads after A's completion. A first verifies
+The parent creates no database connection. Each worker initially owns one physical mysqli
+session; only P8–P10 A replaces its connection once. B remains in autocommit and reads after A's completion. A first verifies
 the MySQL 8.4 server/session and absence of all six literal names in the assigned
 existing disposable database, then executes the actual five TableMaker CREATEs and
 the options fixture. Both workers verify all captured columns and indexes plus
@@ -228,16 +228,32 @@ parent/child stderr. These are source-only offline tests, not SQL acceptance.
 P1/P11a–h have retained MySQL 8.4.11 acceptance at ECPay `ff255d6069f9904446079695e92c9654c126511a`,
 paired with the fixed Core/Affiliate anchors. P3–P6 have separate retained MySQL 8.4.11
 acceptance at ECPay `bd4f7189ac83032049b35a7dfb1fd6cfcf5a303c` with those same anchors.
-P8–P10 engineering and offline controls still require their own clean-source real SQL
-receipts. Their scope literal is `MYSQLI P1/P3-P6/P8-P10/P11 SLICE`; only the returned
+P8–P10 have separate retained MySQL 8.4.11 acceptance at ECPay
+`2338306ccd5ca6e9c4d698f5dfe16f6bd9ffbaef` with those same anchors.
+The current scope literal is `MYSQLI P1/P3-P6/P8-P10/P11/P12 SLICE`; only the returned
 case list identifies the cases actually executed. Each P8–P10 A uses one fresh canonical
 second connection at its named consume/preverify/COMMIT seam. The same wrapper retains
 both connector admissions, one checked old close, the original schema CID and a fixed
 new-server read. Old A, new A and observer B must have three distinct physical IDs;
 A has two connector attempts and B one. The pending product SQL stays byte-identical,
 including its old fence; every dispatched result must equal its presentation. No replacement
-transaction/owner initialization or generic replay is added. P2/P7/P12a–b and genuine
-native WordPress reconnect remain NOT RUN.
+transaction/owner initialization or generic replay is added.
+
+P12a–b now admit the existing two-worker schedules and a finite controller release.
+While the owned children run, the parent verifies setup/A/B seam scope and distinct
+A/B identities, then publishes one create-exclusive release bound to the complete
+B seam proof. Its `MYSQLI INTERFERENCE RELEASE` marker references B's ID, never a
+parent connection. The independent evaluator requires exact release keys/scope,
+prior digest and referenced identity; legacy capture controls keep their explicit
+`IPC CAPTURE CONTROL ONLY` scope. Missing, foreign or duplicate evidence fails.
+B's controlled update stays in autocommit with exact old-byte predicate, affected1
+and immediate readback. P12a retains claim-time principal rejection after profile
+CAS; P12b tests the actual Store BINARY CAS against retained old bytes. Neither
+commits A: the original profile and only B's declared selection delta survive rollback.
+Both retain full six-table equality, exact SQL sent/results/counts and empty logs.
+P12a–b still require their own reviewed clean-source real SQL receipts; IPC/capture
+controls and release markers do not prove SQL execution. P2/P7 and genuine native
+WordPress reconnect remain NOT RUN.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.
