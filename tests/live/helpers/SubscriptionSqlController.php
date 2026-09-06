@@ -77,7 +77,7 @@ final class SubscriptionSqlController {
 				if(!$verdict['matches']) { throw new SubscriptionSqlFailure('mysql_slice_oracle_failed'); }
 			} finally { unset($token); foreach($children as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
 		}
-		return ['scope'=>'MYSQLI P1/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
+		return ['scope'=>'MYSQLI P1/P3-P6/P11 SLICE','sql_execution'=>'EXECUTED','parent_connection_attempts'=>SubscriptionSqlSession::connectionAttempts(),'cases'=>$cases,'unrun_cases'=>array_values(array_diff(array_keys(SubscriptionSqlEvidence::cases()),array_keys($cases))),'native_wpdb'=>'PREREQUISITE UNSATISFIED'];
 	}
 	/** Launches only the CLI's IPC echo lane, which does not load product or create a Session. */
 	public static function runOffline( array $admitted, string $phaseRoot ): array {

@@ -2,7 +2,7 @@
 
 The offline modes validate an allocation and exact product sources, or capture
 product-generated DDL, without connecting. B2 adds a separately admitted real
-mysqli execution path for **P1 and P11a–h only**. Its implementation and offline
+mysqli execution path for **P1, P3–P6 and P11a–h only**. Its implementation and offline
 regressions do not prove SQL acceptance: each case still requires a reviewed clean
 source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
@@ -46,7 +46,7 @@ Use the same CLI with `--driver=adapter --mode=execute --phase=<unique-phase>
 --evidence-root=<existing-local-directory>`. `YS_ECPAY_SQL_RUN` points to the
 nonsecret B1 run envelope: exact keys `version,phase,cases,allocations,source_heads,
 runtime_sha256,driver`, version 1, driver `adapter`. Cases are an ordered unique
-subset of `P1,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h`; every case has a distinct
+subset of `P1,P3,P4,P5,P6,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h`; every case has a distinct
 prefix and its own seven-key `sql-execution` allocation. Every other SQL case is
 rejected before a phase or worker is created.
 
@@ -70,11 +70,22 @@ and failed runs retain their artifacts and tables; a later run needs fresh prefi
 Real raw statement results are retained, including MySQL defaults, `option_id`,
 COUNT column names and SELECT row counts. `evaluateMysql` independently validates
 native schema/session traces, distinct A/B connection IDs, finite dispatches,
-actual/presented equality and B's complete six-table readback. P1 requires the
+precise sent/actual/presented contracts and B's complete six-table readback. P1 requires the
 committed profile/selection pair plus actual renewal projection; P11 requires the
 original finite rejection and unchanged full rows. Re-labeling capture evidence
 cannot satisfy this evaluator. JSON reports only the cases actually accepted,
 lists unrun cases, and keeps WordPress native/reconnect/contention gates unproven.
+
+P3 suppresses only its first post-consume pre-COMMIT session verification, then
+requires actual rollback and the original pair. P4 sends COMMIT successfully and
+presents a controlled acknowledgement failure: B must prove the committed pair,
+including after the protective rollback. This is not packet-loss evidence. P5
+suppresses COMMIT transport, then requires actual rollback and the original pair.
+P6 suppresses the pre-COMMIT verification and rollback, and requires the product
+to poison and close A exactly once before any further A SQL. Only P6/A has a null
+final readback; B must remain open and prove the complete original six-table state.
+Every fault is bound to its case, role, statement kind and one-shot dispatch slot;
+unexpected faults, actual/presented differences, logs or stderr fail the case.
 
 ## Product custody and permitted fixture boundaries
 
@@ -214,8 +225,10 @@ independent rehashed adversarial evidence controls. Source mutations use retaine
 named helper copies and require green controls, rc1 ordinary failures, and empty
 parent/child stderr. These are source-only offline tests, not SQL acceptance.
 
-Still NOT RUN: every true MySQL seed/commit/rollback/locking/reconnect scenario,
-actual server/schema/engine acceptance and genuine native WordPress reconnect.
+P1/P11a–h have retained MySQL 8.4.11 acceptance at ECPay `ff255d6069f9904446079695e92c9654c126511a`,
+paired with the fixed Core/Affiliate anchors. P3–P6 engineering and offline controls
+still require their own clean-source real SQL receipts. P2/P7/P8–P10/P12a–b and
+genuine native WordPress reconnect remain NOT RUN.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.

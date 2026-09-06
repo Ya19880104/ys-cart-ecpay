@@ -5,13 +5,13 @@ namespace YSCartEcpay\Tests\Live;
 require_once __DIR__ . '/SubscriptionSqlScenario.php';
 final class SubscriptionSqlEvidence {
 	public static function assertMysqlCase(string $case):void {
-		if(!in_array($case,['P1','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
+		if(!in_array($case,['P1','P3','P4','P5','P6','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
 	}
 	public static function evaluateMysql(string $case,array $baseline,array $workers,array $artifacts):array {
 		$errors=[];
 		try { self::assertMysqlCase($case); self::collect($case,$baseline,$workers,$artifacts,true); }
 		catch(SubscriptionSqlFailure $e) { $errors[]=$e->getMessage(); }
-		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P11 SLICE'];
+		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P6/P11 SLICE'];
 	}
 	public static function cases(): array {
 		$names = [ 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b' ];
@@ -105,13 +105,13 @@ final class SubscriptionSqlEvidence {
 			$id=$session['identity'];
 			self::need(is_string($id['connection_id']) && 1===preg_match('/\A[1-9][0-9]{0,19}\z/',$id['connection_id']) && is_string($id['database']) && 1===preg_match('/\A[A-Za-z0-9_]{1,64}\z/',$id['database']) && (null===$id['owner_nonce'] || (is_string($id['owner_nonce']) && 1===preg_match('/\A[a-f0-9]{32}\z/',$id['owner_nonce']))), 'session_receipt_invalid');
 			self::need('' === self::raw($artifacts['root'],$w['diagnostics']['stderr']) && self::logMatches(self::raw($artifacts['root'],$w['diagnostics']['log']),self::events($case,$role)), 'unexpected_diagnostics');
-			self::statements($case,$role,$w['statement_receipts']);
+			self::statements($case,$role,$w['statement_receipts'],$mysql);
 			if($mysql) { self::mysqlProof($case,$role,$base,$w); }
 			if(in_array($case,['P12a','P12b'],true)) {
 				$i=$w['fault_receipt']['interference']??null;
 				self::need(self::exactKeys($i,['case','option_name','before_bytes','after_bytes','sql_sha256']) && $i['case']===$case && is_string($i['option_name']) && is_string($i['before_bytes']) && is_string($i['after_bytes']) && is_string($i['sql_sha256']) && 1===preg_match('/\A[a-f0-9]{64}\z/',$i['sql_sha256']), 'interference_invalid');
 			}
-			self::faultProof($case,$role,$w);
+			self::faultProof($case,$role,$w,$mysql);
 		}
 		if($mysql) { self::need($workers['A']['session_receipts']['identity']['connection_id']!==$workers['B']['session_receipts']['identity']['connection_id'] && $workers['A']['session_receipts']['identity']['database']===$workers['B']['session_receipts']['identity']['database'] && $workers['A']['mysql_receipt']['connector']['allocation']===$workers['B']['mysql_receipt']['connector']['allocation'],'mysql_physical_pair_invalid'); }
 		// Admit both workers before dispatch consumes any peer identity or interference bytes.
@@ -123,7 +123,9 @@ final class SubscriptionSqlEvidence {
 			self::barriers($case,$role,$w['barrier_receipts'],$artifacts['root']);
 		}
 		$afterTables=$workers['B']['readback_receipt']; self::need(is_array($afterTables),'readback_missing');
-		if($mysql) { self::need($workers['A']['readback_receipt']===$afterTables,'mysql_readback_disagreement'); }
+		// P6's poisoned A cannot query again. Its null readback/close proof was checked above;
+		// B still supplies the complete schema-validated rows and unchanged-pair proof below.
+		if($mysql && 'P6'!==$case) { self::need($workers['A']['readback_receipt']===$afterTables,'mysql_readback_disagreement'); }
 		$after=self::pair($afterTables,$base['prefix'],$base['token_digest']);
 		$expectedTables=$base['tables'];
 		if(in_array($case,['P1','P2','P4'],true)) {
@@ -177,14 +179,15 @@ final class SubscriptionSqlEvidence {
 		$quoting=SubscriptionSqlSession::forCapture($base['prefix'],static function():never { throw new SubscriptionSqlFailure('unexpected_capture_dispatch'); });
 		self::need($s['plan']===SubscriptionSqlSchema::metadataPlan($quoting,$allocation['database']),'mysql_schema_invalid');
 		$server=SubscriptionSqlSchema::validateMetadata($s['plan'],$s['reads']);
-		self::need($server===$s['server'] && $server['connection_id']===$w['session_receipts']['identity']['connection_id'] && $server['database_name']===$w['session_receipts']['identity']['database'] && 0===$w['session_receipts']['replacements'] && []===$w['session_receipts']['closes'] && true===$w['session_receipts']['ready'],'mysql_server_invalid');
+		self::need($server===$s['server'] && $server['connection_id']===$w['session_receipts']['identity']['connection_id'] && $server['database_name']===$w['session_receipts']['identity']['database'] && 0===$w['session_receipts']['replacements'],'mysql_server_invalid');
 		if('A'===$role) {
 			self::need(self::exactKeys($s['before'],['session','table-engines']),'mysql_schema_invalid');
 			foreach($s['before'] as $key=>$read) { self::need(self::exactKeys($read,['sql','sql_sha256','rows']) && $read['sql']===$s['plan']['queries'][$key] && $read['sql_sha256']===hash('sha256',$read['sql']) && is_array($read['rows']),'mysql_schema_invalid'); }
 			self::need(SubscriptionSqlSchema::validateServer($s['before']['session']['rows'],$allocation['database'])===$server && []===$s['before']['table-engines']['rows'],'schema_collision');
 		} else { self::need([]===$s['before'],'mysql_schema_invalid'); }
-		foreach($w['statement_receipts'] as $statement) { self::need(true===$statement['sent'] && null===$statement['fault'] && $statement['actual']===$statement['presented'],'mysql_statement_invalid'); }
-		foreach([$w['baseline_receipt'],$w['readback_receipt']] as $snapshot) {
+		$snapshots=[$w['baseline_receipt']];
+		if('P6'!==$case || 'A'!==$role) { $snapshots[]=$w['readback_receipt']; }
+		foreach($snapshots as $snapshot) {
 			self::need(is_array($snapshot),'readback_missing');
 			foreach($s['plan']['captured_ddl']['statements'] as $ddl) { $contract=SubscriptionSqlSchema::ddlContract($ddl); foreach($snapshot[$contract['table']]??[] as $row) { self::need(is_array($row) && array_keys($row)===array_keys($contract['columns']),'mysql_snapshot_invalid'); foreach($row as $value) { self::need(null===$value || is_string($value),'mysql_snapshot_invalid'); } } }
 		}
@@ -241,7 +244,7 @@ final class SubscriptionSqlEvidence {
 		}
 		return ''===$r['error'] ? is_int($r['affected']) && $r['affected']>=0 : false===$r['affected'] && []===$r['rows'];
 	}
-	private static function statements(string $case,string $role,array $rows):void {
+	private static function statements(string $case,string $role,array $rows,bool $mysql=false):void {
 		foreach($rows as $i=>$s) {
 			self::need(self::exactKeys($s,['sequence','origin','kind','sql','sql_sha256','before_identity','after_identity','sent','actual','presented','fault']) && $s['sequence']===$i+1 && is_string($s['sql']) && hash('sha256',$s['sql'])===$s['sql_sha256'] && is_bool($s['sent']) && is_string($s['kind']) && in_array($s['origin'],['product','schema-setup','observer','fault-control'],true) && (null===$s['fault'] || is_string($s['fault'])) && self::result($s['presented']), 'statement_receipt_invalid');
 			self::need($s['sent'] ? self::result($s['actual']) && ''===$s['actual']['error'] : null===$s['actual'],'statement_result_invalid');
@@ -255,6 +258,15 @@ final class SubscriptionSqlEvidence {
 			self::need($s['sent']===(null===$suppressed),'statement_result_invalid');
 			$presented=null!==$suppressed ? ['error'=>$suppressed,'rows'=>[],'affected'=>false] : ($ack ? ['error'=>'fixture_ack_lost','rows'=>[],'affected'=>false] : $s['actual']);
 			self::need($s['presented']===$presented,'statement_presentation_invalid');
+			if($mysql) {
+				$expectedFault=match($suppressed) {
+					'fixture_precommit_unreadable'=>'precommit-unreadable',
+					'fixture_commit_suppressed'=>'commit-suppressed',
+					'fixture_rollback_suppressed'=>'rollback-suppressed',
+					default=>null,
+				};
+				self::need($s['fault']===$expectedFault,'mysql_statement_invalid');
+			}
 			foreach(['before_identity','after_identity'] as $key) {
 				$id=$s[$key]; self::need(self::exactKeys($id,['connection_id','database','owner_nonce']),'statement_identity_invalid');
 				if(['connection_id'=>null,'database'=>null,'owner_nonce'=>null]===$id) { continue; }
@@ -421,13 +433,22 @@ final class SubscriptionSqlEvidence {
 		if('B'===$role) { $expected=[[0,0,0],[0,0,0],[0,0,0],'P2'===$case?[1,1,0]:[0,0,0]]; }
 		self::need(array_values($count)===$expected,'statement_counts_invalid');
 	}
-	private static function faultProof(string $case,string $role,array $w):void {
+	private static function faultProof(string $case,string $role,array $w,bool $mysql=false):void {
 		self::need(self::exactKeys($w['fault_receipt'],['case','role','trigger_count','triggered','actual_commit','interference']) && $w['fault_receipt']['case']===$case && $w['fault_receipt']['role']===$role,'fault_proof_invalid');
 		$expected='B'===$role ? [] : match($case) { 'P2'=>['pause-before-commit'],'P3'=>['precommit-unreadable'],'P4'=>['ack-lost'],'P5'=>['commit-suppressed'],'P6'=>['precommit-unreadable','rollback-suppressed'],'P7'=>['swap-global'],'P8'=>['replace-before-consume'],'P9'=>['replace-before-verify'],'P10'=>['replace-before-commit'],'P12a'=>['pause-before-claim'],default=>[] };
 		self::need(($w['fault_receipt']['triggered']??null)===$expected && ($w['fault_receipt']['trigger_count']??null)===count($expected),'fault_proof_invalid');
+		if($mysql) {
+			$closedA='P6'===$case && 'A'===$role;
+			if(!$closedA) { self::need([]===$w['session_receipts']['closes'] && true===$w['session_receipts']['ready'],'mysql_server_invalid'); }
+			self::need($closedA ? null===$w['readback_receipt'] : is_array($w['readback_receipt']),'mysql_readback_invalid');
+		}
 		if('A'!==$role) { return; }
 		if('P4'===$case) { $commits=array_values(array_filter($w['statement_receipts'],static fn(array $s):bool=>'product'===$s['origin'] && 'commit'===$s['kind'])); self::need(1===count($commits) && $commits[0]['actual']===($w['fault_receipt']['actual_commit']??null) && false===($commits[0]['presented']['affected']??null),'commit_actual_proof_invalid'); }
-		if('P6'===$case) { $c=$w['session_receipts']['closes']??null; self::need(is_array($c) && 1===count($c) && true===($c[0]['poisoned']??null) && false===($w['session_receipts']['ready']??null) && count($w['statement_receipts'])===($c[0]['sequence']??null),'poison_proof_invalid'); }
+		if('P6'===$case) {
+			$c=$w['session_receipts']['closes']??null;
+			self::need(is_array($c) && 1===count($c) && true===($c[0]['poisoned']??null) && false===($w['session_receipts']['ready']??null) && count($w['statement_receipts'])===($c[0]['sequence']??null),'poison_proof_invalid');
+			if($mysql) { self::need(self::exactKeys($c[0],['sequence','reason','identity','poisoned']) && 'close'===$c[0]['reason'] && $c[0]['identity']===$w['session_receipts']['identity'],'poison_proof_invalid'); }
+		}
 		if(in_array($case,['P8','P9','P10'],true)) {
 			self::need(1===($w['session_receipts']['replacements']??null) && array_key_exists('owner_nonce',$w['session_receipts']['identity']) && null===$w['session_receipts']['identity']['owner_nonce'],'replacement_proof_invalid');
 			$c=$w['session_receipts']['closes']??[]; self::need(1===count($c) && ($c[0]['identity']['connection_id']??null)!==($w['session_receipts']['identity']['connection_id']??null),'replacement_proof_invalid');

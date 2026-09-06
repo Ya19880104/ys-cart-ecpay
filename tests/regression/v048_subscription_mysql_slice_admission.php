@@ -32,7 +32,13 @@ try {
             $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case]));
             $check($case.' admits exact source runtime and allocated tuple without a secret or connection',$admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P2','P7','P12a','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
+        foreach(['P3','P4','P5','P6'] as $case) {
+            $admitted=null; $code='';
+            try { $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case])); }
+            catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
+            $check($case.' terminal allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
+        }
+        foreach(['P2','P7','P8','P9','P10','P12a','P12b','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['kind'=>'offline-design']),$context),'sql_execution_allocation_required');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$context),'allocation_invalid');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['host'=>'localhost']),$context),'allocation_invalid');
@@ -127,6 +133,77 @@ try {
                 && array_key_exists('sql_statements',$parent) && null===$parent['sql_statements']);
         }
     }
+    // Hand-derived terminal receipt fragments exercise only the existing oracle methods.
+    // They contain no connector/schema proof and can never award SQL acceptance.
+    $statements=new ReflectionMethod(Evidence::class,'statements');
+    $faultProof=new ReflectionMethod(Evidence::class,'faultProof');
+    $id=['connection_id'=>'9101','database'=>$grant['database'],'owner_nonce'=>str_repeat('a',32)];
+    $ok=['error'=>'','rows'=>[],'affected'=>0];
+    $statement=static function(string $kind,string $sql,?string $fault,?array $actual,array $presented,int $sequence=1) use($id):array {
+        return ['sequence'=>$sequence,'origin'=>'product','kind'=>$kind,'sql'=>$sql,'sql_sha256'=>hash('sha256',$sql),
+            'before_identity'=>$id,'after_identity'=>$id,'sent'=>null!==$actual,'actual'=>$actual,'presented'=>$presented,'fault'=>$fault];
+    };
+    $preverify=$statement('session-verify',Session::SESSION_SQL,'precommit-unreadable',null,['error'=>'fixture_precommit_unreadable','rows'=>[],'affected'=>false]);
+    $fragments=[
+        'P3'=>[$preverify],
+        'P4'=>[$statement('commit','COMMIT',null,$ok,['error'=>'fixture_ack_lost','rows'=>[],'affected'=>false])],
+        'P5'=>[$statement('commit','COMMIT','commit-suppressed',null,['error'=>'fixture_commit_suppressed','rows'=>[],'affected'=>false])],
+        'P6'=>[$preverify,$statement('rollback','ROLLBACK','rollback-suppressed',null,['error'=>'fixture_rollback_suppressed','rows'=>[],'affected'=>false],2)],
+    ];
+    $oracleCheck=static function(string $label,callable $call,?string $expected=null) use($check):void {
+        $code=null; try { $call(); } catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
+        $check($label,$code===$expected && 0===Session::connectionAttempts());
+    };
+    foreach($fragments as $case=>$trace) {
+        $oracleCheck($case.' exact terminal actual/presented contract',static fn()=>$statements->invoke(null,$case,'A',$trace,true));
+        $oracleCheck($case.' terminal fault cannot move to B',static fn()=>$statements->invoke(null,$case,'B',$trace,true),
+            'P4'===$case?'statement_presentation_invalid':'statement_result_invalid');
+        $oracleCheck($case.' terminal fault cannot move to P1',static fn()=>$statements->invoke(null,'P1','A',$trace,true),
+            'P4'===$case?'statement_presentation_invalid':'statement_result_invalid');
+        $bad=$trace; $bad[0]['presented']['error']='unrelated_control_error';
+        $oracleCheck($case.' unrelated presented error rejected',static fn()=>$statements->invoke(null,$case,'A',$bad,true),'statement_presentation_invalid');
+        $bad=$trace; $bad[0]['kind']='read-or-setup';
+        $oracleCheck($case.' terminal fault cannot move to another statement kind',static fn()=>$statements->invoke(null,$case,'A',$bad,true),
+            'P4'===$case?'statement_presentation_invalid':'statement_result_invalid');
+        $bad=$trace; $bad[0]['origin']='observer';
+        $oracleCheck($case.' terminal fault cannot move to an observer',static fn()=>$statements->invoke(null,$case,'A',$bad,true),
+            'P4'===$case?'statement_presentation_invalid':'statement_result_invalid');
+        if('P4'!==$case) {
+            $bad=$trace; $bad[0]['actual']=$ok;
+            $oracleCheck($case.' unsent fault cannot claim an actual result',static fn()=>$statements->invoke(null,$case,'A',$bad,true),'statement_result_invalid');
+        } else {
+            $bad=$trace; $bad[0]['sent']=false; $bad[0]['actual']=null;
+            $oracleCheck('P4 ack loss requires a genuinely sent COMMIT',static fn()=>$statements->invoke(null,$case,'A',$bad,true),'statement_result_invalid');
+        }
+    }
+    $ordinary=[$statement('commit','COMMIT','unrelated-fault',$ok,$ok)];
+    $oracleCheck('mysqli does not accept an arbitrary fault on ordinary SQL',static fn()=>$statements->invoke(null,'P1','A',$ordinary,true),'mysql_statement_invalid');
+    $p6=['fault_receipt'=>['case'=>'P6','role'=>'A','trigger_count'=>2,'triggered'=>['precommit-unreadable','rollback-suppressed'],'actual_commit'=>null,'interference'=>null],
+        'session_receipts'=>['identity'=>$id,'replacements'=>0,'closes'=>[['sequence'=>2,'reason'=>'close','identity'=>$id,'poisoned'=>true]],'ready'=>false],
+        'statement_receipts'=>$fragments['P6'],'readback_receipt'=>null];
+    $oracleCheck('P6 A admits exact poison close with no local readback',static fn()=>$faultProof->invoke(null,'P6','A',$p6,true));
+    $bad=$p6; $bad['readback_receipt']=[];
+    $oracleCheck('P6 A cannot supply a post-close readback',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'mysql_readback_invalid');
+    $bad=$p6; $bad['session_receipts']['closes'][0]['identity']['connection_id']='9102';
+    $oracleCheck('P6 close must belong to the original physical session',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'poison_proof_invalid');
+    $bad=$p6; $bad['session_receipts']['closes'][0]['reason']='controlled-replacement';
+    $oracleCheck('P6 close cannot be relabeled as a replacement',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'poison_proof_invalid');
+    $bad=$p6; $bad['session_receipts']['closes'][0]['poisoned']=false;
+    $oracleCheck('P6 requires poison before close',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'poison_proof_invalid');
+    $bad=$p6; $bad['statement_receipts'][]=$statement('session-verify',Session::SESSION_SQL,null,$ok,$ok,3);
+    $oracleCheck('P6 rejects every SQL sequence after close',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'poison_proof_invalid');
+    $bad=$p6; $bad['fault_receipt']['triggered'][]='rollback-suppressed'; ++$bad['fault_receipt']['trigger_count'];
+    $oracleCheck('P6 rejects duplicate fault triggers',static fn()=>$faultProof->invoke(null,'P6','A',$bad,true),'fault_proof_invalid');
+    $observer=['fault_receipt'=>['case'=>'P6','role'=>'B','trigger_count'=>0,'triggered'=>[],'actual_commit'=>null,'interference'=>null],
+        'session_receipts'=>['identity'=>array_replace($id,['connection_id'=>'9102']),'replacements'=>0,'closes'=>[],'ready'=>true],
+        'statement_receipts'=>[],'readback_receipt'=>[]];
+    $oracleCheck('P6 B retains ordinary open observer contract',static fn()=>$faultProof->invoke(null,'P6','B',$observer,true));
+    $bad=$observer; $bad['readback_receipt']=null;
+    $oracleCheck('P6 B cannot omit the final readback',static fn()=>$faultProof->invoke(null,'P6','B',$bad,true),'mysql_readback_invalid');
+    $bad=$observer; $bad['session_receipts']['ready']=false;
+    $oracleCheck('P6 closed-session exception cannot move to B',static fn()=>$faultProof->invoke(null,'P6','B',$bad,true),'mysql_server_invalid');
+    $bad=$p6; $bad['fault_receipt']=['case'=>'P3','role'=>'A','trigger_count'=>1,'triggered'=>['precommit-unreadable'],'actual_commit'=>null,'interference'=>null];
+    $oracleCheck('P6 closed-session exception cannot move to P3',static fn()=>$faultProof->invoke(null,'P3','A',$bad,true),'mysql_server_invalid');
     $failureEvidence=method_exists(Session::class,'failureEvidence');
     $check('post-dispatch failure retains partial schema trace with unproven execution',$failureEvidence);
     if($failureEvidence) {
