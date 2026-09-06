@@ -16,7 +16,14 @@ $check = static function ( string $name, bool $ok ) use ( &$pass, &$fail ): void
 $helperReceipt = Fixture::helperReceipt( $helpers );
 $sources = Fixture::inspectSources( [ 'core' => (string) getenv( 'YS_CORE_ROOT' ), 'ecpay' => (string) ( getenv( 'YS_ECPAY_ROOT' ) ?: dirname( __DIR__, 2 ) ), 'affiliate' => (string) getenv( 'YS_AFFILIATE_ROOT' ) ] );
 $products = Fixture::loadProduct( $sources );
-$check( 'fifteen real product classes are loaded from their exact committed raw blobs', 15 === count( $products ) );
+$check( 'sixteen real product classes are loaded from their exact committed raw blobs', 16 === count( $products ) );
+$methodClass = 'YangSheep\\Ecommerce\\Shipping\\YSShippingMethodId';
+$methodReceipts = array_values( array_filter( $products, static fn ( array $row ): bool => $methodClass === $row['class'] ) );
+$methodLoaded = class_exists( $methodClass, false ) && 1 === count( $methodReceipts );
+$check( 'new Core shipping method dependency has its exact explicit source receipt', $methodLoaded
+	&& realpath( $sources['core']['root'] . '/src/Shipping/YSShippingMethodId.php' ) === $methodReceipts[0]['path']
+	&& 'fa07152a06a54c002ea6bc1d4de99ec3f75d3b7b' === $methodReceipts[0]['blob']
+	&& '9f96b1ff3e5d0b3880bf88e8fcedeed7f33892bf03dd54cb8979ae665c466a12' === $methodReceipts[0]['sha256'] );
 $attempts = 0;
 try { Session::connect( [ 'kind' => 'sql-execution' ], static function () use ( &$attempts ): void { ++$attempts; } ); }
 catch ( SubscriptionSqlFailure $error ) { $code = $error->getMessage(); }
@@ -46,6 +53,8 @@ $db = Session::forCapture( $prefix, static function ( string $sql ) use ( &$capt
 $GLOBALS['wpdb'] = $db;
 $invalidInput = Fixture::updateProduct( 41, [ 'unexpected_input' => 'benign' ], [ 'customer_id' => 91, 'user_id' => 7 ] );
 $check( 'real coordinator rejects client authority before any transport dispatch', 'browser_authority_violation' === ( $invalidInput['code'] ?? '' ) && [] === $captured );
+$invalidMethod = $methodLoaded ? Fixture::updateProduct( 41, [ 'expected_generation' => 3, 'shipping_method_id' => 'invalid method' ], [ 'customer_id' => 91, 'user_id' => 7 ] ) : [];
+$check( 'real coordinator invokes the new method normalizer before any transport dispatch', 'invalid_request' === ( $invalidMethod['code'] ?? '' ) && [] === $captured );
 $model = \YangSheep\Ecommerce\Models\YSSubscription::class;
 $check( 'real model rejects missing lock custody without a statement', null === $model::find_for_fulfillment_profile_update( 41 ) && [] === $captured );
 $fence = [ 'connection_id' => '9101', 'database' => 'ecpay_offline_fixture', 'owner_nonce' => str_repeat( 'a', 32 ), 'tables' => $model::admitted_table_map( $db ) ];

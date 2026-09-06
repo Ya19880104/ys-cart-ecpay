@@ -20,7 +20,7 @@ namespace {
 
 namespace YSCartEcpay\Tests\Live {
 	final class SubscriptionProductSqlFixture {
-		public const CORE = '47b07b523445492c163b26ba7047c19d64911c0b';
+		public const CORE = '7c8acd9843fe4507cc39eb18e8bb54bfd6fc3ec1';
 		public const ECPAY = '445adc76c4dc6653abdd228b529bad636eef5d42';
 		public const AFFILIATE = '18c609a1b94cca28e57c2ce4f225f25662555ccd';
 		private const ALLOWED_DESCENDANT_PATHS = [
@@ -82,6 +82,7 @@ namespace YSCartEcpay\Tests\Live {
 					'YangSheep\\Ecommerce\\Database\\YSTableMaker' => 'src/Database/YSTableMaker.php',
 					'YangSheep\\Ecommerce\\Models\\YSSubscription' => 'src/Models/YSSubscription.php',
 					'YangSheep\\Ecommerce\\Models\\YSProduct' => 'src/Models/YSProduct.php',
+					'YangSheep\\Ecommerce\\Shipping\\YSShippingMethodId' => 'src/Shipping/YSShippingMethodId.php',
 					'YangSheep\\Ecommerce\\Services\\Subscription\\YSSubscriptionFulfillmentProfileCoordinator' => 'src/Services/Subscription/YSSubscriptionFulfillmentProfileCoordinator.php',
 					'YangSheep\\Ecommerce\\Services\\Subscription\\YSSubscriptionFulfillmentProfileService' => 'src/Services/Subscription/YSSubscriptionFulfillmentProfileService.php',
 					'YangSheep\\Ecommerce\\Services\\Subscription\\YSSubscriptionSharedDbBoundary' => 'src/Services/Subscription/YSSubscriptionSharedDbBoundary.php',

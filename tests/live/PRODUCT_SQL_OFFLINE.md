@@ -2,11 +2,15 @@
 
 The offline modes validate an allocation and exact product sources, or capture
 product-generated DDL, without connecting. B2 adds a separately admitted real
-mysqli execution path for **P1, P3–P10, P11a–h and P12a–b only**. Its implementation and offline
+mysqli execution path for **P1–P10, P11a–h and P12a–b only**. Its implementation and offline
 regressions do not prove SQL acceptance: each case still requires a reviewed clean
 source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
 its handwritten CAS is not evidence for this product-path checkpoint.
+
+The current Core7c8 pair is an **offline capture candidate; SQL NOT RUN**.
+Retained MySQL acceptances below belong to the earlier Core47b pair and do not
+become evidence for Core7c8 after a loader or pin change.
 
 ## Entry and configuration
 
@@ -46,7 +50,7 @@ Use the same CLI with `--driver=adapter --mode=execute --phase=<unique-phase>
 --evidence-root=<existing-local-directory>`. `YS_ECPAY_SQL_RUN` points to the
 nonsecret B1 run envelope: exact keys `version,phase,cases,allocations,source_heads,
 runtime_sha256,driver`, version 1, driver `adapter`. Cases are an ordered unique
-subset of `P1,P3,P4,P5,P6,P7,P8,P9,P10,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h,P12a,P12b`; every case has a distinct
+subset of `P1,P2,P3,P4,P5,P6,P7,P8,P9,P10,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h,P12a,P12b`; every case has a distinct
 prefix and its own seven-key `sql-execution` allocation. Every other SQL case is
 rejected before a phase or worker is created.
 
@@ -92,7 +96,7 @@ unexpected faults, actual/presented differences, logs or stderr fail the case.
 
 ## Product custody and permitted fixture boundaries
 
-Core is pinned to `47b07b523445492c163b26ba7047c19d64911c0b`; Affiliate is pinned
+Core is pinned to `7c8acd9843fe4507cc39eb18e8bb54bfd6fc3ec1`; Affiliate is pinned
 read-only to `18c609a1b94cca28e57c2ce4f225f25662555ccd`. All three roots must be clean.
 ECPay product bytes are pinned to `445adc76c4dc6653abdd228b529bad636eef5d42`;
 only descendants whose entire changed-path set is in the twenty-one-path explicit
@@ -106,8 +110,13 @@ all raw files equal its HEAD; dirty precommit controls are `UNFROZEN AUTHORING`.
 Helpers are test code, not product authority. A helper override requires a named
 `mutation-*` phase and produces `NAMED MUTATION`, never canonical evidence.
 
-`SubscriptionProductSqlFixture` loads fifteen real product classes (eleven Core,
-four ECPay), including genuine YSProduct and all invoked normalization dependencies.
+`SubscriptionProductSqlFixture` loads sixteen real product classes (twelve Core,
+four ECPay), including genuine YSProduct and the explicitly listed
+`src/Shipping/YSShippingMethodId.php` normalization dependency. The new dependency
+uses the same exact Git blob and Reflection custody; no autoloader or product
+substitute is added. Offline tests cover source admission, seed/profile normalization,
+normal request/projection and rejection of a mixed old-Core pair. Use a clean,
+exact Core source checkout; unrelated untracked files are not a clean-guard exception.
 Its `dbDelta`
 boundary only records DDL from five actual `YSTableMaker` methods (products,
 subscriptions, orders, order items, order-created outbox); it cannot reach a
@@ -228,8 +237,11 @@ independent rehashed adversarial evidence controls. Source mutations use retaine
 named helper copies and require green controls, rc1 ordinary failures, and empty
 parent/child stderr. These are source-only offline tests, not SQL acceptance.
 
+All retained server acceptances in this section used Core
+`47b07b523445492c163b26ba7047c19d64911c0b` and Affiliate
+`18c609a1b94cca28e57c2ce4f225f25662555ccd`; these historical anchors remain unchanged.
 P1/P11a–h have retained MySQL 8.4.11 acceptance at ECPay `ff255d6069f9904446079695e92c9654c126511a`,
-paired with the fixed Core/Affiliate anchors. P3–P6 have separate retained MySQL 8.4.11
+paired with those Core/Affiliate anchors. P3–P6 have separate retained MySQL 8.4.11
 acceptance at ECPay `bd4f7189ac83032049b35a7dfb1fd6cfcf5a303c` with those same anchors.
 P8–P10 have separate retained MySQL 8.4.11 acceptance at ECPay
 `2338306ccd5ca6e9c4d698f5dfe16f6bd9ffbaef` with those same anchors.
@@ -307,8 +319,13 @@ the exact generation-4/consumed-4 durable state. Rehashed false waits, wrong
 identities/scope/predicates/SQL, premature or duplicate releases, altered COMMIT
 presentation and a stale_generation response cannot become acceptance.
 
-P2 is SQL NOT RUN pending a fresh clean-source root allocation and independent
-server receipts. The local IPC, admission and oracle controls prove no SQL.
+P2 has retained MySQL 8.4.11 acceptance at ECPay
+`b0b5b6c32dc9acf96e379db70cf84eabe18f148c` with that same Core47b/Affiliate pair:
+two workers and distinct IDs, actual wait proof, A CAS/consume/COMMIT once,
+B authority-changed 409/rollback without CAS/consume/COMMIT, and equal full
+six-table readbacks. The owned server was normally shut down. This historical
+result does not cover the new Core7c8 pair; its SQL gate remains NOT RUN.
+Local IPC, admission and oracle controls themselves prove no SQL.
 Genuine native WordPress reconnect remains NOT RUN with its separate prerequisites;
 the mysqli slice label never supplies native wpdb or other unexecuted case proof.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder

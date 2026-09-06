@@ -61,7 +61,7 @@ if ( $available ) {
 $check( 'setup and fault unit tests construct no connection', 0 === Session::connectionAttempts() );
 $sources = Fixture::inspectSources( [ 'core'=>getenv( 'YS_CORE_ROOT' ),'ecpay'=>getenv( 'YS_ECPAY_ROOT' ),'affiliate'=>getenv( 'YS_AFFILIATE_ROOT' ) ] );
 $products = Fixture::loadProduct( $sources ); require_once $helpers . '/SubscriptionSqlRequestBoundary.php';
-$check( 'actual fifteen product classes loaded for issuance', 15 === count( $products ) );
+$check( 'actual sixteen product classes loaded for issuance', 16 === count( $products ) );
 $halfSeed=Fixture::seedPlan($db->prefix,1788566400,str_repeat('H',32)); $beforeDispatch=$db->dispatches;
 $half=\YangSheep\Ecommerce\Services\Subscription\YSSubscriptionFulfillmentProfileService::renewal_projection((object)$halfSeed['subscription'],null,$db,null);
 $check('actual projection rejects half a catalog custody credential before any query', ['ok'=>false,'error'=>'subscription_tracked_stock_not_supported']===$half && $db->dispatches===$beforeDispatch);

@@ -70,6 +70,15 @@ foreach ( $cases as $name => [ $path, $commit, $expected ] ) {
 	$ok ? ++$pass : ++$fail;
 	$receipts[] = [ 'case' => $name, 'expected' => $expected, 'actual' => $actual, 'fixture' => $root, 'connection_attempts' => Session::connectionAttempts() ];
 }
+$oldCore = $scratch . '/old-core-pair';
+$git( [ 'clone', '--shared', '--no-checkout', (string) getenv( 'YS_CORE_ROOT' ), $oldCore ] );
+$git( [ '-C', $oldCore, '-c', 'core.autocrlf=false', 'checkout', '--detach', '47b07b523445492c163b26ba7047c19d64911c0b' ] );
+$actual = 'accepted';
+try { Fixture::inspectSources( [ 'core' => $oldCore, 'ecpay' => $scratch . '/clean-checkpoint', 'affiliate' => (string) getenv( 'YS_AFFILIATE_ROOT' ) ] ); }
+catch ( SubscriptionSqlFailure $e ) { $actual = $e->getMessage(); }
+$ok = 'pair_anchor_drift' === $actual && 0 === Session::connectionAttempts();
+echo ( $ok ? 'PASS ' : 'FAIL ' ) . "old Core47 cannot be mixed into the new Core pair\n"; $ok ? ++$pass : ++$fail;
+$receipts[] = [ 'case' => 'old-core-pair', 'expected' => 'pair_anchor_drift', 'actual' => $actual, 'fixture' => $oldCore, 'connection_attempts' => Session::connectionAttempts() ];
 $path = $scratch . '/receipts.json';
 file_put_contents( $path, json_encode( [ 'helpers' => $helperReceipt, 'cases' => $receipts, 'commands' => $commands ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
 echo 'CUSTODY_RECEIPTS ' . json_encode( [ 'path' => $path, 'sha256' => hash_file( 'sha256', $path ) ], JSON_UNESCAPED_SLASHES ) . "\n";
