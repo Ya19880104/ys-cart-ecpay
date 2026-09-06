@@ -61,6 +61,8 @@ try {
 		$environments=[];
 		foreach($run['allocations'] as $case=>$allocation) { $allocation=\YSCartEcpay\Tests\Live\SubscriptionSqlAllocation::validate($allocation); $environments[$case]=['YS_TEST_MYSQL_DSN'=>getenv('YS_TEST_MYSQL_DSN'),'YS_TEST_MYSQL_DB'=>getenv('YS_TEST_MYSQL_DB'),'YS_TEST_MYSQL_USER'=>getenv('YS_TEST_MYSQL_USER'),'YS_ECPAY_SQL_PREFIX'=>$allocation['prefix']]; }
 		$admitted=\YSCartEcpay\Tests\Live\SubscriptionSqlController::admit($run,$environments,$sources);
+		// Parent connection counts cannot prove the aggregate work of admitted workers.
+		$result['sql_execution']='UNPROVEN'; $result['sql_statements']=null;
 		$execution=\YSCartEcpay\Tests\Live\SubscriptionSqlController::runMysql($admitted,$options['evidence-root']??'');
 		echo json_encode(['success'=>true,'code'=>'mysql_slice_complete','connection_attempts'=>Session::connectionAttempts(),'execution'=>$execution],JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n"; exit(0);
 	}

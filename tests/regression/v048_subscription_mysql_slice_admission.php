@@ -57,7 +57,7 @@ try {
     if($serverReady) {
         $row=['version'=>'8.4.11','database_name'=>'ecpay_b2_fixture','connection_id'=>'9101','transaction_isolation'=>'REPEATABLE-READ','autocommit'=>'1','sql_mode'=>'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION','time_zone'=>'+00:00','character_set_connection'=>'utf8mb4','collation_connection'=>'utf8mb4_unicode_ci'];
         $check('literal MySQL84 server session fields admit without connecting',Schema::validateServer([$row],'ecpay_b2_fixture')===$row);
-        foreach([['version','8.0.41'],['version','11.8.8-MariaDB'],['database_name','foreign'],['autocommit','0'],['connection_id',null],['character_set_connection','latin1']] as [$key,$value]) { $reject(static fn()=>Schema::validateServer([array_replace($row,[$key=>$value])],'ecpay_b2_fixture'),'mysql_server_invalid'); }
+        foreach([['version','8.0.41'],['version','11.8.8-MariaDB'],['database_name','foreign'],['autocommit','0'],['connection_id',null],['character_set_connection','latin1'],['sql_mode','STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES']] as [$key,$value]) { $reject(static fn()=>Schema::validateServer([array_replace($row,[$key=>$value])],'ecpay_b2_fixture'),'mysql_server_invalid'); }
         $reject(static fn()=>Schema::validateServer([],'ecpay_b2_fixture'),'mysql_server_invalid');
         Fixture::loadProduct($sources);
         $plan=Schema::plan($grant['prefix']); $contracts=[];
@@ -89,6 +89,43 @@ try {
         $check('scope relabel cannot manufacture SQL acceptance',false===$verdict['matches'] && 'UNPROVEN'===$verdict['sql_execution']);
         $verdict=Evidence::evaluateMysql('P2',[],[],[]);
         $check('SQL evaluator never widens slice to contention',false===$verdict['matches'] && in_array('mysql_slice_case_not_authorized',$verdict['errors'],true));
+    }
+    // These literal expectations cover the escaping difference observed in real P1 seed SQL.
+    // This is a zero-connection oracle control, not another native SQL execution.
+    $quote=new ReflectionMethod(Evidence::class,'quote');
+    $json='{"contract_version":1,"contract_kind":"physical"}';
+    $check('capture JSON quoting remains unchanged',$quote->invoke(null,$json)==="'".$json."'");
+    $check('mysqli JSON quoting matches the real P1 literal',
+        $quote->invoke(null,$json,true)==='\'{\"contract_version\":1,\"contract_kind\":\"physical\"}\'');
+    foreach([["\0","'\\0'"],["\n","'\\n'"],["\r","'\\r'"],["\\","'\\\\'"],["'","'\\''"],['"',"'\\\"'"],["\x1a","'\\Z'"]] as $i=>[$literal,$expected]) {
+        $check('mysqli literal escape '.$i.' is exact',$quote->invoke(null,$literal,true)===$expected);
+    }
+    $check('mysqli UTF-8 scalar bytes remain unchanged',$quote->invoke(null,'門市',true)==="'門市'");
+    // Exercise the actual CLI around admission. Missing credentials and -n prevent any connector.
+    $cliRoot=sys_get_temp_dir().'/ecpay-b2-parent-'.bin2hex(random_bytes(8)); mkdir($cliRoot);
+    $cliRun=['version'=>1,'phase'=>'b2-parent-control','cases'=>['P1'],'allocations'=>['P1'=>$grant],
+        'source_heads'=>$heads,'runtime_sha256'=>$context['runtime_sha256'],'driver'=>'adapter'];
+    foreach(['before-admission','after-admission'] as $boundary) {
+        $packet=$cliRun;
+        if('before-admission'===$boundary) { $packet['source_heads']['ecpay']=str_repeat('0',40); }
+        $runFile=$cliRoot.'/'.$boundary.'.json'; file_put_contents($runFile,json_encode($packet,JSON_THROW_ON_ERROR));
+        $childEnv=getenv(); unset($childEnv['YS_TEST_MYSQL_PASSWORD']); $childEnv['YS_ECPAY_SQL_RUN']=$runFile;
+        $out=$cliRoot.'/'.$boundary.'.stdout.txt'; $err=$cliRoot.'/'.$boundary.'.stderr.txt';
+        $child=proc_open([PHP_BINARY,'-n',dirname(__DIR__).'/live/live_subscription_product_pair.php',
+            '--driver=adapter','--mode=execute','--phase=b2-parent-control','--evidence-root='.$cliRoot],
+            [0=>['pipe','r'],1=>['file',$out,'x'],2=>['file',$err,'x']],$pipes,null,$childEnv);
+        if(!is_resource($child)) { throw new RuntimeException('parent control process unavailable'); }
+        fclose($pipes[0]); $childRc=proc_close($child); $parent=json_decode((string)file_get_contents($out),true);
+        $check($boundary.' CLI failure keeps parent connections at zero',
+            2===$childRc && 0===filesize($err) && false===($parent['success']??null) && 0===($parent['connection_attempts']??null));
+        if('before-admission'===$boundary) {
+            $check('pre-admission rejection still proves SQL NOT RUN',
+                'controller_source_mismatch'===($parent['code']??null) && 'NOT RUN'===($parent['sql_execution']??null) && 0===($parent['sql_statements']??null));
+        } else {
+            $check('admitted execution failure never infers aggregate SQL from parent count',
+                'execution_password_required'===($parent['code']??null) && 'UNPROVEN'===($parent['sql_execution']??null)
+                && array_key_exists('sql_statements',$parent) && null===$parent['sql_statements']);
+        }
     }
     $failureEvidence=method_exists(Session::class,'failureEvidence');
     $check('post-dispatch failure retains partial schema trace with unproven execution',$failureEvidence);

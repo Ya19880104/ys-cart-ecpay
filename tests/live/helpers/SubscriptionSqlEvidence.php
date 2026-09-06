@@ -119,7 +119,7 @@ final class SubscriptionSqlEvidence {
 			$w=$workers[$role];
 			self::dispatchProof($case,$role,$base,$workers,$artifacts['root'],$mysql);
 			self::counts($case,$role,$w['statement_receipts']);
-			self::statementAuthority($w['statement_receipts'],$base['prefix'],$before);
+			self::statementAuthority($w['statement_receipts'],$base['prefix'],$before,$mysql);
 			self::barriers($case,$role,$w['barrier_receipts'],$artifacts['root']);
 		}
 		$afterTables=$workers['B']['readback_receipt']; self::need(is_array($afterTables),'readback_missing');
@@ -203,8 +203,8 @@ final class SubscriptionSqlEvidence {
 		sort($stages); sort($expected); self::need($stages===$expected,'barrier_manifest_invalid');
 		if(in_array($case,['P2','P12a','P12b'],true)) { $barrier->awaitBound($case,'release',1); }
 	}
-	private static function statementAuthority(array $rows,string $prefix,array $before):void {
-		$q=static fn(string $v):string=>"'".str_replace(['\\',"'"],['\\\\',"\\'"],$v)."'";
+	private static function statementAuthority(array $rows,string $prefix,array $before,bool $mysql=false):void {
+		$q=static fn(string $v):string=>self::quote($v,$mysql);
 		$p=json_decode($before['profile_bytes'],true);
 		$p['shipping_method_id']='ys_ec_ecpay_ship_unimart'; $p['shipping_provider']='ecpay'; $p['shipping_total']='65.00';
 		$p['fulfillment_snapshot']['provider_id']='ecpay'; $p['fulfillment_snapshot']['method_id']='ys_ec_ecpay_ship_unimart';
@@ -262,14 +262,19 @@ final class SubscriptionSqlEvidence {
 			}
 		}
 	}
-	private static function quote(string $v):string { return "'".str_replace(['\\',"'"],['\\\\',"\\'"],$v)."'"; }
+	private static function quote(string $v,bool $mysql=false):string {
+		// MySQL admission fixes utf8mb4 and rejects NO_BACKSLASH_ESCAPES.
+		// Reconstruct mysqli literal bytes independently; never normalize the observed SQL.
+		if($mysql) { return "'".strtr($v,["\0"=>'\\0',"\n"=>'\\n',"\r"=>'\\r','\\'=>'\\\\',"'"=>"\\'",'"'=>'\\"',"\x1a"=>'\\Z'])."'"; }
+		return "'".str_replace(['\\',"'"],['\\\\',"\\'"],$v)."'";
+	}
 	private static function waitSql(string $prefix,array $id,string $bid):string {
 		return 'SELECT rt.PROCESSLIST_ID AS requesting_id, bt.PROCESSLIST_ID AS blocking_id, rl.OBJECT_SCHEMA AS schema_name, rl.OBJECT_NAME AS table_name, rl.INDEX_NAME AS index_name, rl.LOCK_DATA AS lock_data FROM performance_schema.data_lock_waits w JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID JOIN performance_schema.data_locks rl ON rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID AND rl.ENGINE = w.ENGINE WHERE rt.PROCESSLIST_ID = '.$bid.' AND bt.PROCESSLIST_ID = '.$id['connection_id'].' AND rl.OBJECT_SCHEMA = '.self::quote($id['database']).' AND rl.OBJECT_NAME = '.self::quote($prefix.'ys_ec_subscriptions')." AND rl.INDEX_NAME = 'PRIMARY' AND rl.LOCK_DATA = '41'";
 	}
 	/** Reconstruct finite complete dispatches from owned rows, never from the producer's SQL hash. */
 	private static function dispatchProof(string $case,string $role,array $base,array $workers,string $root,bool $mysql=false):void {
 		$w=$workers[$role]; $rows=$w['statement_receipts']; $prefix=$base['prefix']; $tables=$base['tables'];
-		$q=self::quote(...); $key='ys_ec_ecpay_subsel_'.$base['token_digest']; $optionRead='SELECT option_value FROM '.$prefix.'options WHERE option_name = '.$q($key);
+		$q=static fn(string $v):string=>self::quote($v,$mysql); $key='ys_ec_ecpay_subsel_'.$base['token_digest']; $optionRead='SELECT option_value FROM '.$prefix.'options WHERE option_name = '.$q($key);
 		$subRead='SELECT * FROM '.$prefix.'ys_ec_subscriptions WHERE id = '; $show='SHOW TABLE STATUS WHERE Name = '.$q($prefix.'options');
 		$sessionSql='SELECT CAST(CONNECTION_ID() AS CHAR) AS cid, DATABASE() AS dbname, CAST(@ys_profile_tx_owner AS CHAR) AS owner';
 		$emptyId=['connection_id'=>null,'database'=>null,'owner_nonce'=>null]; $state=$emptyId;
