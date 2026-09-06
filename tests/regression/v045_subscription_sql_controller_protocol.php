@@ -127,6 +127,47 @@ if ( $available ) {
 	$check( 'duplicate phase cannot overwrite controller evidence', 'phase_exists' === $code );
 	$path = $scratch . '/protocol-receipt.json'; file_put_contents( $path, json_encode( $protocol, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . "\n" );
 	echo 'PROTOCOL_RECEIPTS ' . json_encode( [ 'path' => $path, 'sha256' => hash_file( 'sha256', $path ) ], JSON_UNESCAPED_SLASHES ) . "\n";
+	// P2 IPC ONLY: a pre-dispatch B marker never substitutes for a server wait row.
+	foreach(['normal','missing-wait','outer-scope','inner-scope','action','setup-id','wait-id','same-id','zero-rows','two-rows','row-extra','requester','blocker','database','table','index','key','sql','foreign-phase','truncated','duplicate'] as $failure) {
+		$phase='p2-release-'.$failure; $barrier=\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::createPhase($scratch,$phase);
+		$allocation=array_replace($grant,['kind'=>'sql-execution']); $aid='9101'; $bid='same-id'===$failure?$aid:'9102';
+		$sql=(new ReflectionMethod(\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::class,'waitSql'))->invoke(null,$grant['prefix'],['connection_id'=>$aid,'database'=>$grant['database']],$bid);
+		$row=['requesting_id'=>$bid,'blocking_id'=>$aid,'schema_name'=>$grant['database'],'table_name'=>$grant['prefix'].'ys_ec_subscriptions','index_name'=>'PRIMARY','lock_data'=>'41'];
+		$field=match($failure){'requester'=>'requesting_id','blocker'=>'blocking_id','database'=>'schema_name','table'=>'table_name','index'=>'index_name','key'=>'lock_data',default=>null};
+		if(null!==$field) { $row[$field]='foreign'; } if('row-extra'===$failure) { $row['extra']='foreign'; }
+		$wait=['kind'=>'data_lock_waits_join','sql_sha256'=>hash('sha256','sql'===$failure?'SELECT 1':$sql),'rows'=>'zero-rows'===$failure?[]:('two-rows'===$failure?[$row,$row]:[$row]),'scope'=>'inner-scope'===$failure?'CAPTURE RESULT CONTROL ONLY':'SUPPLIED SERVER OBSERVATION'];
+		foreach([['setup-complete','A',1,'setup-id'===$failure?'9199':$aid,[]],['a-seam','A',2,$aid,['action'=>'action'===$failure?'pause-before-claim':'pause-before-commit']],['b-seam','B',1,$bid,['lock_sql_sha256'=>str_repeat('a',64)]],['wait-observed','A',3,'wait-id'===$failure?'9199':$aid,$wait]] as [$stage,$role,$sequence,$cid,$data]) {
+			if('missing-wait'===$failure && 'wait-observed'===$stage) { continue; }
+			$payload=['version'=>1,'phase'=>$phase,'case'=>'P2','role'=>$role,'sequence'=>$sequence,'scope'=>'outer-scope'===$failure && 'wait-observed'===$stage?'CAPTURE WORKER':'MYSQLI WORKER','data'=>$data];
+			$ref=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),'p2-'.$stage.'-receipt.json',$payload); $barrier->publish('P2',$stage,$role,$cid,$ref);
+		}
+		$waitPath=$barrier->path().'/p2-wait-observed.json';
+		if('foreign-phase'===$failure) { $value=json_decode(file_get_contents($waitPath),true); $value['phase']='foreign'; file_put_contents($waitPath,json_encode($value)); }
+		if('truncated'===$failure) { file_put_contents($waitPath,'{'); }
+		if('duplicate'===$failure) {
+			$prior=$barrier->awaitBound('P2','wait-observed',1);
+			$ref=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),'p2-release-receipt.json',['version'=>1,'phase'=>$phase,'case'=>'P2','role'=>'controller','sequence'=>1,'scope'=>'MYSQLI CONTENTION RELEASE','prior_sha256'=>hash('sha256',json_encode($prior))]);
+			$barrier->publish('P2','release','controller',$aid,$ref);
+		}
+		$empty=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),'empty-worker.json',[]); $owned=[]; $caught=''; $result=null;
+		foreach(['A','B'] as $role) {
+			$base=$barrier->path().'/'.$role;
+			$body=['version'=>1,'phase'=>$phase,'case'=>'P2','role'=>$role,'scope'=>'MYSQLI WORKER','token_digest'=>str_repeat('a',64),'connection_attempts'=>1,'sql_execution'=>'EXECUTED','receipt'=>$empty];
+			$code='$until=hrtime(true)+1000000000; while(!is_file($argv[1]) && hrtime(true)<$until) { usleep(1000); } if(!is_file($argv[1])) { exit(3); } echo stream_get_contents(STDIN);';
+			$command=[PHP_BINARY,'-n','-r',$code,$barrier->path().'/p2-release.json'];
+			$child=proc_open($command,[0=>['pipe','r'],1=>['file',$base.'.stdout.txt','x'],2=>['file',$base.'.stderr.txt','x']],$pipes);
+			if(!is_resource($child)) { throw new RuntimeException('P2 IPC process unavailable'); } fwrite($pipes[0],json_encode($body)); fclose($pipes[0]);
+			$owned[]=['process'=>$child,'base'=>$base,'case'=>'P2','role'=>$role,'phase'=>$phase,'token_digest'=>str_repeat('a',64),'command'=>$command,'mysql'=>true,'allocation'=>$allocation];
+		}
+		try { $result=$supervisor->invoke(null,$owned,500,$barrier); } catch(SubscriptionSqlFailure $error) { $caught=$error->getMessage(); }
+		finally { foreach($owned as $child) { if(is_resource($child['process'])) { proc_terminate($child['process']); proc_close($child['process']); } } }
+		$check('P2 exact wait release '.$failure.' is a zero-DB protocol control','normal'===$failure?''===$caught && 2===count($result['workers']):('duplicate'===$failure?'evidence_exists'===$caught:''!==$caught && !is_file($barrier->path().'/p2-release.json')));
+		if('normal'===$failure && ''===$caught) {
+			$release=$barrier->awaitBound('P2','release',1); $prior=$barrier->awaitBound('P2','wait-observed',1);
+			$check('P2 release binds the complete wait proof and A observer ID',\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::exactKeys($release['receipt'],['version','phase','case','role','sequence','scope','prior_sha256']) && $release['marker']['connection_id']===$aid && $release['receipt']['scope']==='MYSQLI CONTENTION RELEASE' && $release['receipt']['prior_sha256']===hash('sha256',json_encode($prior)));
+		}
+	}
+	$check('P2 release protocol never constructs a parent connection',0===Session::connectionAttempts());
 	// Native-shaped IPC ONLY: both child receipts are empty and cannot prove SQL execution.
 	foreach([['P12a','normal'],['P12b','normal'],['P12a','missing'],['P12a','scope'],['P12a','duplicate']] as [$case,$failure]) {
 		$phase='release-'.strtolower($case).'-'.$failure;

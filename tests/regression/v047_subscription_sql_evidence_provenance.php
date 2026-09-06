@@ -141,6 +141,50 @@ if ( $available ) {
 				}
 				if('P2'===$case) { $changes['wait-unrelated-sql']=static function(string $kind,string $name,mixed $value):mixed { $sql='SELECT 1'; if('artifact'===$kind && 'p2-wait-observed-receipt.json'===$name) { $value['data']['sql_sha256']=hash('sha256',$sql); } if('worker'===$kind && 'A'===$name) { foreach($value['statement_receipts'] as &$s) { if('observer'===$s['origin'] && isset($s['actual']['rows'][0]['blocking_id'])) { $s['sql']=$sql; $s['sql_sha256']=hash('sha256',$sql); } } unset($s); } return $value; }; }
 				if('P2'===$case) {
+					// Rehashed native-shaped barriers exercise only wait/release contracts, never SQL proof.
+					$barrier=\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::attach(dirname($control['artifacts']['root']),$control['base']['phase']);
+					$nativeWait=$barrier->awaitBound('P2','wait-observed',1); $nativeWait['receipt']['scope']='MYSQLI WORKER'; $nativeWait['receipt']['data']['scope']='SUPPLIED SERVER OBSERVATION';
+					$nativeWait['marker']['receipt_sha256']=hash('sha256',json_encode($nativeWait['receipt'],JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_PRESERVE_ZERO_FRACTION|JSON_THROW_ON_ERROR)."\n");
+					$nativePrior=hash('sha256',json_encode($nativeWait)); $aid=$nativeWait['marker']['connection_id']; $barriers=new ReflectionMethod(Evidence::class,'barriers');
+					foreach(['normal','release-prior','release-scope','release-extra','release-identity','wait-scope','wait-row','wait-sql'] as $variant) {
+						$input=ecpay_b1_fork_evidence($control,'native-'.$variant,static function(string $kind,string $name,mixed $value) use($variant,$nativePrior,$aid):mixed {
+							if('artifact'===$kind && str_starts_with($name,'p2-')) {
+								$value['scope']='MYSQLI WORKER';
+								if('p2-wait-observed-receipt.json'===$name) {
+									$value['data']['scope']='wait-scope'===$variant?'CAPTURE RESULT CONTROL ONLY':'SUPPLIED SERVER OBSERVATION';
+									if('wait-row'===$variant) { $value['data']['rows'][0]['schema_name']='foreign'; }
+									if('wait-sql'===$variant) { $value['data']['sql_sha256']=hash('sha256','SELECT 1'); }
+								}
+								if('p2-release-receipt.json'===$name) {
+									$value['scope']='release-scope'===$variant?'IPC CAPTURE CONTROL ONLY':'MYSQLI CONTENTION RELEASE'; $value['prior_sha256']='release-prior'===$variant?str_repeat('0',64):$nativePrior;
+									if('release-extra'===$variant) { $value['extra']=true; }
+								}
+							}
+							if('marker'===$kind && 'p2-release.json'===$name) { $value['connection_id']='release-identity'===$variant?'9199':$aid; }
+							return $value;
+						});
+						$code='';
+						try {
+							$phase=\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::attach(dirname($input['artifacts']['root']),$input['base']['phase']);
+							Evidence::p2WaitProof($phase,$input['base']['prefix'],$input['workers']['A']['session_receipts']['identity']['database'],true);
+							foreach(['A','B'] as $role) { $barriers->invoke(null,'P2',$role,$input['workers'][$role]['barrier_receipts'],$input['artifacts']['root'],true); }
+						} catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
+						$check('P2 rehashed native wait and release '.$variant.' is only a provenance control','normal'===$variant?''===$code:('release_'===substr($code,0,8)||'contention_proof_unavailable'===$code));
+					}
+					// Native-shaped B schedule only: no connector/schema proof or SQL execution.
+					$schedule=new ReflectionMethod(Evidence::class,'dispatchProof'); $native=$control['workers'];
+					$native['B']['mysql_receipt']=['schema'=>['before'=>[],'reads'=>[]]]; $statusIndex=null;
+					foreach($native['B']['statement_receipts'] as $i=>&$s) {
+						$s['actual']['affected']=count($s['actual']['rows']);
+						if(str_starts_with($s['sql'],'SHOW TABLE STATUS')) { $statusIndex=$i; $s['actual']['rows']=[['Name'=>$control['base']['prefix'].'options','Engine'=>'InnoDB','Version'=>'10','Row_format'=>'Dynamic','Rows'=>'2']]; }
+						$s['presented']=$s['actual'];
+					} unset($s);
+					foreach(['normal','foreign-name','wrong-engine'] as $variant) {
+						$input=$native;
+						if('normal'!==$variant) { $input['B']['statement_receipts'][$statusIndex]['actual']['rows'][0]['foreign-name'===$variant?'Name':'Engine']='foreign-name'===$variant?'foreign_options':'MyISAM'; $input['B']['statement_receipts'][$statusIndex]['presented']=$input['B']['statement_receipts'][$statusIndex]['actual']; }
+						$code=''; try { $schedule->invoke(null,'P2','B',$control['base'],$input,$control['artifacts']['root'],true); } catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
+						$check('P2 native-shaped full SHOW rows '.$variant.' retain exact SQL schedule','normal'===$variant?''===$code:'mysql_table_status_invalid'===$code);
+					}
 					$changes['wait-marker-identity']=static function(string $kind,string $name,mixed $value):mixed { if('marker'===$kind && 'p2-wait-observed.json'===$name) { $value['connection_id']='9102'; } return $value; };
 					$changes['b-response']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'B'===$name) { $value['product_response']['code']='stale_generation'; } return $value; };
 					$changes['wait-predicate']=static function(string $kind,string $name,mixed $value):mixed {

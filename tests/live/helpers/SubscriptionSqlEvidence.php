@@ -5,13 +5,13 @@ namespace YSCartEcpay\Tests\Live;
 require_once __DIR__ . '/SubscriptionSqlScenario.php';
 final class SubscriptionSqlEvidence {
 	public static function assertMysqlCase(string $case):void {
-		if(!in_array($case,['P1','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
+		if(!in_array($case,['P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
 	}
 	public static function evaluateMysql(string $case,array $baseline,array $workers,array $artifacts):array {
 		$errors=[];
 		try { self::assertMysqlCase($case); self::collect($case,$baseline,$workers,$artifacts,true); }
 		catch(SubscriptionSqlFailure $e) { $errors[]=$e->getMessage(); }
-		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P10/P11/P12 SLICE'];
+		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1-P12 SLICE'];
 	}
 	public static function cases(): array {
 		$names = [ 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b' ];
@@ -148,9 +148,8 @@ final class SubscriptionSqlEvidence {
 		if('P2' === $case) {
 			self::need($workers['B']['product_response'] === ['success'=>false,'code'=>'subscription_authority_changed','message'=>'訂閱物流資料目前無法更新。','status'=>409],'competitor_response_invalid');
 			$barrier=SubscriptionSqlBarrier::attach(dirname($artifacts['root']),$base['phase']);
-			$wait=$barrier->awaitBound('P2','wait-observed',1); $locked=$barrier->awaitBound('P2','b-seam',1);
+			$wait=self::p2WaitProof($barrier,$base['prefix'],$workers['A']['session_receipts']['identity']['database'],$mysql); $locked=$barrier->awaitBound('P2','b-seam',1);
 			$proof=$wait['receipt']['data'];
-			self::need(self::exactKeys($proof,['kind','sql_sha256','rows','scope']) && 'data_lock_waits_join' === $proof['kind'] && 'CAPTURE RESULT CONTROL ONLY' === $proof['scope'] && is_array($proof['rows']) && 1 === count($proof['rows']), 'contention_proof_unavailable');
 			$r=$proof['rows'][0]; $aid=$workers['A']['session_receipts']['identity']['connection_id']; $bid=$workers['B']['session_receipts']['identity']['connection_id'];
 			self::need($wait['marker']['connection_id']===$aid && $locked['marker']['connection_id']===$bid,'contention_proof_unavailable');
 			self::need($aid !== $bid && ($r['requesting_id'] ?? null) === $bid && ($r['blocking_id'] ?? null) === $aid && ($r['schema_name'] ?? null) === $workers['A']['session_receipts']['identity']['database'] && ($r['table_name'] ?? null) === $base['prefix'].'ys_ec_subscriptions' && ($r['index_name'] ?? null) === 'PRIMARY' && ($r['lock_data'] ?? null) === '41', 'contention_proof_unavailable');
@@ -221,10 +220,10 @@ final class SubscriptionSqlEvidence {
 		sort($stages); sort($expected); self::need($stages===$expected,'barrier_manifest_invalid');
 		if(in_array($case,['P2','P12a','P12b'],true)) {
 			$release=$barrier->awaitBound($case,'release',1);
-			if('P2'!==$case) {
-				$prior=$barrier->awaitBound($case,'b-seam',1); $payload=$release['receipt'];
+			if('P2'!==$case || $mysql) {
+				$prior=$barrier->awaitBound($case,'P2'===$case?'wait-observed':'b-seam',1); $payload=$release['receipt'];
 				self::need(self::exactKeys($payload,['version','phase','case','role','sequence','scope','prior_sha256'])
-					&& $payload['scope']===($mysql?'MYSQLI INTERFERENCE RELEASE':'IPC CAPTURE CONTROL ONLY')
+					&& $payload['scope']===($mysql?('P2'===$case?'MYSQLI CONTENTION RELEASE':'MYSQLI INTERFERENCE RELEASE'):'IPC CAPTURE CONTROL ONLY')
 					&& $payload['prior_sha256']===hash('sha256',json_encode($prior))
 					&& $release['marker']['connection_id']===($mysql?$prior['marker']['connection_id']:'1'),'release_proof_invalid');
 			}
@@ -291,6 +290,7 @@ final class SubscriptionSqlEvidence {
 				};
 				if('A'===$role && 'product'===$s['origin'] && null!==$s['fault']) {
 					$expectedFault=match(true) {
+						'P2'===$case && 'commit'===$s['kind']=>'pause-before-commit',
 						'P8'===$case && 'consume'===$s['kind']=>'replace-before-consume',
 						'P9'===$case && 'session-verify'===$s['kind']=>'replace-before-verify',
 						'P10'===$case && 'commit'===$s['kind']=>'replace-before-commit',
@@ -314,6 +314,18 @@ final class SubscriptionSqlEvidence {
 	}
 	private static function waitSql(string $prefix,array $id,string $bid):string {
 		return 'SELECT rt.PROCESSLIST_ID AS requesting_id, bt.PROCESSLIST_ID AS blocking_id, rl.OBJECT_SCHEMA AS schema_name, rl.OBJECT_NAME AS table_name, rl.INDEX_NAME AS index_name, rl.LOCK_DATA AS lock_data FROM performance_schema.data_lock_waits w JOIN performance_schema.threads rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID JOIN performance_schema.threads bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID JOIN performance_schema.data_locks rl ON rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID AND rl.ENGINE = w.ENGINE WHERE rt.PROCESSLIST_ID = '.$bid.' AND bt.PROCESSLIST_ID = '.$id['connection_id'].' AND rl.OBJECT_SCHEMA = '.self::quote($id['database']).' AND rl.OBJECT_NAME = '.self::quote($prefix.'ys_ec_subscriptions')." AND rl.INDEX_NAME = 'PRIMARY' AND rl.LOCK_DATA = '41'";
+	}
+	/** Shared finite P2 wait contract; neither a B arrival nor elapsed time grants release. */
+	public static function p2WaitProof(SubscriptionSqlBarrier $barrier,string $prefix,string $database,bool $mysql=false):array {
+		$setup=$barrier->awaitBound('P2','setup-complete',1); $a=$barrier->awaitBound('P2','a-seam',1); $b=$barrier->awaitBound('P2','b-seam',1); $wait=$barrier->awaitBound('P2','wait-observed',1);
+		foreach([$setup,$a,$b,$wait] as $bound) { self::need(self::exactKeys($bound['receipt'],['version','phase','case','role','sequence','scope','data']) && $bound['receipt']['scope']===($mysql?'MYSQLI WORKER':'CAPTURE CONTROL FLOW ONLY'),'contention_proof_unavailable'); }
+		$aid=$a['marker']['connection_id']; $bid=$b['marker']['connection_id'];
+		self::need($setup['marker']['connection_id']===$aid && $wait['marker']['connection_id']===$aid && $aid!==$bid && $a['receipt']['data']===['action'=>'pause-before-commit'],'contention_proof_unavailable');
+		$proof=$wait['receipt']['data'];
+		self::need(self::exactKeys($proof,['kind','sql_sha256','rows','scope']) && 'data_lock_waits_join'===$proof['kind'] && $proof['scope']===($mysql?'SUPPLIED SERVER OBSERVATION':'CAPTURE RESULT CONTROL ONLY')
+			&& $proof['rows']===[['requesting_id'=>$bid,'blocking_id'=>$aid,'schema_name'=>$database,'table_name'=>$prefix.'ys_ec_subscriptions','index_name'=>'PRIMARY','lock_data'=>'41']]
+			&& $proof['sql_sha256']===hash('sha256',self::waitSql($prefix,['connection_id'=>$aid,'database'=>$database],$bid)),'contention_proof_unavailable');
+		return $wait;
 	}
 	/** Reconstruct finite complete dispatches from owned rows, never from the producer's SQL hash. */
 	private static function dispatchProof(string $case,string $role,array $base,array $workers,string $root,bool $mysql=false):void {
@@ -390,7 +402,7 @@ final class SubscriptionSqlEvidence {
 			if('P11h'===$case) { $option($original,2); }
 			elseif('P12b'!==$case) {
 				$id='P11b'===$case?42:41; $read($subRead.$id,[$tables[$prefix.'ys_ec_subscriptions'][42===$id?1:0]]);
-				if('P2'===$case && 'B'===$role) { $read($show,[['Engine'=>'InnoDB']]); }
+				if('P2'===$case && 'B'===$role) { $read($show,$statusRows()); }
 				if('P11e'===$case) {
 					$s=$rows[count($slots)]??null; self::need(is_array($s) && 1===preg_match('/\ASELECT option_value FROM '.preg_quote($prefix,'/')."options WHERE option_name = 'ys_ec_ecpay_subsel_([a-f0-9]{64})'\\z/",$s['sql'],$m) && $m[1]!==$base['token_digest'],'unissued_lookup_invalid');
 					$read($s['sql'],[]);

@@ -233,7 +233,7 @@ paired with the fixed Core/Affiliate anchors. P3–P6 have separate retained MyS
 acceptance at ECPay `bd4f7189ac83032049b35a7dfb1fd6cfcf5a303c` with those same anchors.
 P8–P10 have separate retained MySQL 8.4.11 acceptance at ECPay
 `2338306ccd5ca6e9c4d698f5dfe16f6bd9ffbaef` with those same anchors.
-The current scope literal is `MYSQLI P1/P3-P10/P11/P12 SLICE`; only the returned
+The current scope literal is `MYSQLI P1-P12 SLICE`; only the returned
 case list identifies the cases actually executed. Each P8–P10 A uses one fresh canonical
 second connection at its named consume/preverify/COMMIT seam. The same wrapper retains
 both connector admissions, one checked old close, the original schema CID and a fixed
@@ -282,9 +282,35 @@ and both application logs are empty. CLI completion closes both owned handles;
 any connect/role/persist/close failure remains UNPROVEN and retains each available
 handle trace independently.
 
-P7 remains SQL NOT RUN until a fresh clean-source root allocation and independent
-server receipts accept that case. P2 and genuine native WordPress reconnect remain
-NOT RUN; neither is unlocked by P7 adapter engineering.
+P7 has retained MySQL 8.4.11 acceptance at ECPay
+`817947df182fc1a25280ed5bbb84a519e405d590` with the same fixed pair: one child,
+two canonical handles and distinct IDs, complete B trace, A rollback and exact
+six-table baseline equality, followed by normal owned-server shutdown.
+
+P2 now admits only its existing two-child contention schedule. The controller
+waits for A's `wait-observed` receipt, freshly binds setup/A/B/wait phase, roles,
+scopes and IDs, and requires one exact data_lock_waits join row for the allocated
+database, subscriptions table and PRIMARY key 41. A B pre-dispatch arrival or a
+timeout never grants release. The shared finite oracle independently rebuilds the
+observer SQL hash; the final verdict additionally requires that exact SQL to have
+been dispatched on A with the same successful raw row. One create-exclusive
+`MYSQLI CONTENTION RELEASE` binds the complete wait proof and A's observer ID;
+the parent owns no connection. Its exact keys, scope, prior digest and ID are
+revalidated by the evidence collector. Capture controls keep their prior scope.
+
+A must complete one profile CAS, one token consume and an ordinary acknowledged
+COMMIT after its named pause. B's actual locked read then sees the committed
+authority, returns `subscription_authority_changed` 409 and rolls back without
+CAS, consume or COMMIT. B's full native SHOW TABLE STATUS row is retained and its
+literal options name/InnoDB engine checked. Both six-table readbacks must equal
+the exact generation-4/consumed-4 durable state. Rehashed false waits, wrong
+identities/scope/predicates/SQL, premature or duplicate releases, altered COMMIT
+presentation and a stale_generation response cannot become acceptance.
+
+P2 is SQL NOT RUN pending a fresh clean-source root allocation and independent
+server receipts. The local IPC, admission and oracle controls prove no SQL.
+Genuine native WordPress reconnect remains NOT RUN with its separate prerequisites;
+the mysqli slice label never supplies native wpdb or other unexecuted case proof.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.

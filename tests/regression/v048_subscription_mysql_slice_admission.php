@@ -32,13 +32,13 @@ try {
             $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case]));
             $check($case.' admits exact source runtime and allocated tuple without a secret or connection',$admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P3','P4','P5','P6','P7','P8','P9','P10','P12a','P12b'] as $case) {
+        foreach(['P2','P3','P4','P5','P6','P7','P8','P9','P10','P12a','P12b'] as $case) {
             $admitted=null; $code='';
             try { $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case])); }
             catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
             $check($case.' slice allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P2','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
+        foreach(['P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['kind'=>'offline-design']),$context),'sql_execution_allocation_required');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$context),'allocation_invalid');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['host'=>'localhost']),$context),'allocation_invalid');
@@ -53,7 +53,7 @@ try {
         $reject(static fn()=>Session::connect($grant),'sql_execution_not_authorized_in_checkpoint');
         $run=['version'=>1,'phase'=>'b2-admission-control','cases'=>['P2'],'allocations'=>['P2'=>$grant],'source_heads'=>$heads,'runtime_sha256'=>$context['runtime_sha256'],'driver'=>'adapter'];
         $admitted=Controller::admit($run,$env,$sources);
-        $reject(static fn()=>Controller::runMysql($admitted,sys_get_temp_dir()),'mysql_slice_case_not_authorized');
+        $reject(static fn()=>Controller::runMysql($admitted,sys_get_temp_dir()),'execution_password_required');
         $run['cases']=['P1']; $run['allocations']=['P1'=>array_replace($grant,['kind'=>'offline-design'])];
         $admitted=Controller::admit($run,$env,$sources);
         $reject(static fn()=>Controller::runMysql($admitted,sys_get_temp_dir()),'sql_execution_allocation_required');
@@ -94,7 +94,7 @@ try {
         $verdict=Evidence::evaluateMysql('P1',[],['A'=>['runtime_receipt'=>['scope'=>'MYSQLI EXECUTION']],'B'=>['runtime_receipt'=>['scope'=>'MYSQLI EXECUTION']]],[]);
         $check('scope relabel cannot manufacture SQL acceptance',false===$verdict['matches'] && 'UNPROVEN'===$verdict['sql_execution']);
         $verdict=Evidence::evaluateMysql('P2',[],[],[]);
-        $check('SQL evaluator never widens slice to contention',false===$verdict['matches'] && in_array('mysql_slice_case_not_authorized',$verdict['errors'],true));
+        $check('P2 admission alone cannot prove contention SQL',false===$verdict['matches'] && ['baseline_invalid']===$verdict['errors'] && 'UNPROVEN'===$verdict['sql_execution']);
     }
     // These literal expectations cover the escaping difference observed in real P1 seed SQL.
     // This is a zero-connection oracle control, not another native SQL execution.
@@ -201,6 +201,21 @@ try {
     }
     $ordinary=[$statement('commit','COMMIT','unrelated-fault',$ok,$ok)];
     $oracleCheck('mysqli does not accept an arbitrary fault on ordinary SQL',static fn()=>$statements->invoke(null,'P1','A',$ordinary,true),'mysql_statement_invalid');
+    $p2=[$statement('commit','COMMIT','pause-before-commit',$ok,$ok)];
+    $oracleCheck('P2 pause retains a sent COMMIT with ordinary successful acknowledgement',static fn()=>$statements->invoke(null,'P2','A',$p2,true));
+    foreach(['role','case','kind','origin','label','unsent','actual-failed','ack-loss'] as $break) {
+        $bad=$p2; $role='A'; $case='P2';
+        if('role'===$break) { $role='B'; }
+        if('case'===$break) { $case='P1'; }
+        if('kind'===$break) { $bad[0]['kind']='read-or-setup'; }
+        if('origin'===$break) { $bad[0]['origin']='observer'; }
+        if('label'===$break) { $bad[0]['fault']='foreign-pause'; }
+        if('unsent'===$break) { $bad[0]['sent']=false; $bad[0]['actual']=null; }
+        if('actual-failed'===$break) { $bad[0]['actual']=['error'=>'fixture_actual_commit_failed','rows'=>[],'affected'=>false]; $bad[0]['presented']=$bad[0]['actual']; }
+        if('ack-loss'===$break) { $bad[0]['presented']=['error'=>'fixture_ack_lost','rows'=>[],'affected'=>false]; }
+        $expected=match($break){'unsent','actual-failed'=>'statement_result_invalid','ack-loss'=>'statement_presentation_invalid',default=>'mysql_statement_invalid'};
+        $oracleCheck('P2 ordinary COMMIT rejects '.$break,static fn()=>$statements->invoke(null,$case,$role,$bad,true),$expected);
+    }
     // Native replacement fragments test precise oracle boundaries, never SQL acceptance.
     $newId=['connection_id'=>'9103','database'=>$grant['database'],'owner_nonce'=>null];
     foreach(['P8'=>['consume','replace-before-consume'],'P9'=>['session-verify','replace-before-verify'],'P10'=>['commit','replace-before-commit']] as $case=>[$kind,$label]) {
