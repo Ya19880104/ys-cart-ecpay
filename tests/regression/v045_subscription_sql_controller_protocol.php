@@ -85,6 +85,32 @@ if ( $available ) {
 	$privateBytes=file_get_contents($privateOut).file_get_contents($privateErr).json_encode($privateCommand);
 	$check('private stdin token and inherited password sentinel never enter argv or retained output',0===$privateRc && !str_contains($privateBytes,$privatePacket['token']) && !str_contains($privateBytes,$secretSentinel) && 0===filesize($privateErr));
 	$supervisor=new ReflectionMethod(Controller::class,'supervise');
+	// One owned IPC child represents two P7 handles; these headers do not prove SQL.
+	foreach(['normal','missing-b','extra-role','same-ref','foreign-phase','foreign-case','wrong-peer-role','topology','one-connect','three-connects','child-b','ordinary-double','stderr','exit'] as $failure) {
+		$phase='p7-envelope-'.$failure; $barrier=\YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::createPhase($scratch,$phase); $refs=[];
+		foreach(['A','B'] as $role) {
+			$header=['version'=>1,'phase'=>$phase,'case'=>'P7','role'=>$role,'topology'=>'one-worker-two-handles'];
+			if('B'===$role) {
+				if('foreign-phase'===$failure) { $header['phase']='foreign'; }
+				if('foreign-case'===$failure) { $header['case']='P1'; }
+				if('wrong-peer-role'===$failure) { $header['role']='A'; }
+				if('topology'===$failure) { $header['topology']='two-workers'; }
+			}
+			$refs[$role]=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),'p7-'.strtolower($role).'-worker.json',$header);
+		}
+		if('missing-b'===$failure) { unset($refs['B']); }
+		if('extra-role'===$failure) { $refs['C']=$refs['A']; }
+		if('same-ref'===$failure) { $refs['B']=$refs['A']; }
+		$case='ordinary-double'===$failure?'P1':'P7'; $role='child-b'===$failure?'B':'A';
+		$body=['version'=>1,'phase'=>$phase,'case'=>$case,'role'=>$role,'scope'=>'MYSQLI TWO-HANDLE WORKER','token_digest'=>str_repeat('a',64),'connection_attempts'=>'one-connect'===$failure?1:('three-connects'===$failure?3:2),'sql_execution'=>'EXECUTED','receipts'=>$refs];
+		$base=$barrier->path().'/owned'; $command=[PHP_BINARY,'-n','-r','echo stream_get_contents(STDIN);'.('stderr'===$failure?'fwrite(STDERR,"x");':'').('exit'===$failure?'exit(3);':'')];
+		$child=proc_open($command,[0=>['pipe','r'],1=>['file',$base.'.stdout.txt','x'],2=>['file',$base.'.stderr.txt','x']],$pipes);
+		fwrite($pipes[0],json_encode($body)); fclose($pipes[0]); $caught=''; $observed=null;
+		try { $observed=$supervisor->invoke(null,[['process'=>$child,'base'=>$base,'case'=>$case,'role'=>$role,'phase'=>$phase,'token_digest'=>str_repeat('a',64),'command'=>$command,'mysql'=>true]],1000); }
+		catch(SubscriptionSqlFailure $error) { $caught=$error->getMessage(); }
+		finally { if(is_resource($child)) { proc_terminate($child); proc_close($child); } }
+		$check('P7 single-child two-role envelope '.$failure.' has zero-DB custody','normal'===$failure ? ''===$caught && 1===count($observed['workers']) && $observed['workers'][0]['result']['receipts']===$refs : 'worker_result_invalid'===$caught);
+	}
 	foreach(['partial','missing','wrong-phase','wrong-role','timeout'] as $failure) {
 		$body=['version'=>1,'phase'=>'expected','case'=>'P1','role'=>'A','scope'=>'IPC ONLY','token_digest'=>str_repeat('0',64),'connection_attempts'=>0,'sql_execution'=>'NOT RUN'];
 		if('wrong-phase'===$failure) { $body['phase']='foreign'; } if('wrong-role'===$failure) { $body['role']='B'; }

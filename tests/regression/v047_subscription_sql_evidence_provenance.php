@@ -62,6 +62,36 @@ if ( $available ) {
 					'fault-role'=>static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'A'===$name) { $value['fault_receipt']['role']='B'; } return $value; },
 					'session-extra'=>static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'B'===$name) { $value['session_receipts']['unknown']=true; } return $value; },
 				];
+				if('P7'===$case) {
+					$changes['p7-topology']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind) { $value['topology']='two-workers'; } return $value; };
+					$changes['p7-missing-global-prefix']=static function(string $kind,string $name,mixed $value):mixed { if('worker'===$kind && 'B'===$name) { $value['statement_receipts']=array_slice($value['statement_receipts'],11); foreach($value['statement_receipts'] as $i=>&$s) { $s['sequence']=$i+1; } unset($s); } return $value; };
+					$changes['p7-readback-disagreement']=static function(string $kind,string $name,mixed $value) use($control):mixed { if('worker'===$kind && 'A'===$name) { $value['readback_receipt'][$control['base']['prefix'].'options'][0]['option_value']='wrong-readback'; } return $value; };
+					$aid=$control['workers']['A']['session_receipts']['identity']['connection_id'];
+					$changes['p7-same-physical-id']=static function(string $kind,string $name,mixed $value) use($aid):mixed {
+						if('marker'===$kind && str_contains($name,'-b-')) { $value['connection_id']=$aid; }
+						if('worker'===$kind && 'B'===$name) {
+							$value['session_receipts']['identity']['connection_id']=$aid;
+							foreach($value['statement_receipts'] as &$s) {
+								foreach(['before_identity','after_identity'] as $key) { if(null!==$s[$key]['connection_id']) { $s[$key]['connection_id']=$aid; } }
+								if('session-verify'===$s['kind']) { $s['actual']['rows'][0]['cid']=$aid; $s['presented']=$s['actual']; }
+							} unset($s);
+						} return $value;
+					};
+					foreach(['UPDATE owned_fixture SET value = 1','START TRANSACTION','COMMIT','ROLLBACK'] as $i=>$sql) { $changes['p7-B-write-'.$i]=static function(string $kind,string $name,mixed $value) use($sql):mixed { if('worker'===$kind && 'B'===$name) { $s=end($value['statement_receipts']); $s['sequence']=count($value['statement_receipts'])+1; $s['origin']='product'; $s['kind']='read-or-setup'; $s['sql']=$sql; $s['sql_sha256']=hash('sha256',$sql); $s['actual']=$s['presented']=['error'=>'','rows'=>[],'affected'=>0]; $value['statement_receipts'][]=$s; } return $value; }; }
+					// Exercise only the private finite SQL schedule with native-shaped rows.
+					// No mysqlProof/schema admission is supplied, so this is not SQL acceptance.
+					$schedule=new ReflectionMethod(Evidence::class,'dispatchProof'); $native=$control['workers'];
+					$native['B']['mysql_receipt']=['schema'=>['before'=>[],'reads'=>[]]];
+					foreach($native['B']['statement_receipts'] as &$s) { $s['actual']['affected']=count($s['actual']['rows']); $s['presented']=$s['actual']; } unset($s);
+					$status=['Name'=>$control['base']['prefix'].'options','Engine'=>'InnoDB','Version'=>'10','Row_format'=>'Dynamic','Rows'=>'2'];
+					$native['B']['statement_receipts'][0]['actual']['rows']=[$status]; $native['B']['statement_receipts'][0]['presented']=$native['B']['statement_receipts'][0]['actual'];
+					foreach(['normal','foreign-name','wrong-engine'] as $variant) {
+						$input=$native;
+						if('normal'!==$variant) { $input['B']['statement_receipts'][0]['actual']['rows'][0]['foreign-name'===$variant?'Name':'Engine']='foreign-name'===$variant?'foreign_options':'MyISAM'; $input['B']['statement_receipts'][0]['presented']=$input['B']['statement_receipts'][0]['actual']; }
+						$code=''; try { $schedule->invoke(null,'P7','B',$control['base'],$input,$control['artifacts']['root'],true); } catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
+						$check('P7 native-shaped full SHOW rows '.$variant.' retain exact SQL schedule','normal'===$variant?''===$code:'mysql_table_status_invalid'===$code);
+					}
+				}
 				// Independent, fully rehashed contradictions: a valid artifact hash is not SQL proof.
 				if('P1'===$case) {
 					foreach(['actual-failed','presented-untyped','actual-error-type','actual-affected-type','actual-extra','presented-diverged','kind-untyped','observer-write','setup-unknown-write'] as $break) {

@@ -5,13 +5,13 @@ namespace YSCartEcpay\Tests\Live;
 require_once __DIR__ . '/SubscriptionSqlScenario.php';
 final class SubscriptionSqlEvidence {
 	public static function assertMysqlCase(string $case):void {
-		if(!in_array($case,['P1','P3','P4','P5','P6','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
+		if(!in_array($case,['P1','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b'],true)) { throw new SubscriptionSqlFailure('mysql_slice_case_not_authorized'); }
 	}
 	public static function evaluateMysql(string $case,array $baseline,array $workers,array $artifacts):array {
 		$errors=[];
 		try { self::assertMysqlCase($case); self::collect($case,$baseline,$workers,$artifacts,true); }
 		catch(SubscriptionSqlFailure $e) { $errors[]=$e->getMessage(); }
-		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P6/P8-P10/P11/P12 SLICE'];
+		return ['matches'=>[]===$errors,'errors'=>$errors,'sql_execution'=>[]===$errors?'EXECUTED':'UNPROVEN','scope'=>'MYSQLI P1/P3-P10/P11/P12 SLICE'];
 	}
 	public static function cases(): array {
 		$names = [ 'P1','P2','P3','P4','P5','P6','P7','P8','P9','P10','P11a','P11b','P11c','P11d','P11e','P11f','P11g','P11h','P12a','P12b' ];
@@ -113,7 +113,8 @@ final class SubscriptionSqlEvidence {
 			}
 			self::faultProof($case,$role,$w,$mysql);
 		}
-		if($mysql) { self::need($workers['A']['session_receipts']['identity']['connection_id']!==$workers['B']['session_receipts']['identity']['connection_id'] && $workers['A']['session_receipts']['identity']['database']===$workers['B']['session_receipts']['identity']['database'] && $workers['A']['mysql_receipt']['connector']['allocation']===$workers['B']['mysql_receipt']['connector']['allocation'],'mysql_physical_pair_invalid'); }
+		if($mysql || 'P7'===$case) { self::need($workers['A']['session_receipts']['identity']['connection_id']!==$workers['B']['session_receipts']['identity']['connection_id'] && $workers['A']['session_receipts']['identity']['database']===$workers['B']['session_receipts']['identity']['database'],'mysql_physical_pair_invalid'); }
+		if($mysql) { self::need($workers['A']['mysql_receipt']['connector']['allocation']===$workers['B']['mysql_receipt']['connector']['allocation'],'mysql_physical_pair_invalid'); }
 		if($mysql && in_array($case,['P8','P9','P10'],true)) { self::need($workers['A']['mysql_receipt']['schema']['server']['connection_id']!==$workers['B']['session_receipts']['identity']['connection_id'],'mysql_physical_pair_invalid'); }
 		// Admit both workers before dispatch consumes any peer identity or interference bytes.
 		foreach(['A','B'] as $role) {
@@ -126,7 +127,7 @@ final class SubscriptionSqlEvidence {
 		$afterTables=$workers['B']['readback_receipt']; self::need(is_array($afterTables),'readback_missing');
 		// P6's poisoned A cannot query again. Its null readback/close proof was checked above;
 		// B still supplies the complete schema-validated rows and unchanged-pair proof below.
-		if($mysql && 'P6'!==$case) { self::need($workers['A']['readback_receipt']===$afterTables,'mysql_readback_disagreement'); }
+		if(($mysql && 'P6'!==$case) || 'P7'===$case) { self::need($workers['A']['readback_receipt']===$afterTables,'mysql_readback_disagreement'); }
 		$after=self::pair($afterTables,$base['prefix'],$base['token_digest']);
 		$expectedTables=$base['tables'];
 		if(in_array($case,['P1','P2','P4'],true)) {
@@ -346,7 +347,7 @@ final class SubscriptionSqlEvidence {
 		$option=static function(string $bytes,int $count=1,string $origin='product') use($read,$optionRead):void { for($i=0;$i<$count;++$i) { $read($optionRead,[['option_value'=>$bytes]],$origin); } };
 		$original=$tables[$prefix.'options'][1]['option_value'];
 		// P7's switched global handle legitimately precedes B's own worker observation.
-		if('P7'===$case && 'B'===$role) { $read($show,[['Engine'=>'InnoDB']]); $option($original,4); $snapshot($tables); }
+		if('P7'===$case && 'B'===$role) { $read($show,$statusRows()); $option($original,4); $snapshot($tables); }
 		$add('observer','session-verify',$sessionSql);
 		if($mysql) {
 			$schema=$w['mysql_receipt']['schema'];

@@ -35,7 +35,9 @@ final class SubscriptionSqlWorker {
 		if($mysql) {
 			SubscriptionSqlEvidence::assertMysqlCase($case);
 			$execution=$a->executionReceipt();
-			if(null!==$b || null===$execution || $execution['allocation']!==$p['allocation'] || $execution['context']['case']!==$case || $execution['context']['source_heads']!==$p['source_heads']) { throw new SubscriptionSqlFailure('mysql_session_required'); }
+			$pair='P7'===$case && 'A'===$role;
+			if(null===$execution || $execution['allocation']!==$p['allocation'] || $execution['context']['case']!==$case || $execution['context']['source_heads']!==$p['source_heads']
+				|| ($pair ? null===$b || $b->isCapture() || null===$b->executionReceipt() || $b->executionReceipt()['allocation']!==$execution['allocation'] || $b->executionReceipt()['context']!==$execution['context'] : null!==$b)) { throw new SubscriptionSqlFailure('mysql_session_required'); }
 		} elseif(null!==$b && !$b->isCapture()) { throw new SubscriptionSqlFailure('worker_session_invalid'); }
 		if ( ! $a->ready || $a->prefix !== $p['allocation']['prefix'] || basename( $barrier->path() ) !== $p['phase'] || ( null !== $b && ( $b === $a || $b->prefix !== $a->prefix || ! $b->ready ) )
 			|| ( !$mysql && 'A' === $role && in_array( $case, ['P7','P8','P9','P10'], true ) && null === $b ) ) { throw new SubscriptionSqlFailure( 'worker_session_invalid' ); }

@@ -2,7 +2,7 @@
 
 The offline modes validate an allocation and exact product sources, or capture
 product-generated DDL, without connecting. B2 adds a separately admitted real
-mysqli execution path for **P1, P3–P6, P8–P10, P11a–h and P12a–b only**. Its implementation and offline
+mysqli execution path for **P1, P3–P10, P11a–h and P12a–b only**. Its implementation and offline
 regressions do not prove SQL acceptance: each case still requires a reviewed clean
 source, a fresh root allocation, and actual server/worker/readback receipts.
 The old `live_subscription_selection_two_connections.php` is a separate runner;
@@ -46,7 +46,7 @@ Use the same CLI with `--driver=adapter --mode=execute --phase=<unique-phase>
 --evidence-root=<existing-local-directory>`. `YS_ECPAY_SQL_RUN` points to the
 nonsecret B1 run envelope: exact keys `version,phase,cases,allocations,source_heads,
 runtime_sha256,driver`, version 1, driver `adapter`. Cases are an ordered unique
-subset of `P1,P3,P4,P5,P6,P8,P9,P10,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h,P12a,P12b`; every case has a distinct
+subset of `P1,P3,P4,P5,P6,P7,P8,P9,P10,P11a,P11b,P11c,P11d,P11e,P11f,P11g,P11h,P12a,P12b`; every case has a distinct
 prefix and its own seven-key `sql-execution` allocation. Every other SQL case is
 rejected before a phase or worker is created.
 
@@ -57,9 +57,12 @@ each private child its allocated prefix. No credential defaults, password argume
 packet dumps, or retained secret configuration exist. The worker rechecks allocation
 expiry, case, exact tuple, runtime and clean source immediately before connecting.
 Caller connector callbacks and supplied/capture handles cannot acquire admission.
+Only P7/A receives a second handle created by the same canonical connector inside
+the owned CLI child; both complete allocation/context receipts must match.
 
-The parent creates no database connection. Each worker initially owns one physical mysqli
-session; only P8–P10 A replaces its connection once. B remains in autocommit and reads after A's completion. A first verifies
+The parent creates no database connection. Ordinary workers initially own one physical mysqli
+session; only P8–P10 A replaces its connection once. P7 uses one child with two
+independent physical handles and two role receipts, as detailed below. B remains in autocommit and reads after A's completion. A first verifies
 the MySQL 8.4 server/session and absence of all six literal names in the assigned
 existing disposable database, then executes the actual five TableMaker CREATEs and
 the options fixture. Both workers verify all captured columns and indexes plus
@@ -230,7 +233,7 @@ paired with the fixed Core/Affiliate anchors. P3–P6 have separate retained MyS
 acceptance at ECPay `bd4f7189ac83032049b35a7dfb1fd6cfcf5a303c` with those same anchors.
 P8–P10 have separate retained MySQL 8.4.11 acceptance at ECPay
 `2338306ccd5ca6e9c4d698f5dfe16f6bd9ffbaef` with those same anchors.
-The current scope literal is `MYSQLI P1/P3-P6/P8-P10/P11/P12 SLICE`; only the returned
+The current scope literal is `MYSQLI P1/P3-P10/P11/P12 SLICE`; only the returned
 case list identifies the cases actually executed. Each P8–P10 A uses one fresh canonical
 second connection at its named consume/preverify/COMMIT seam. The same wrapper retains
 both connector admissions, one checked old close, the original schema CID and a fixed
@@ -251,9 +254,37 @@ and immediate readback. P12a retains claim-time principal rejection after profil
 CAS; P12b tests the actual Store BINARY CAS against retained old bytes. Neither
 commits A: the original profile and only B's declared selection delta survive rollback.
 Both retain full six-table equality, exact SQL sent/results/counts and empty logs.
-P12a–b still require their own reviewed clean-source real SQL receipts; IPC/capture
-controls and release markers do not prove SQL execution. P2/P7 and genuine native
-WordPress reconnect remain NOT RUN.
+P12a–b have separate retained MySQL 8.4.11 acceptance at ECPay
+`7ab883972ed870728885245656b69f7b0cfc792c` with the same fixed pair: two cases,
+four workers/connections, parent zero, exact interference deltas and rollback
+readback, followed by normal owned-server shutdown. IPC/capture controls and
+release markers alone never prove SQL execution.
+
+P7 now has a finite one-child/two-handle execution path. The controller launches
+only A; that CLI creates canonical A and B, runs the existing A(a,b) schedule and
+then B(b,null) using the same B object. Its single `MYSQLI TWO-HANDLE WORKER`
+stdout envelope has role A, connection_attempts=2 and exactly two `receipts` refs,
+A and B. The two role receipts share the actual child stderr stream; each retains
+its own application log. The parent reopens both refs and validates phase/case/role
+and topology, while continuing to report one process. Ordinary single-receipt
+envelopes remain unchanged.
+
+The swap occurs once after A profile CAS and immediately before the actual Plugin
+claim; the captured transaction object/fence remains A. B retains every read made
+through the swapped global, including its initial full SHOW TABLE STATUS, four
+selection reads and six-table snapshot before B role initialization. Its later
+session/schema/final reads stay in the same trace; no trace reset, early synthetic
+identity, replacement or third connection is added. Real Store rejection returns
+claim_rejected; A consumes/commits nothing and rolls back on A. B performs no
+writes or transaction commands and remains usable. Both role readbacks must equal
+the complete original six-table baseline. All SQL is sent, actual equals presented,
+and both application logs are empty. CLI completion closes both owned handles;
+any connect/role/persist/close failure remains UNPROVEN and retains each available
+handle trace independently.
+
+P7 remains SQL NOT RUN until a fresh clean-source root allocation and independent
+server receipts accept that case. P2 and genuine native WordPress reconnect remain
+NOT RUN; neither is unlocked by P7 adapter engineering.
 Still NOT IMPLEMENTED: historical dbeb split-state loader/control, materialized-period/YSOrder
 guard, full provider lifecycle/catalog and actual renewal order/charge coverage.
 Native `class-wpdb.php` path/version/hash prerequisites remain UNSATISFIED.

@@ -26,15 +26,31 @@ try {
 		$runtime=$packet['runtime_sha256']; unset($packet['runtime_sha256'],$private);
 		$packet=\YSCartEcpay\Tests\Live\SubscriptionSqlWorker::validatePacket($packet);
 		if($options['role']!==$packet['role'] || $options['phase']!==$packet['phase']) { throw new SubscriptionSqlFailure('worker_packet_invalid'); }
+		$pair='P7'===$packet['case'];
+		if($pair && 'A'!==$packet['role']) { throw new SubscriptionSqlFailure('worker_packet_invalid'); }
 		$barrier=Barrier::attach($options['evidence-root'],$options['phase']);
-		$session=Session::connect($packet['allocation'],null,['case'=>$packet['case'],'source_heads'=>$packet['source_heads'],'runtime_sha256'=>$runtime]);
-		try { $worker=\YSCartEcpay\Tests\Live\SubscriptionSqlWorker::run($packet,$session,null,$barrier); } finally { $session->close(); }
+		$handles=[]; $workers=[]; $context=['case'=>$packet['case'],'source_heads'=>$packet['source_heads'],'runtime_sha256'=>$runtime];
+		try {
+			$handles[$packet['role']]=$session=Session::connect($packet['allocation'],null,$context);
+			if($pair) { $handles['B']=Session::connect($packet['allocation'],null,$context); }
+			$workers[$packet['role']]=\YSCartEcpay\Tests\Live\SubscriptionSqlWorker::run($packet,$session,$pair?$handles['B']:null,$barrier);
+			if($pair) { $peer=$packet; $peer['role']='B'; $workers['B']=\YSCartEcpay\Tests\Live\SubscriptionSqlWorker::run($peer,$handles['B'],null,$barrier); unset($peer); }
+		} finally {
+			$closeFailed=false;
+			foreach($handles as $owned) { try { if(!$owned->close()) { $closeFailed=true; } } catch(Throwable $closeError) { $closeFailed=true; } }
+			if($closeFailed) { throw new SubscriptionSqlFailure('worker_close_failed'); }
+		}
 		$base=$barrier->path().'/'.strtolower($packet['case'].'-'.$packet['role']);
 		$stderr=$base.'.stderr.txt';
 		if(!is_file($stderr) || 0!==filesize($stderr)) { throw new SubscriptionSqlFailure('worker_diagnostics_invalid'); }
-		$worker['diagnostics']['stderr']=['path'=>realpath($stderr),'bytes'=>0,'sha256'=>hash_file('sha256',$stderr)];
-		$ref=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),strtolower($packet['case'].'-'.$packet['role']).'-worker.json',$worker);
-		$protocol=['version'=>1,'phase'=>$packet['phase'],'case'=>$packet['case'],'role'=>$packet['role'],'scope'=>'MYSQLI WORKER','token_digest'=>hash('sha256',$packet['token']),'connection_attempts'=>Session::connectionAttempts(),'sql_execution'=>'EXECUTED','receipt'=>$ref];
+		$refs=[];
+		foreach($workers as $role=>$worker) {
+			// P7 has one actual child stderr stream shared by its two role receipts.
+			$worker['diagnostics']['stderr']=['path'=>realpath($stderr),'bytes'=>0,'sha256'=>hash_file('sha256',$stderr)];
+			$refs[$role]=\YSCartEcpay\Tests\Live\SubscriptionSqlEvidence::persist($barrier->path(),strtolower($packet['case'].'-'.$role).'-worker.json',$worker);
+		}
+		$protocol=['version'=>1,'phase'=>$packet['phase'],'case'=>$packet['case'],'role'=>$packet['role'],'scope'=>$pair?'MYSQLI TWO-HANDLE WORKER':'MYSQLI WORKER','token_digest'=>hash('sha256',$packet['token']),'connection_attempts'=>Session::connectionAttempts(),'sql_execution'=>'EXECUTED'];
+		$protocol[$pair?'receipts':'receipt']=$pair?$refs:$refs[$packet['role']];
 		unset($packet); echo json_encode($protocol,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n"; exit(0);
 	}
 	if ( 'ipc-worker' === ( $options['mode'] ?? '' ) ) {
@@ -104,10 +120,16 @@ catch ( Throwable $error ) { $result['success'] = false; $result['code'] = 'harn
 $result['connection_attempts'] = Session::connectionAttempts();
 if('mysql-worker'===($options['mode']??null) && $result['connection_attempts']>0) {
 	$result['sql_execution']='UNPROVEN';
-	if(isset($session,$barrier,$packet)) {
-		$result['sql_statements']=$session->dispatches;
-		try { $result=array_replace($result,$session->failureEvidence($barrier->path(),strtolower($packet['case'].'-'.$packet['role']).'-failed-worker.json')); }
-		catch(Throwable $persistenceError) { $result['failure_trace_unavailable']=true; }
+	if(isset($barrier,$packet)) {
+		$result['sql_statements']=0;
+		foreach($handles??[] as $role=>$owned) {
+			$result['sql_statements']+=$owned->dispatches;
+			try {
+				$failure=$owned->failureEvidence($barrier->path(),strtolower($packet['case'].'-'.$role).'-failed-worker.json');
+				if('P7'===$packet['case']) { $result['failure_traces'][$role]=$failure['failure_trace']; }
+				else { $result=array_replace($result,$failure); }
+			} catch(Throwable $persistenceError) { $result['failure_trace_unavailable']=true; }
+		}
 	}
 }
 echo json_encode( $result, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR ) . "\n";

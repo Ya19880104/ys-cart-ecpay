@@ -32,13 +32,13 @@ try {
             $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case]));
             $check($case.' admits exact source runtime and allocated tuple without a secret or connection',$admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P3','P4','P5','P6','P8','P9','P10','P12a','P12b'] as $case) {
+        foreach(['P3','P4','P5','P6','P7','P8','P9','P10','P12a','P12b'] as $case) {
             $admitted=null; $code='';
             try { $admitted=Session::admitExecution($grant,array_replace($context,['case'=>$case])); }
             catch(SubscriptionSqlFailure $error) { $code=$error->getMessage(); }
             $check($case.' slice allocation admits without credentials or a connection',''===$code && $admitted===$grant && 0===Session::connectionAttempts());
         }
-        foreach(['P2','P7','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
+        foreach(['P2','P11','unknown'] as $case) { $reject(static fn()=>Session::admitExecution($grant,array_replace($context,['case'=>$case])),'mysql_slice_case_not_authorized'); }
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['kind'=>'offline-design']),$context),'sql_execution_allocation_required');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['expires_at'=>time()-1]),$context),'allocation_invalid');
         $reject(static fn()=>Session::admitExecution(array_replace($grant,['host'=>'localhost']),$context),'allocation_invalid');
@@ -296,6 +296,12 @@ try {
         $trace=$nestedDb->statements();
         $check('pending actual claim retains consume provenance and original dispatch bytes',$claimed && 4===count($trace) && 'consume'===$trace[2]['kind'] && $update===$trace[2]['sql'] && $trace[2]['sequence']<$trace[3]['sequence']);
     } finally { $nestedDb->instrument(null,null); $nestedDb->close(); $GLOBALS['wpdb']=$oldDb; }
+    $peerPhase='p7-independent-b'; \YSCartEcpay\Tests\Live\SubscriptionSqlBarrier::createPhase($cliRoot,$peerPhase);
+    $peerPacket=['version'=>1,'phase'=>$peerPhase,'case'=>'P7','role'=>'B','allocation'=>$grant,'source_heads'=>$heads,'token'=>str_repeat('T',32),'runtime_sha256'=>$context['runtime_sha256']];
+    $peerOut=$cliRoot.'/p7-b.stdout'; $peerErr=$cliRoot.'/p7-b.stderr';
+    $peerChild=proc_open([PHP_BINARY,'-n',dirname(__DIR__).'/live/live_subscription_product_pair.php','--driver=adapter','--mode=mysql-worker','--role=B','--phase='.$peerPhase,'--evidence-root='.$cliRoot],[0=>['pipe','r'],1=>['file',$peerOut,'x'],2=>['file',$peerErr,'x']],$pipes);
+    fwrite($pipes[0],json_encode($peerPacket)); fclose($pipes[0]); $peerRc=proc_close($peerChild); $peerResult=json_decode((string)file_get_contents($peerOut),true);
+    $check('P7 independent B CLI child is rejected before any connector',2===$peerRc && 0===filesize($peerErr) && 'worker_packet_invalid'===($peerResult['code']??null) && 0===($peerResult['connection_attempts']??null));
     $failureEvidence=method_exists(Session::class,'failureEvidence');
     $check('post-dispatch failure retains partial schema trace with unproven execution',$failureEvidence);
     if($failureEvidence) {
