@@ -50,6 +50,9 @@ namespace YSCartEcpay\Tests\Live {
 			// 補 require 是唯一的修法，因此把這兩個路徑納入允許的後代變更。
 			'tests/regression/v037_subscription_pair_commit_boundary.php',
 			'tests/regression/v039_subscription_account_to_renewal_vertical.php',
+			// 文件：CHANGELOG 記錄的是既成事實，讀不到、也影響不了任何 SQL 證據。
+			// 不放行它等於「以後每一次改動都必須不寫 changelog」，那不是這條 allowlist 的用意。
+			'CHANGELOG.md',
 		];
 		private static function git( string $root, array $args ): string {
 			$process = proc_open( [ 'git', '-C', $root, ...$args ], [ 0 => [ 'pipe', 'r' ], 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );
