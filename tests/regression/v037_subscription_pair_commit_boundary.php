@@ -571,6 +571,9 @@ namespace {
 	require_once $core_root . '/src/Services/Shipping/YSShippingIdentifier.php';
 	require_once $core_root . '/src/Services/Subscription/YSSubscriptionRecurringAmount.php';
 	require_once $core_root . '/src/Utils/YSUtf8.php';
+	// YSFulfillmentSnapshotService 自 Core 2.59.4 併入後改以 YSShippingMethodId::normalize()
+	// 正規化 method_id。這裡是手動 require 鏈、沒有 autoloader，漏掉它就是未捕捉的 fatal。
+	require_once $core_root . '/src/Shipping/YSShippingMethodId.php';
 	require_once $core_root . '/src/Services/Shipping/YSFulfillmentSnapshotService.php';
 	require_once $core_root . '/src/Services/Checkout/YSCheckoutFulfillmentService.php';
 	require_once $core_root . '/src/Services/Subscription/YSSubscriptionFulfillmentProfileService.php';

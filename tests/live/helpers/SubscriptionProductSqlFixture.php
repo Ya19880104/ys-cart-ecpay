@@ -45,6 +45,11 @@ namespace YSCartEcpay\Tests\Live {
 			'tests/regression/v046_subscription_sql_seed_fault_boundaries.php',
 			'tests/regression/v047_subscription_sql_evidence_provenance.php',
 			'tests/regression/v048_subscription_mysql_slice_admission.php',
+			// v037/v039 的手動 require 鏈少了 YSShippingMethodId：Core 2.59.4 併入後
+			// YSFulfillmentSnapshotService 改用它，兩支測試在自己的 pin 上就是 fatal。
+			// 補 require 是唯一的修法，因此把這兩個路徑納入允許的後代變更。
+			'tests/regression/v037_subscription_pair_commit_boundary.php',
+			'tests/regression/v039_subscription_account_to_renewal_vertical.php',
 		];
 		private static function git( string $root, array $args ): string {
 			$process = proc_open( [ 'git', '-C', $root, ...$args ], [ 0 => [ 'pipe', 'r' ], 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );

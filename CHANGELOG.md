@@ -111,6 +111,14 @@
 - `v013` 增補 SDK／文件的 canonical validator custody：釘住 SDK 只有**一份** pattern、map 與
   claim 兩條路徑共用同一個 validator、pattern 與伺服器端 `CartScope` 逐字相同，並實際以
   Node 執行 SDK 驗證兩條路徑都在**發出任何請求之前**就 reject。
+- 修復 `v037`／`v039` 在**自己的 pin 上**就是 fatal 的手動 require 鏈：Core 2.59.4 併入
+  Core 2.61 之後，`YSFulfillmentSnapshotService` 改以 `YSShippingMethodId::normalize()`
+  正規化 `method_id`，而這兩支測試沒有 autoloader、也沒有 require 那個類別，於是
+  `Class ... not found` 直接中止（連帶讓驅動它們的 `v040` 全紅）。補上 require 之後
+  v037 14/0、v039 16/0、v040 10/0。
+  同時把這兩個路徑納入 `SubscriptionProductSqlFixture::ALLOWED_DESCENDANT_PATHS`——
+  該 allowlist 把 ECPay 樹鎖在 pin 上，不擴充就沒辦法修一支在 pin 上本來就紅的測試，
+  而 allowlist 檔案本身就在允許清單內，因此這是它自己規則容許的擴充。
 
 ## 0.3.0 - 2026-08-17（信用卡退款；需 YS CART core >= 2.57.0）
 
