@@ -641,9 +641,8 @@ final class Plugin {
 		if ( '' === $cart_scope || ! preg_match( '/^[a-z0-9_]{1,32}$/D', $cart_scope ) ) {
 			$cart_scope = 'default';
 		}
-		if ( '' === $method_id ) {
-			return null;
-		}
+		// An empty method is a valid virtual checkout: the catalog ownership
+		// check leaves it unhandled, while sealed claims still require ok=true.
 
 		$data['shipping_method'] = $method_id;
 		$data['payment_method']  = $payment_method;

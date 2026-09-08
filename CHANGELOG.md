@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased（需 YS CART core >= 2.58.0）
+## 0.3.1 — Unreleased（需 YS CART core >= 2.58.0）
 
 ### Fixed
 
+- 全數位商品不需配送時，ECPay 不再因空白物流方式攔截其他付款方式的普通結帳；沿用既有型錄歸屬判斷回傳未處理，並保留 typed context 與一次性物流 claim 的驗證。
 - headless `GET /ecpay/store-result` 現在從 query string 讀取 one-time code 與 cart
   scope；先前誤用只解析 JSON／form body 的共用 parser，合法提領一律回 400。
 - headless `GET /ecpay/store-result` 的參數**形狀**現在在解析身分之前就被檢查：`code` 或

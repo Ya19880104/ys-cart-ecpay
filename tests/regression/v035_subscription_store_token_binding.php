@@ -625,6 +625,58 @@ namespace {
 		'subscription_id'    => 41,
 	];
 	$plugin = new Plugin();
+	// Ordinary virtual carts intentionally have no shipping method. A complete
+	// typed context may select no provider; malformed typed contracts still fail.
+	$no_shipping_context = [
+		'cart_items'         => [ [ 'product_id' => 256, 'is_virtual' => true, 'qty' => 1 ] ],
+		'totals'             => [ 'total' => 138.0 ],
+		'method_id'          => '',
+		'payment_method'     => 'ys_ec_bank_transfer',
+		'cart_scope'         => 'default',
+		'zero_payment_order' => false,
+	];
+	$ownership_cases = [
+		'digital guest default cart without a shipping field is unhandled' => [
+			0, [ 'payment_method' => 'ys_ec_bank_transfer' ], $no_shipping_context, false,
+		],
+		'digital member default cart with an empty shipping field is unhandled' => [
+			7, [ 'shipping_method' => '', 'payment_method' => 'ys_ec_bank_transfer' ], $no_shipping_context, false,
+		],
+		'non-ECPay server method wins over a browser-carried ECPay method' => [
+			7, [ 'shipping_method' => $shipping ],
+			array_merge( $no_shipping_context, [ 'method_id' => 'ys_ec_custom_manual' ] ), false,
+		],
+		'non-ECPay method with malformed typed context remains fail-closed' => [
+			7, [ 'shipping_method' => $shipping ], [ 'method_id' => 'ys_ec_custom_manual' ], true,
+		],
+		'ECPay server method with missing typed fields remains fail-closed' => [
+			7, [ 'shipping_method' => 'ys_ec_custom_manual' ], [ 'method_id' => $shipping ], true,
+		],
+		'ECPay server method with a non-boolean zero-total flag remains fail-closed' => [
+			7, [ 'shipping_method' => $shipping ],
+			array_merge( $no_shipping_context, [ 'method_id' => $shipping, 'zero_payment_order' => '0' ] ), true,
+		],
+	];
+	$ownership_before = [ $GLOBALS['wpdb']->rows, $GLOBALS['v035_transients'] ];
+	$ownership_user = $GLOBALS['v035_user_id'];
+	foreach ( $ownership_cases as $label => [ $user_id, $request_data, $request_context, $must_reject ] ) {
+		$GLOBALS['v035_user_id'] = $user_id;
+		$ownership_result = $plugin->resolve_fulfillment_selection( [ 'handled' => false ], $request_data, $request_context );
+		$check(
+			$label,
+			$must_reject
+				? true === ( $ownership_result['handled'] ?? false )
+					&& false === ( $ownership_result['ok'] ?? true )
+					&& 'invalid_fulfillment_context' === ( $ownership_result['code'] ?? '' )
+				: [ 'handled' => false ] === $ownership_result
+		);
+	}
+	$GLOBALS['v035_user_id'] = $ownership_user;
+	$check(
+		'ownership-only decisions leave all existing selection tokens unchanged',
+		$ownership_before === [ $GLOBALS['wpdb']->rows, $GLOBALS['v035_transients'] ]
+	);
+
 	$ordinary_generic = $plugin->resolve_fulfillment_selection(
 		[ 'handled' => false ],
 		$pair_data,
@@ -671,6 +723,28 @@ namespace {
 		'session_database'      => $GLOBALS['wpdb']->dbname,
 		'session_owner_nonce'   => (string) $GLOBALS['wpdb']->session_vars['@ys_profile_tx_owner'],
 	] );
+	$empty_method_claim = $plugin->claim_fulfillment_selection(
+		[ 'handled' => false ], $pair_resolution['claim'] ?? [], $pair_data,
+		array_merge( $pair_claim_context, [ 'method_id' => '' ] )
+	);
+	$malformed_context_claim = $plugin->claim_fulfillment_selection(
+		[ 'handled' => false ], $pair_resolution['claim'] ?? [], $pair_data,
+		array_merge( $pair_claim_context, [ 'zero_payment_order' => '0' ] )
+	);
+	$check(
+		'an already sealed ECPay claim cannot consume a token with an empty method',
+		true === ( $empty_method_claim['handled'] ?? false )
+			&& false === ( $empty_method_claim['ok'] ?? true )
+			&& '' === ( $empty_method_claim['digest'] ?? null )
+			&& 'issued' === $durable_state( $pair_token )
+	);
+	$check(
+		'an already sealed ECPay claim still rejects malformed typed context without consuming its token',
+		true === ( $malformed_context_claim['handled'] ?? false )
+			&& false === ( $malformed_context_claim['ok'] ?? true )
+			&& 'invalid_fulfillment_context' === ( $malformed_context_claim['code'] ?? '' )
+			&& 'issued' === $durable_state( $pair_token )
+	);
 	$pair_claim = $plugin->claim_fulfillment_selection(
 		[ 'handled' => false ],
 		$pair_resolution['claim'] ?? [],
