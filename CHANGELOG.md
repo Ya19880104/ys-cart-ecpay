@@ -1,15 +1,6 @@
 # Changelog
 
-## 0.4.0 - 2026-09-08（需 YS CART core >= 2.58.0）
-
-> 🔴 **破壞性變更**：`cart_scope` 成為 canonical ABI。送非 canonical scope 的呼叫端
-> 會開始收到 400，而不再被靜默改綁——詳見下方「Changed」第一條。第一方 headless SDK
-> （`sdk/ys-cart-ecpay-headless.js`）已套用同一條規則，自寫或第三方呼叫端需自行對齊。
->
-> **本版不宣稱支援信用卡自動退款。** 該路徑自 0.3.0 起就以 `ys_ec_ecpay_auto_refund_enabled`
-> 預設關閉（record-only／manual-only），本版未改變這件事；
-> `docs/credit-refund-sandbox-gate.md` 的實測 gate 仍未完成。
-
+## Unreleased（需 YS CART core >= 2.58.0）
 
 ### Fixed
 
