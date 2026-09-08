@@ -21,7 +21,16 @@ namespace {
 namespace YSCartEcpay\Tests\Live {
 	final class SubscriptionProductSqlFixture {
 		public const CORE = '7c8acd9843fe4507cc39eb18e8bb54bfd6fc3ec1';
-		public const ECPAY = '445adc76c4dc6653abdd228b529bad636eef5d42';
+		// 重新錨定到 v0.4.0 版號確定的那一個 commit。
+		//
+		// 舊 pin 是 445adc76，而 ALLOWED_DESCENDANT_PATHS 不含主檔 ys-cart-ecpay.php，
+		// 因此「推一個版號」就會讓 v041–v048 全部丟 pair_path_not_allowed。
+		// 正確的做法不是把主檔加進 allowlist（那檔還包含 bootstrap，
+		// 放行一次等於永久放行），而是把錨點移到新的產品樹上。
+		// 這幾支測試的證據是每次執行現產（fixture、allocation、receipts
+		// 都在 run 時寫入 scratch），所以「重新錨定 + 重跑」就是在新錨點上
+		// 重取一次證據，不是把閃紅的燈關掉。
+		public const ECPAY = '871f1300e47eb51ab75a1e92d0e88dc63e4cc3e7';
 		public const AFFILIATE = '18c609a1b94cca28e57c2ce4f225f25662555ccd';
 		private const ALLOWED_DESCENDANT_PATHS = [
 			'tests/live/PRODUCT_SQL_OFFLINE.md',
