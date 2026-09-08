@@ -4,7 +4,7 @@
  *
  * 這條測試已經是第四版；前三個缺口都讓它變成 false GREEN：
  *   1. 以 `glob + rsort` 取「現存最新」ZIP——版號推進後會驗一個陳舊的包並回報 PASS。
- *      現鎖定 plugin header 的當前版號。
+ *      現鎖定 exact HEAD plugin header 的版號。
  *   2. 只斷言「幾個必含 entry ＋ 一份 src/Plugin.php bytes」——手工打的 0.2.11 漏掉
  *      整個 skills/、又收進政策上排除的 CHANGELOG.md，測試仍全綠；其餘 49 個檔案
  *      也可以是任意舊版本。現改為精確集合 ＋ 全量 bytes。
@@ -25,6 +25,7 @@ declare(strict_types=1);
 $root = str_replace('\\', '/', dirname(__DIR__, 2));
 
 require_once $root . '/bin/release-policy.php';
+require_once $root . '/bin/release-source.php';
 
 $slug = ys_cart_ecpay_release_slug();
 
@@ -43,6 +44,14 @@ $abort = static function (string $message): void {
     fwrite(STDERR, $message . "\n");
     exit(1);
 };
+
+// 集合、版號與內容綁同一顆 HEAD；checkout 的 CRLF 和未追蹤檔案不是出貨來源。
+try {
+    $scan = ys_cart_ecpay_release_head($root);
+    $builderSource = ys_cart_ecpay_release_git($root, ['cat-file', 'blob', $scan['head'] . ':bin/build-release.php']);
+} catch (RuntimeException $error) {
+    $abort($error->getMessage());
+}
 
 // ── A. 政策本身的反例（先驗工具，再用工具驗產物）──────────────────────────
 
@@ -127,7 +136,7 @@ $assert(
 );
 
 $assert(
-    str_contains((string) file_get_contents($root . '/bin/build-release.php'), "require_once __DIR__ . '/release-policy.php'"),
+    str_contains($builderSource, "require_once __DIR__ . '/release-policy.php'"),
     '(A4) builder 與本測試共用同一份 policy（不得各自抄一份排除規則）'
 );
 
@@ -187,13 +196,13 @@ $assert(
     '(A7) 完全重複與 case-fold 碰撞分別回報，訊息可辨識'
 );
 
-// ── B. 當前 source 版號 ─────────────────────────────────────────────────────
+// ── B. exact HEAD source 版號 ───────────────────────────────────────────────
 
-$pluginFile = $root . '/' . $slug . '.php';
-if (!is_file($pluginFile)) {
-    $abort("Plugin main file not found: {$pluginFile}");
+$pluginFile = $scan['head'] . ':' . $slug . '.php';
+if (!isset($scan['bytes'][$slug . '.php'])) {
+    $abort("Committed plugin main file not found: {$pluginFile}");
 }
-$pluginSource = (string) file_get_contents($pluginFile);
+$pluginSource = $scan['bytes'][$slug . '.php'];
 
 if (!preg_match('/^\s*\*\s*Version:\s*(\S+)\s*$/m', $pluginSource, $m)) {
     $abort("Unable to read plugin version header from {$pluginFile}");
@@ -209,11 +218,10 @@ if ($cm[1] !== $version) {
 
 // ── C. eligible 集合（共用政策）─────────────────────────────────────────────
 
-$scan = ys_cart_ecpay_release_scan($root);
-$assert([] === $scan['links'], '(C1) 工作目錄無 symlink（addFile 會跟隨 symlink 把目標內容打進包裡）');
+$assert([] === $scan['links'], '(C1) eligible HEAD entries 無 symlink 或不支援的 Git object');
 
 if (!$scan['files']) {
-    $abort('Derived an empty eligible file set — the exclusion policy or the working tree is wrong.');
+    $abort('Derived an empty eligible HEAD file set — the exclusion policy or the committed tree is wrong.');
 }
 
 // 交付面錨點：各自代表一整塊曾被漏掉的交付內容，單獨斷言以取得可讀的失敗訊息。
@@ -247,12 +255,14 @@ foreach ($mustNotShip as $forbidden) {
     if (in_array($forbidden, $scan['files'], true)) {
         $shipLeaks[] = $forbidden;
     }
-    if (!is_file($root . '/' . $forbidden)) {
+    try {
+        ys_cart_ecpay_release_git($root, ['cat-file', '-e', $scan['head'] . ':' . $forbidden]);
+    } catch (RuntimeException $error) {
         $missingDocs[] = $forbidden;
     }
 }
 $assert([] === $shipLeaks, '(C4) 內部 release runbook 不隨包出貨（' . (implode(', ', $shipLeaks) ?: '無洩漏') . '）');
-$assert([] === $missingDocs, '(C5) 該 runbook 仍保留在 repo（排除 ≠ 刪除）');
+$assert([] === $missingDocs, '(C5) 該 runbook 仍保留在 HEAD（排除 ≠ 刪除）');
 $assert(
     null === ys_cart_ecpay_release_exclusion_reason('docs/headless.md'),
     '(C6) 排除以 exact path 為準——docs/ 底下的其他文件仍應出貨'
@@ -344,7 +354,7 @@ $sourceCollisions = ys_cart_ecpay_release_collision_problems(ys_cart_ecpay_relea
 $assert([] === $sourceCollisions, '(E5) eligible 來源集合本身無碰撞（' . (implode('; ', $sourceCollisions) ?: '無') . '）');
 
 // 順序契約：碰撞判定必須早於 unlink，否則一次失敗的建置會順手毀掉上一份可用產物。
-$builderSrc  = str_replace("\r\n", "\n", (string) file_get_contents($root . '/bin/build-release.php'));
+$builderSrc  = str_replace("\r\n", "\n", $builderSource);
 $posGate     = strpos($builderSrc, 'ys_cart_ecpay_release_collision_problems');
 $posEntry    = strpos($builderSrc, 'ys_cart_ecpay_release_entry_problem');
 $posUnlink   = strpos($builderSrc, 'unlink($zipPath)');
@@ -376,7 +386,7 @@ if ($expected !== $actual) {
         fwrite(STDERR, "  (集合成員相同但清單不相等 — 存在重複 entry)\n");
     }
     $zip->close();
-    $abort('  Rebuild with bin/build-release.php from this working tree.');
+    $abort('  Rebuild with bin/build-release.php from the reviewed clean HEAD.');
 }
 $assert(true, sprintf(
     '(F1) ZIP entry 集合與 eligible 集合完全相等（%d 檔 + %d 目錄 = %d entries）',
@@ -399,65 +409,43 @@ $assert(
     "(G1) ZIP 內的 Version header 與 YS_CART_ECPAY_VERSION 都是 {$version}"
 );
 
-// ── H. 每一個 eligible 檔案逐位相同 ─────────────────────────────────────────
+// ── H. 每一個 eligible 檔案與同一顆 HEAD snapshot 逐位相同 ──────────────────
 
 $mismatched = [];
-$eol_only   = true;
 foreach ($scan['files'] as $relative) {
     $entry  = $slug . '/' . $relative;
     $zipped = $zip->getFromName($entry);
     if (false === $zipped) {
         $mismatched[] = [$relative, '(unreadable in zip)', ''];
-        $eol_only     = false;
         continue;
     }
-    $local = (string) file_get_contents($root . '/' . $relative);
-    if ($zipped !== $local) {
-        $mismatched[] = [$relative, hash('sha256', $zipped), hash('sha256', $local)];
-
-        // 這個檔案的差異是否**僅**來自行尾？（說明見下方）
-        if (str_replace("\r\n", "\n", $zipped) !== str_replace("\r\n", "\n", $local)) {
-            $eol_only = false;
-        }
+    $committed = $scan['bytes'][$relative];
+    if ($zipped !== $committed) {
+        $mismatched[] = [$relative, hash('sha256', $zipped), hash('sha256', $committed)];
     }
 }
 $zip->close();
 
 if ($mismatched) {
-    fwrite(STDERR, "Release zip contents differ from the working tree (byte-for-byte):\n");
-    foreach ($mismatched as [$relative, $zipHash, $localHash]) {
-        fwrite(STDERR, "  {$relative}\n    zip    : {$zipHash}\n    source : {$localHash}\n");
+    fwrite(STDERR, "Release zip contents differ from the exact HEAD snapshot (byte-for-byte):\n");
+    foreach ($mismatched as [$relative, $zipHash, $committedHash]) {
+        fwrite(STDERR, "  {$relative}\n    zip    : {$zipHash}\n    HEAD   : {$committedHash}\n");
     }
-
-    // 🔴 最常見的原因不是「忘了重打包」，而是**行尾**：Windows 上 autocrlf=true 的
-    // 工作樹是 CRLF，而可出貨的 artifact 一律從 autocrlf=false 的乾淨 clone 建置
-    // （LF）。兩者逐位比對必然不同，但那不是缺陷——是兩個不同的樹。
-    // 分辨這兩種情況，訊息才不會把人導向錯誤的方向。
-    if ($eol_only) {
-        $abort(
-            "  差異**僅在行尾**（CRLF vs LF）。這個 artifact 是從 autocrlf=false 的乾淨 clone\n"
-            . "  建置的（可出貨的那一份）；本工作樹是 CRLF checkout。\n"
-            . "  在本地驗證 → 重打包：php bin/build-release.php\n"
-            . "  驗證可出貨的那一份 → 在乾淨 clone 內執行本測試。"
-        );
-    }
-
-    $abort("  The artifact was not built from this branch's current bytes.");
+    $abort('  The artifact does not match the pinned committed bytes; checkout EOL is not an exception.');
 }
-$assert(true, sprintf('(H1) %d 個 eligible 檔案與工作目錄逐位相同', count($scan['files'])));
+$assert(true, sprintf('(H1) %d 個 eligible 檔案與 exact HEAD snapshot 逐位相同', count($scan['files'])));
 
-// ── I. 🔴 #2G：正式 package gate 比對的是**committed Git blob**，不只工作樹 ──
+// ── I. 🔴 #2G：獨立重新讀 committed Git blob，不信任共用來源 helper 的 bytes ─
 //
-// 工作樹逐位相同只證明「這個包是從我現在看到的檔案打出來的」。它不證明那些檔案
-// 已經進版控——未 commit 的修改、被 .gitignore 忽略卻仍被打包的檔案、以及
-// 「artifact 建好之後又改了原始碼」都能通過 (H1)。
+// (H1) 比對共用來源 helper 的 HEAD snapshot；本段另走獨立 binary-safe Git reader，
+// 防止共用 helper 回傳錯誤 bytes 而與 builder 一起通過。同時拒絕測試期間 HEAD 改變。
 //
 // 而我們回報給審查者的是 hash：那個 hash 必須對應到一個**可以被別人重現的
 // commit**，否則「這個包來自那份 commit」只是宣稱。因此比對基準是
 // `git cat-file blob HEAD:<path>` 的原始位元組。
 //
 // 這道 gate **不會**因為環境不方便而放行：不是 git repo、git 不可用、檔案未追蹤、
-// 或內容與 HEAD 不同，全部視為未通過。
+// 或 artifact 內容與 HEAD 不同，全部視為未通過；工作樹 CRLF 不參與 bytes 比對。
 $git_problems = [];
 $git_checked  = 0;
 
@@ -505,6 +493,9 @@ if (0 !== $head['code']) {
     $git_problems[] = 'git rev-parse HEAD 失敗（不是 git repo 或 git 不可用）：' . $head['out'];
 } else {
     $head_sha = trim($head['out']);
+    if ($head_sha !== $scan['head']) {
+        $git_problems[] = 'HEAD changed after the committed source snapshot was captured';
+    }
 
     // 逐檔比對 ZIP 的位元組與 HEAD 的 blob。ZIP 已在上方 close，重開一次。
     $zip2 = new ZipArchive();
@@ -552,13 +543,9 @@ if ($git_problems) {
         fwrite(STDERR, sprintf("  ...（另有 %d 項）\n", count($git_problems) - 30));
     }
 
-    // 🔴 與 (H1) 同一個道理：本地 CRLF checkout 的工作樹與 LF 的 blob 必然逐位不同。
-    // 那不是缺陷，是兩個不同的樹——但**仍然不通過**，因為可出貨的 artifact 只能從
-    // autocrlf=false 的乾淨 clone 建置。訊息要說清楚，才不會有人往「漏打包」的方向查。
     fwrite(
         STDERR,
-        "  這道 gate 只在 autocrlf=false 的乾淨 clone 內會通過（工作樹與 blob 同為 LF）。\n"
-        . "  在本地 CRLF checkout 內它必然是紅的：請在乾淨 clone 內執行本測試以驗證可出貨的那一份。\n"
+        "  ZIP 必須與 exact HEAD blob 逐位相同；LF／CRLF checkout 都使用同一份 committed bytes。\n"
     );
 }
 

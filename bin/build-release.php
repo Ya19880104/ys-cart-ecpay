@@ -4,17 +4,30 @@
  *
  * 排除規則與 eligible 集合的推導全部委派給 bin/release-policy.php——tests/regression/
  * v004 讀的是**同一份**政策，兩邊不會再各自漂移。entry 以「目錄先、檔案後，各自排序」
- * 的固定順序寫入，讓同一份工作目錄重打時位元組穩定。
+ * 的固定順序寫入。集合與內容皆取自 HEAD blob，不受 checkout 行尾與未追蹤檔案影響。
  */
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/release-policy.php';
+require_once __DIR__ . '/release-source.php';
 
 $slug    = ys_cart_ecpay_release_slug();
 $root    = str_replace('\\', '/', dirname(__DIR__));
-$main    = $root . '/' . $slug . '.php';
-$source  = (string) file_get_contents($main);
+try {
+    if ('' !== trim(ys_cart_ecpay_release_git($root, ['status', '--porcelain', '--untracked-files=no']))) {
+        throw new RuntimeException('Refusing to build from a dirty tracked working tree.');
+    }
+    $scan = ys_cart_ecpay_release_head($root);
+} catch (RuntimeException $error) {
+    fwrite(STDERR, $error->getMessage() . "\n");
+    exit(1);
+}
+$source  = $scan['bytes'][$slug . '.php'] ?? '';
+if (!preg_match('/^ \* Version:\s*([^\r\n]+)/m', $source)) {
+    fwrite(STDERR, "Unable to read committed plugin version.\n");
+    exit(1);
+}
 $version = preg_match('/^ \* Version:\s*([^\r\n]+)/m', $source, $matches) ? trim($matches[1]) : '0.0.0';
 $outDir  = $root . '/artifacts';
 $zipPath = $outDir . '/' . $slug . '-' . $version . '.zip';
@@ -29,10 +42,8 @@ if (!is_dir($outDir) && !mkdir($outDir, 0775, true)) {
     exit(1);
 }
 
-$scan = ys_cart_ecpay_release_scan($root);
-
 if ($scan['links']) {
-    fwrite(STDERR, "Refusing to build: the working tree contains symlinks, which would be followed into the package:\n");
+    fwrite(STDERR, "Refusing to build: eligible HEAD entries contain symlinks or unsupported objects:\n");
     foreach ($scan['links'] as $link) {
         fwrite(STDERR, "  {$link}\n");
     }
@@ -81,7 +92,7 @@ foreach ($scan['dirs'] as $relative) {
 }
 
 foreach ($scan['files'] as $relative) {
-    if (!$zip->addFile($root . '/' . $relative, $slug . '/' . $relative)) {
+    if (!$zip->addFromString($slug . '/' . $relative, $scan['bytes'][$relative])) {
         $zip->close();
         fwrite(STDERR, "Unable to add file to zip: {$relative}\n");
         exit(1);
