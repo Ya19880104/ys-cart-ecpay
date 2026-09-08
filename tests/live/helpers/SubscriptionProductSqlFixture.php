@@ -20,8 +20,8 @@ namespace {
 
 namespace YSCartEcpay\Tests\Live {
 	final class SubscriptionProductSqlFixture {
-		public const CORE = '7c8acd9843fe4507cc39eb18e8bb54bfd6fc3ec1';
-		public const ECPAY = '445adc76c4dc6653abdd228b529bad636eef5d42';
+		public const CORE = '5c60a28822084aaaee3cf4c7582de3f951d912a0';
+		public const ECPAY = '89897f8754f66eb49013ca7eaf20ba03e004fd37';
 		public const AFFILIATE = '18c609a1b94cca28e57c2ce4f225f25662555ccd';
 		private const ALLOWED_DESCENDANT_PATHS = [
 			'tests/live/PRODUCT_SQL_OFFLINE.md',
