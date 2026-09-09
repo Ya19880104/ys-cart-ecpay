@@ -299,17 +299,43 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
 					<h2><?php esc_html_e( '金流方式', 'ys-cart-ecpay' ); ?></h2>
-					<?php foreach ( (array) $settings['payment_methods'] as $key => $label ) : ?>
+					<p class="description"><?php esc_html_e( '以下為一般支付（導轉）可用的付款方式。消費者會跳到綠界付款頁完成付款，卡號全程不經過本站。', 'ys-cart-ecpay' ); ?></p>
+					<?php foreach ( (array) $settings['payment_methods'] as $ys_ec_pm_key => $ys_ec_pm ) : ?>
+						<?php
+						$ys_ec_pm_label      = is_array( $ys_ec_pm ) ? (string) ( $ys_ec_pm['label'] ?? '' ) : (string) $ys_ec_pm;
+						$ys_ec_pm_activation = is_array( $ys_ec_pm ) ? (string) ( $ys_ec_pm['activation'] ?? '' ) : '';
+						?>
 						<div class="ys-ec-form-group">
 							<label class="ysca-switch-label">
 								<span class="ysca-switch">
-									<input type="checkbox" name="ys_ec_ecpay_<?php echo esc_attr( (string) $key ); ?>_enabled" value="1" <?php checked( $settings[ (string) $key . '_enabled' ] ); ?>>
+									<input type="checkbox" name="ys_ec_ecpay_<?php echo esc_attr( (string) $ys_ec_pm_key ); ?>_enabled" value="1" <?php checked( $settings[ (string) $ys_ec_pm_key . '_enabled' ] ); ?>>
 									<span class="ysca-switch-slider"></span>
 								</span>
-								<strong><?php echo esc_html( (string) $label ); ?></strong>
+								<strong><?php echo esc_html( $ys_ec_pm_label ); ?></strong>
 							</label>
+							<?php if ( '' !== $ys_ec_pm_activation ) : ?>
+								<p class="description"><?php echo esc_html( $ys_ec_pm_activation ); ?></p>
+							<?php endif; ?>
 						</div>
 					<?php endforeach; ?>
+					<p class="description">
+						<?php esc_html_e( '標示「需先向綠界申請開通」的方式預設關閉。沒開通就開啟，消費者會走到綠界付款頁才被擋下——請先在綠界廠商後台確認已開通再啟用。', 'ys-cart-ecpay' ); ?>
+					</p>
+
+					<h2 class="ysca-mt-md"><?php esc_html_e( '分期期數', 'ys-cart-ecpay' ); ?></h2>
+					<label class="ysca-field">
+						<span class="ysca-field__label"><?php esc_html_e( '開放的期數（逗號分隔）', 'ys-cart-ecpay' ); ?></span>
+						<input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_credit_installment_periods" value="<?php echo esc_attr( (string) ( $settings['credit_installment_periods'] ?? '' ) ); ?>" placeholder="3,6,12">
+					</label>
+					<p class="description">
+						<?php
+						printf(
+							/* translators: %s: comma-separated list of the instalment periods ECPay accepts. */
+							esc_html__( '綠界接受的期數：%s（30N 為永豐 30 期；5、8、9、10 需為閘道商合約）。只填你已向綠界開通的期數；不在清單內的值會被忽略。留空則「信用卡分期」不會出現在結帳頁。', 'ys-cart-ecpay' ),
+							esc_html( implode( '、', (array) ( $settings['credit_installment_periods_allowed'] ?? [] ) ) )
+						);
+						?>
+					</p>
 				</div>
 			</div>
 		<?php endif; ?>

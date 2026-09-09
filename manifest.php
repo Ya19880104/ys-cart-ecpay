@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 return [
 	'id'                 => 'ys_ecpay',
 	'name'               => '綠界 ECPay',
-	'description'        => '綠界金流與物流整合，支援信用卡、ATM、超商代碼、條碼付款，以及超商取貨與宅配物流。',
+	'description'        => '綠界金流與物流整合。一般支付（導轉）支援信用卡、分期、銀聯、ATM、WebATM、超商代碼、超商條碼、Apple Pay、TWQR、微信支付與 BNPL 無卡分期，另含超商取貨與宅配物流。',
 	'version'            => YS_CART_ECPAY_VERSION,
 	'contract_version'   => 1,
 	'plugin_file'        => YS_CART_ECPAY_BASENAME,
@@ -22,12 +22,8 @@ return [
 	'domains'            => [ 'payment', 'shipping' ],
 	'capabilities'       => [
 		'payment'  => [
-			'methods'              => [
-				[ 'id' => 'ys_ec_ecpay_credit', 'label' => '信用卡', 'class' => \YangSheep\YSCartEcpay\Payment\EcpayCreditGateway::class ],
-				[ 'id' => 'ys_ec_ecpay_atm', 'label' => 'ATM 虛擬帳號', 'class' => \YangSheep\YSCartEcpay\Payment\EcpayAtmGateway::class ],
-				[ 'id' => 'ys_ec_ecpay_cvs', 'label' => '超商代碼', 'class' => \YangSheep\YSCartEcpay\Payment\EcpayCvsGateway::class ],
-				[ 'id' => 'ys_ec_ecpay_barcode', 'label' => '超商條碼', 'class' => \YangSheep\YSCartEcpay\Payment\EcpayBarcodeGateway::class ],
-			],
+			// 🔴 金流方式清單由型錄導出，這裡**不再**抄一份——理由與下方物流相同。
+			'methods'              => \YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog::manifest_methods(),
 			'supported_currencies' => [ 'TWD' ],
 			'supported_countries'  => [ 'TW' ],
 			'test_mode_available'  => true,

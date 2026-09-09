@@ -43,6 +43,7 @@ $template = v008_read('templates/admin/ecpay-settings.php');
 $plugin   = v008_read('src/Plugin.php');
 $manifest = v008_read('manifest.php');
 $store    = v008_read('src/Shipping/Ecpay/EcpayStoreSelector.php');
+$paycat   = v008_read('src/Payment/EcpayPaymentCatalog.php');
 
 echo "## Toggle sync and localization contract\n";
 
@@ -55,10 +56,19 @@ v008_check(
     false !== strpos($admin, 'sync_gateway_enabled_list')
         && false !== strpos($admin, 'lifecycle_methods_setting_desired')
         && false !== strpos($admin, "'gateway_enabled_list'")
-        && false !== strpos($admin, "'ys_ec_ecpay_credit'")
-        && false !== strpos($admin, "'ys_ec_ecpay_atm'")
-        && false !== strpos($admin, "'ys_ec_ecpay_cvs'")
-        && false !== strpos($admin, "'ys_ec_ecpay_barcode'")
+        && false !== strpos($admin, 'EcpayPaymentCatalog::alias_to_id()')
+        // 型錄是唯一事實來源：admin 檔不得再抄一份方式 ID 清單。
+        && false === strpos($admin, "'ys_ec_ecpay_credit'")
+        && false === strpos($admin, "'ys_ec_ecpay_atm'")
+        && false === strpos($admin, "'ys_ec_ecpay_cvs'")
+        && false === strpos($admin, "'ys_ec_ecpay_barcode'")
+        // 方式 ID 與啟用開關 key 都在型錄裡（含 0.4.0 新增的方式）。
+        && false !== strpos($paycat, "'ys_ec_ecpay_credit'")
+        && false !== strpos($paycat, "'ys_ec_ecpay_atm'")
+        && false !== strpos($paycat, "'ys_ec_ecpay_cvs'")
+        && false !== strpos($paycat, "'ys_ec_ecpay_barcode'")
+        && false !== strpos($paycat, "'ys_ec_ecpay_webatm'")
+        && false !== strpos($paycat, "'ys_ec_ecpay_bnpl'")
 );
 
 v008_check(
@@ -78,12 +88,14 @@ v008_check(
         && false !== strpos($template, '儲存綠界設定')
 );
 
-// 合流後：物流方式 label 的權威在型錄（manifest 由它導出），金流 label 仍在 manifest。
+// 0.4.0 起：金流與物流的 label 權威**都**在各自型錄，manifest 兩邊都由型錄導出。
 $catalog = v008_read('src/Shipping/Ecpay/EcpayShippingCatalog.php');
 v008_check(
     'ECPay provider card labels are localized',
     false !== strpos($manifest, "'name'               => '綠界 ECPay'")
-        && false !== strpos($manifest, "'label' => '信用卡'")
+        && false !== strpos($manifest, 'EcpayPaymentCatalog::manifest_methods()')
+        && false === strpos($manifest, "'label' => '信用卡'")
+        && false !== strpos($paycat, "=> '信用卡'")
         && false !== strpos($catalog, "=> '全家超商取貨'")
 );
 
@@ -92,7 +104,8 @@ v008_check(
 $operability = v008_read('src/Support/ShippingMethodOperability.php');
 v008_check(
     'ECPay runtime registration is method-level gated',
-    false !== strpos($plugin, "is_method_enabled( 'payment', 'ys_ec_ecpay_credit'")
+    false !== strpos($plugin, "is_method_enabled( 'payment', (string) \$method_id )")
+        && false !== strpos($plugin, 'EcpayPaymentCatalog::all()')
         && false !== strpos($plugin, 'ShippingMethodOperability::is_operable( $method_id )')
         && false !== strpos($plugin, "YSProviderLifecycleState::is_method_enabled")
         && false !== strpos($operability, "is_method_enabled( 'shipping', \$method_id, \$manifest )")

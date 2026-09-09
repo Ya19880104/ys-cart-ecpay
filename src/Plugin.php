@@ -19,10 +19,8 @@ use YangSheep\YSCartEcpay\Admin\EcpaySettings;
 use YangSheep\YSCartEcpay\Api\EcpayLogisticsController;
 use YangSheep\YSCartEcpay\Api\EcpayPaymentController;
 use YangSheep\YSCartEcpay\Api\EcpayPrintController;
-use YangSheep\YSCartEcpay\Payment\EcpayAtmGateway;
-use YangSheep\YSCartEcpay\Payment\EcpayBarcodeGateway;
-use YangSheep\YSCartEcpay\Payment\EcpayCreditGateway;
-use YangSheep\YSCartEcpay\Payment\EcpayCvsGateway;
+use YangSheep\YSCartEcpay\Payment\EcpayGatewayBase;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
@@ -718,17 +716,22 @@ final class Plugin {
 			return;
 		}
 
-		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_credit' ) ) {
-			YSGatewayRegistry::register( new EcpayCreditGateway() );
-		}
-		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_atm' ) ) {
-			YSGatewayRegistry::register( new EcpayAtmGateway() );
-		}
-		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_cvs' ) ) {
-			YSGatewayRegistry::register( new EcpayCvsGateway() );
-		}
-		if ( $this->is_method_enabled( 'payment', 'ys_ec_ecpay_barcode' ) ) {
-			YSGatewayRegistry::register( new EcpayBarcodeGateway() );
+		// 逐一由型錄註冊。加一個方式＝在型錄加一列，這裡不需要動——
+		// 「型錄加了、註冊忘了」在語法上不可能發生（與物流同一個理由）。
+		foreach ( EcpayPaymentCatalog::all() as $method_id => $descriptor ) {
+			if ( ! $this->is_method_enabled( 'payment', (string) $method_id ) ) {
+				continue;
+			}
+
+			$class = (string) $descriptor['class'];
+			if ( ! class_exists( $class ) ) {
+				continue;
+			}
+
+			$gateway = new $class();
+			if ( $gateway instanceof EcpayGatewayBase ) {
+				YSGatewayRegistry::register( $gateway );
+			}
 		}
 	}
 
@@ -1610,12 +1613,8 @@ final class Plugin {
 		}
 
 		if ( 'payment' === $domain ) {
-			$legacy_map = [
-				'ys_ec_ecpay_credit'  => 'credit',
-				'ys_ec_ecpay_atm'     => 'atm',
-				'ys_ec_ecpay_cvs'     => 'cvs',
-				'ys_ec_ecpay_barcode' => 'barcode',
-			];
+			// method_id → alias 同樣由型錄導出（舊核心沒有 lifecycle state 時的路徑）。
+			$legacy_map = EcpayPaymentCatalog::id_to_alias();
 			return isset( $legacy_map[ $method_id ] ) && Settings::gateway_enabled( $legacy_map[ $method_id ] );
 		}
 

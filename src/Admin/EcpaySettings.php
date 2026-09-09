@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Admin\YSAdminApp;
 use YangSheep\YSCartEcpay\Plugin;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
@@ -20,12 +21,15 @@ final class EcpaySettings {
 		'shipping'    => '物流方式',
 		'diagnostics' => '串接資訊',
 	];
-	private const PAYMENT_GATEWAY_IDS = [
-		'credit'  => 'ys_ec_ecpay_credit',
-		'atm'     => 'ys_ec_ecpay_atm',
-		'cvs'     => 'ys_ec_ecpay_cvs',
-		'barcode' => 'ys_ec_ecpay_barcode',
-	];
+	/**
+	 * alias → method_id。由型錄導出，不維護第二份清單。
+	 *
+	 * @return array<string,string>
+	 */
+	private static function payment_gateway_ids(): array {
+		return EcpayPaymentCatalog::alias_to_id();
+	}
+
 	/**
 	 * alias → method_id。由型錄導出，不維護第二份清單。
 	 *
@@ -552,7 +556,7 @@ final class EcpaySettings {
 	 * @param array<int,string> $selected_ids
 	 */
 	private static function sync_gateway_enabled_list( array $selected_ids ): void {
-		self::sync_enabled_list( 'gateway_enabled_list', array_values( self::PAYMENT_GATEWAY_IDS ), $selected_ids );
+		self::sync_enabled_list( 'gateway_enabled_list', array_values( self::payment_gateway_ids() ), $selected_ids );
 	}
 
 	/**
@@ -645,12 +649,8 @@ final class EcpaySettings {
 				'logistics_notify' => rest_url( 'ys-ecommerce/v1/ecpay/logistics-notify' ),
 				'store_map'        => rest_url( 'ys-ecommerce-headless/v1/stores/ecpay/map-url' ),
 			],
-			'payment_methods'       => [
-				'credit'  => '信用卡',
-				'atm'     => 'ATM 虛擬帳號',
-				'cvs'     => '超商代碼',
-				'barcode' => '超商條碼',
-			],
+			// 金流方式清單、標籤、ChoosePayment、開通說明與最低金額——全部由型錄導出。
+			'payment_methods'       => EcpayPaymentCatalog::admin_rows(),
 			// 物流方式清單、通路、溫層、是否需要退貨門市——全部由型錄導出。
 			'shipping_methods'      => EcpayShippingCatalog::admin_rows(),
 		];
@@ -691,6 +691,9 @@ final class EcpaySettings {
 		$out['home_credential_family'] = Settings::home_credential_family();
 		$out['payment_mode']          = Settings::payment_mode();
 		$out['payment_modes_implemented'] = Settings::IMPLEMENTED_PAYMENT_MODES;
+		// 分期期數（後台必須讀得回來，否則存了等於沒存）。
+		$out['credit_installment_periods']         = Settings::credit_installment_periods();
+		$out['credit_installment_periods_allowed'] = Settings::ALLOWED_CREDIT_INSTALLMENTS;
 		foreach ( Settings::LOGISTICS_SOURCE_KEYS as $family => $key ) {
 			$out[ 'logistics_' . $family . '_source_mode' ] = self::logistics_source_for_render( $family, $out );
 		}
@@ -698,10 +701,11 @@ final class EcpaySettings {
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
 		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );
 		$shipping_ids          = self::shipping_method_ids();
+		$payment_ids           = self::payment_gateway_ids();
 		foreach ( Settings::method_keys() as $alias => $setting_key ) {
 			$enabled = '1' === (string) Settings::get( $setting_key, '0' );
-			if ( isset( self::PAYMENT_GATEWAY_IDS[ $alias ] ) && null !== $gateway_enabled_list ) {
-				$enabled = $enabled && in_array( self::PAYMENT_GATEWAY_IDS[ $alias ], $gateway_enabled_list, true );
+			if ( isset( $payment_ids[ $alias ] ) && null !== $gateway_enabled_list ) {
+				$enabled = $enabled && in_array( $payment_ids[ $alias ], $gateway_enabled_list, true );
 			}
 			if ( isset( $shipping_ids[ $alias ] ) && null !== $shipping_enabled_list ) {
 				$enabled = $enabled && in_array( $shipping_ids[ $alias ], $shipping_enabled_list, true );
@@ -988,21 +992,36 @@ final class EcpaySettings {
 			$desired = array_replace( $desired, $lifecycle['desired'] );
 
 			if ( 'payment' === $tab ) {
-				$aliases      = [ 'credit', 'atm', 'cvs', 'barcode' ];
-				$selected_ids = self::selected_ids_from_post( $aliases, self::PAYMENT_GATEWAY_IDS );
+				$gateway_ids  = self::payment_gateway_ids();
+				$method_keys  = Settings::payment_method_keys();
+				$aliases      = array_keys( $gateway_ids );
+				$selected_ids = self::selected_ids_from_post( $aliases, $gateway_ids );
 				foreach ( $aliases as $alias ) {
-					$desired[ Settings::PAYMENT_METHOD_KEYS[ $alias ] ] = isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ? '1' : '0';
+					$desired[ $method_keys[ $alias ] ] = isset( $_POST[ 'ys_ec_ecpay_' . $alias . '_enabled' ] ) ? '1' : '0';
 				}
 				$list = self::enabled_list_setting_desired(
 					'gateway_enabled_list',
-					array_values( self::PAYMENT_GATEWAY_IDS ),
+					array_values( $gateway_ids ),
 					$selected_ids
 				);
-				$methods = self::lifecycle_methods_setting_desired( 'payment', self::PAYMENT_GATEWAY_IDS, $selected_ids, $desired );
+				$methods = self::lifecycle_methods_setting_desired( 'payment', $gateway_ids, $selected_ids, $desired );
 				if ( ! $list['ok'] || ! $methods['ok'] ) {
 					return 'settings_state_read_failed';
 				}
 				$desired = array_replace( $desired, $list['desired'], $methods['desired'] );
+
+				// 分期期數：正規化後只留綠界載明的合法值。
+				//
+				// 🔴 送出的欄位有值、但值不合法，綠界會退回整筆交易——症狀出現在
+				// 消費者按下結帳之後。這裡把不合法的期數丟掉（而不是原樣存起來），
+				// 全部不合法時存成空字串，`EcpayCreditInstallmentGateway::is_enabled()`
+				// 據此讓分期不出現在結帳頁。
+				if ( array_key_exists( Settings::CREDIT_INSTALLMENT_PERIODS, $_POST ) ) {
+					$raw = is_string( $_POST[ Settings::CREDIT_INSTALLMENT_PERIODS ] )
+						? sanitize_text_field( wp_unslash( (string) $_POST[ Settings::CREDIT_INSTALLMENT_PERIODS ] ) )
+						: '';
+					$desired[ Settings::CREDIT_INSTALLMENT_PERIODS ] = Settings::normalize_credit_installments( $raw );
+				}
 			} else {
 				$ids     = self::shipping_method_ids();
 				$aliases = array_keys( $ids );

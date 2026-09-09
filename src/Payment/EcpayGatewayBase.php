@@ -14,8 +14,55 @@ use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 abstract class EcpayGatewayBase implements YSGatewayInterface {
-	abstract protected function gateway_key(): string;
-	abstract protected function choose_payment(): string;
+	/**
+	 * 這個方式在型錄裡的 descriptor。
+	 *
+	 * 🔴 型錄查不到就是**設定錯誤**，不是「用預設值頂一下」的情況：一個不在型錄裡
+	 * 的方式，manifest 認不得它、後台列不出它、`is_method_enabled()` 也對不到
+	 * alias——它會是一個半開的方式。與其讓它帶著空白的 ChoosePayment 去簽表單，
+	 * 不如在這裡就停下來。
+	 *
+	 * @return array<string,mixed>
+	 * @throws \LogicException 方式不在 {@see EcpayPaymentCatalog}
+	 */
+	protected function descriptor(): array {
+		$descriptor = EcpayPaymentCatalog::get( $this->get_id() );
+		if ( null === $descriptor ) {
+			throw new \LogicException(
+				sprintf( '付款方式 %s 不在 EcpayPaymentCatalog 型錄中。', $this->get_id() )
+			);
+		}
+
+		return $descriptor;
+	}
+
+	/** 後台開關與 legacy 設定 key 用的短名（型錄導出）。 */
+	protected function gateway_key(): string {
+		return (string) $this->descriptor()['alias'];
+	}
+
+	/** 綠界 AIO `ChoosePayment` 欄位值（型錄導出）。 */
+	protected function choose_payment(): string {
+		return (string) $this->descriptor()['choose_payment'];
+	}
+
+	/**
+	 * 這個方式額外要送的 AIO 欄位。
+	 *
+	 * 型錄裡的靜態值（例如銀聯的 `UnionPay=1`）由這裡導出；值取自設定的方式
+	 * （例如分期期數）覆寫本方法。
+	 *
+	 * @return array<string,string>
+	 */
+	protected function extra_aio_fields(): array {
+		$extra = $this->descriptor()['extra_fields'] ?? [];
+
+		return is_array( $extra ) ? $extra : [];
+	}
+
+	public function get_title(): string {
+		return (string) $this->descriptor()['title'];
+	}
 
 	public function get_description(): string {
 		return '使用綠界 ECPay AIO 金流付款。';
@@ -44,8 +91,15 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			&& ( 0.0 === $this->get_max_amount() || $total <= $this->get_max_amount() );
 	}
 
+	/**
+	 * 這個方式的最低金額（型錄導出）。
+	 *
+	 * 🔴 BNPL 的 3,000 元下限寫在型錄，意義是「金額不足時結帳頁就不顯示這個
+	 * 方式」——而不是讓消費者選了、填完資料、才在綠界那邊收到
+	 * 「BNPL 金額未達最低」被退回來。
+	 */
 	public function get_min_amount(): float {
-		return 1.0;
+		return (float) $this->descriptor()['min_amount'];
 	}
 
 	public function get_max_amount(): float {
@@ -116,7 +170,12 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		// v0.3.0：先算出實際要送出的金額（非 canonical TWD 正整數會直接拋例外），
 		// 並在**送出付款表單之前**連同環境與商店身分一起持久化。
 		try {
-			$form_data = ( new EcpayPaymentClient() )->build_aio_form( $order, $merchant_trade_no, $this->choose_payment() );
+			$form_data = ( new EcpayPaymentClient() )->build_aio_form(
+				$order,
+				$merchant_trade_no,
+				$this->choose_payment(),
+				$this->extra_aio_fields()
+			);
 		} catch ( \InvalidArgumentException $e ) {
 			YSLogger::error( 'ecpay', '建單金額不合法，拒絕簽發付款表單', [
 				'order_id' => $order_id,

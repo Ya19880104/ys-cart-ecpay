@@ -68,6 +68,7 @@ namespace YangSheep\Ecommerce\Utils {
 namespace {
 
 $root = dirname( __DIR__, 2 );
+require_once $root . '/src/Payment/EcpayPaymentCatalog.php';
 require_once $root . '/src/Shipping/Ecpay/EcpayShippingCatalog.php';
 require_once $root . '/src/Support/Settings.php';
 

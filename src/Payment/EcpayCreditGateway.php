@@ -16,17 +16,7 @@ final class EcpayCreditGateway extends EcpayGatewayBase {
 		return 'ys_ec_ecpay_credit';
 	}
 
-	public function get_title(): string {
-		return '綠界信用卡';
-	}
 
-	protected function gateway_key(): string {
-		return 'credit';
-	}
-
-	protected function choose_payment(): string {
-		return 'Credit';
-	}
 
 	/** 啟用自動退款的設定鍵（預設關閉）。 */
 	public const AUTO_REFUND_OPTION = 'ys_ec_ecpay_auto_refund_enabled';

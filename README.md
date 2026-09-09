@@ -4,11 +4,24 @@ Standalone ECPay provider plugin for YS CART.
 
 ## Features
 
-- ECPay AIO payment gateways:
-  - Credit Card
-  - ATM
-  - CVS Code
-  - Barcode
+- ECPay AIO redirect payment methods, declared in one place
+  (`src/Payment/EcpayPaymentCatalog.php`) from which the manifest, gateway
+  registration, settings keys and admin screen are all derived:
+  - Credit Card, ATM, CVS Code, Barcode — usable under a plain ECPay contract
+  - WebATM — usable under a plain contract, off by default because it is new
+  - Credit instalments, UnionPay, Apple Pay, TWQR, WeChat Pay, BNPL — each
+    requires activation with ECPay first, so each ships disabled with its
+    prerequisite stated next to the switch. Upgrading never turns a method on.
+  - Instalment periods are configurable and validated against the values ECPay
+    documents (3, 5, 6, 8, 9, 10, 12, 18, 24, 30N). Leaving it empty hides the
+    instalment method rather than sending an empty `CreditInstallment`, which
+    ECPay would treat as an ordinary single payment.
+  - BNPL carries ECPay's 3,000 TWD minimum, so it is hidden below that amount
+    instead of failing at ECPay's payment page.
+  - A method may declare extra AIO fields (UnionPay's `UnionPay=1`, instalments'
+    `CreditInstallment`). They are merged before signing, so they are always
+    inside CheckMacValue, and a field name colliding with an order field is
+    refused rather than allowed to overwrite it.
 - ECPay domestic logistics:
   - FamilyMart
   - 7-ELEVEN

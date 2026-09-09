@@ -8,6 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\Ecommerce\YSEcommerce;
 use YangSheep\YSCartEcpay\Plugin;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 
 final class Settings {
@@ -92,24 +93,66 @@ final class Settings {
 			: self::MODE_REDIRECT;
 	}
 
+	/**
+	 * 信用卡分期要開放的期數（逗號分隔，送進綠界 `CreditInstallment`）。
+	 *
+	 * 官方載明的期數（skill V3.4 guides/01 §分期）：
+	 *   一般 3 / 6 / 12 / 18 / 24；永豐 30 期為 `30N`；閘道商另支援 5 / 8 / 9 / 10。
+	 *
+	 * 🔴 只收上述值。允許任意字串的後果不是「多一個期數」，而是整張表單被綠界
+	 * 退回——期數不合法時綠界拒收整筆交易，症狀出現在消費者按下結帳之後。
+	 */
+	public const CREDIT_INSTALLMENT_PERIODS = 'ys_ec_ecpay_credit_installment_periods';
+
+	/** 綠界允許的分期期數全集。 */
+	public const ALLOWED_CREDIT_INSTALLMENTS = [ '3', '5', '6', '8', '9', '10', '12', '18', '24', '30N' ];
+
+	/**
+	 * 正規化一份期數清單：去空白、去重、只留合法值，並依綠界文件的順序輸出。
+	 *
+	 * @return string 逗號分隔的合法期數；沒有任何合法值時回空字串。
+	 */
+	public static function normalize_credit_installments( string $raw ): string {
+		$wanted = [];
+		foreach ( explode( ',', $raw ) as $piece ) {
+			$piece = strtoupper( trim( $piece ) );
+			if ( '' !== $piece ) {
+				$wanted[ $piece ] = true;
+			}
+		}
+
+		$out = [];
+		foreach ( self::ALLOWED_CREDIT_INSTALLMENTS as $allowed ) {
+			if ( isset( $wanted[ $allowed ] ) ) {
+				$out[] = $allowed;
+			}
+		}
+
+		return implode( ',', $out );
+	}
+
+	/** 目前設定的分期期數（已正規化）。 */
+	public static function credit_installment_periods(): string {
+		return self::normalize_credit_installments( (string) self::get( self::CREDIT_INSTALLMENT_PERIODS, '' ) );
+	}
+
 	/** Which explicit credential profile signs HOME requests. */
 	public const HOME_CREDENTIAL_FAMILY = 'ys_ec_ecpay_home_credential_family';
 	public const FAMILY_B2C_HOME = 'b2c_home';
 	public const FAMILY_C2C = 'c2c';
 
 	/**
-	 * 金流方式的啟用開關。
+	 * 金流方式的啟用開關——由 {@see EcpayPaymentCatalog} 導出。
 	 *
-	 * 物流的部分**不在這裡**——它由 {@see EcpayShippingCatalog} 導出（見
-	 * {@see self::method_keys()}）。抄第二份清單正是「後台勾得到、卻註冊不進去」
-	 * 這類半開狀態的來源。
+	 * 物流同理，由 {@see EcpayShippingCatalog} 導出（見 {@see self::method_keys()}）。
+	 * 兩邊都不在這裡抄第二份清單：抄第二份正是「後台勾得到、卻註冊不進去」這類
+	 * 半開狀態的來源。
+	 *
+	 * @return array<string,string>
 	 */
-	public const PAYMENT_METHOD_KEYS = [
-		'credit'  => 'ys_ec_ecpay_credit_enabled',
-		'atm'     => 'ys_ec_ecpay_atm_enabled',
-		'cvs'     => 'ys_ec_ecpay_cvs_enabled',
-		'barcode' => 'ys_ec_ecpay_barcode_enabled',
-	];
+	public static function payment_method_keys(): array {
+		return EcpayPaymentCatalog::enabled_option_by_alias();
+	}
 
 	/**
 	 * alias → 啟用開關設定 key（金流 ＋ 物流）。
@@ -117,7 +160,7 @@ final class Settings {
 	 * @return array<string,string>
 	 */
 	public static function method_keys(): array {
-		return self::PAYMENT_METHOD_KEYS + EcpayShippingCatalog::enabled_option_by_alias();
+		return self::payment_method_keys() + EcpayShippingCatalog::enabled_option_by_alias();
 	}
 
 	/**

@@ -10,6 +10,7 @@ function __(string $value, string $domain = ''): string { return $value; }
 function esc_attr(string $value): string { return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8', false); }
 function esc_html(string $value): string { return esc_attr($value); }
 function esc_url(string $value): string { return esc_attr($value); }
+function esc_html__(string $value, string $domain = ''): string { return esc_html($value); }
 function esc_html_e(string $value, string $domain = ''): void { echo esc_html($value); }
 function esc_attr_e(string $value, string $domain = ''): void { echo esc_attr($value); }
 function admin_url(string $path): string { return 'https://fixture.invalid/wp-admin/' . $path; }
@@ -22,6 +23,9 @@ function wp_json_encode(mixed $value, int $flags = 0): string { return (string) 
 function wp_create_nonce(string $action = ''): string { return 'fixture-rest-nonce'; }
 function wp_nonce_field(string $action): void { echo '<input type="hidden" name="_wpnonce" value="fixture-nonce">'; }
 function sanitize_key(string $value): string { return preg_replace('/[^a-z0-9_-]/', '', strtolower($value)); }
+require_once dirname(__DIR__, 2) . '/src/Payment/EcpayPaymentCatalog.php';
+require_once dirname(__DIR__, 2) . '/src/Shipping/Ecpay/EcpayShippingCatalog.php';
+require_once dirname(__DIR__, 2) . '/src/Support/Settings.php';
 function wp_unslash(string $value): string { return stripslashes($value); }
 
 function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c', bool $testMode = true): string {
@@ -33,10 +37,16 @@ function render_settings(string $b2c = 'disabled', string $c2c = 'payment', stri
         'payment_mode' => 'redirect', 'payment_modes_implemented' => ['redirect'],
         'legacy_logistics_credentials_present' => true,
         'logistics_b2c_home_source_mode' => $b2c, 'logistics_c2c_source_mode' => $c2c,
-        'payment_methods' => ['credit' => '信用卡'], 'credit_enabled' => true,
+        // 🔴 用真的型錄列渲染。手抄一份假的方式清單，測的就只是那份假清單。
+        'payment_methods' => \YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog::admin_rows(),
+        'credit_installment_periods' => '3,6,12',
+        'credit_installment_periods_allowed' => \YangSheep\YSCartEcpay\Support\Settings::ALLOWED_CREDIT_INSTALLMENTS,
         'shipping_methods' => [], 'callback_urls' => ['payment' => 'https://fixture.invalid/callback'],
         'sender_name' => 'Fixture', 'sender_phone' => '', 'sender_zipcode' => '', 'sender_address' => '',
     ];
+    foreach (\YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog::default_enabled_by_alias() as $alias => $on) {
+        $settings[$alias . '_enabled'] = '1' === $on;
+    }
     foreach (['payment', 'logistics_b2c_home', 'logistics_c2c'] as $group) {
         $settings[$group . '_test_mode'] = 'payment' === $group ? $testMode : true;
         $settings[$group . '_merchant_id'] = 'fixture-"<&' . $group;
@@ -155,6 +165,56 @@ check('unsupported mode rejection is visible', str_contains(dom(render_settings(
 $prodXp = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home', false));
 check('production mode names the live endpoint', str_contains($prodXp->document->textContent, 'payment.ecpay.com.tw') && str_contains($prodXp->document->textContent, '會真實扣款'));
 check('test mode names the stage endpoint', str_contains($modeText, 'payment-stage.ecpay.com.tw') && str_contains($modeText, '不會真的扣款'));
+
+// ── 金流方式分頁：型錄的每一列都要真的渲染出來，開通提示不得漏 ──
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
+
+$payXp   = dom(render_settings('disabled', 'disabled', 'payment'));
+$payText = $payXp->document->textContent;
+$rows    = EcpayPaymentCatalog::admin_rows();
+
+$renderedToggles = [];
+foreach ($payXp->query('//input[@type="checkbox"]') as $box) {
+    $name = $box->getAttribute('name');
+    if (preg_match('/^ys_ec_ecpay_(.+)_enabled$/', $name, $m) === 1) {
+        $renderedToggles[$m[1]] = $box->hasAttribute('checked');
+    }
+}
+check('every catalogue payment method renders a toggle', array_keys($rows) === array_keys($renderedToggles));
+check('exactly the eleven redirect methods are offered', count($rows) === 11);
+
+// 需開通的方式預設不能是勾起來的——勾著等於讓沒開通的站直接對外開賣。
+$activationOff = true;
+foreach ($rows as $alias => $row) {
+    if ('' !== $row['activation']) {
+        $activationOff = $activationOff && (($renderedToggles[$alias] ?? true) === false);
+    }
+}
+check('methods needing ECPay activation default to off', $activationOff);
+
+// 🔴 升級安全：0.4.0 新增的方式一個都不能預設開著。預設開＝既有站台升級之後，
+// 結帳頁自己多出一個業主沒同意的付款方式。預設開的集合必須恰好是 0.4.0 之前
+// 就已經在賣的那四個。
+$defaultOn = array_keys(array_filter(EcpayPaymentCatalog::default_enabled_by_alias(), static fn(string $v): bool => '1' === $v));
+sort($defaultOn);
+check('upgrading a site never turns on a newly added method', $defaultOn === ['atm', 'barcode', 'credit', 'cvs']);
+check('rendered toggles agree with the catalogue defaults', array_keys(array_filter($renderedToggles)) === ['credit', 'atm', 'cvs', 'barcode']);
+
+$activationNotes = 0;
+foreach ($rows as $row) {
+    if ('' !== $row['activation']) {
+        $activationNotes += str_contains($payText, $row['activation']) ? 1 : 0;
+    }
+}
+check('each activation requirement is stated next to its toggle', $activationNotes === count(array_filter($rows, static fn(array $r): bool => '' !== $r['activation'])));
+check('BNPL states its 3,000 minimum', str_contains($payText, '3,000 元'));
+check('Apple Pay states domain verification is required', str_contains($payText, '網域驗證'));
+check('payment tab explains the card never reaches this site', str_contains($payText, '卡號全程不經過本站'));
+
+$periods = first($payXp, '//input[@name="ys_ec_ecpay_credit_installment_periods"]');
+check('instalment periods field round trips the stored value', $periods !== null && $periods->getAttribute('value') === '3,6,12');
+check('instalment periods list the values ECPay accepts', str_contains($payText, '3、5、6、8、9、10、12、18、24、30N'));
+check('empty instalment periods are explained as hiding the method', str_contains($payText, '留空則'));
 
 $failed = array_values(array_filter($checks, static fn(array $check): bool => !$check['pass']));
 echo json_encode(['pass' => count($checks) - count($failed), 'fail' => count($failed), 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";

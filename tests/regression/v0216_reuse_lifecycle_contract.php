@@ -298,6 +298,7 @@ namespace YangSheep\Ecommerce\Shipping {
 namespace {
 
 $root = dirname( __DIR__, 2 );
+require_once $root . '/src/Payment/EcpayPaymentCatalog.php';
 require_once $root . '/src/Shipping/Ecpay/EcpayShippingCatalog.php';
 require_once $root . '/src/Support/Settings.php';
 require_once $root . '/src/Support/ProviderMaintenanceLock.php';
@@ -310,6 +311,7 @@ require_once $root . '/src/Shipping/Ecpay/EcpayShippingRequester.php';
 require_once $root . '/src/Shipping/Ecpay/EcpayStoreDirectory.php';
 
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester;
@@ -1268,23 +1270,24 @@ v0216l_check( 'G14f signer rotation commits verified lifecycle rows without a la
 $method_tab = method_exists( EcpaySettings::class, 'apply_methods_tab_atomically' )
 	? new ReflectionMethod( EcpaySettings::class, 'apply_methods_tab_atomically' )
 	: null;
-$payment_state = wp_json_encode( [
-	'ys_ec_ecpay_credit'  => [ 'enabled' => false, 'order' => 0, 'provider_id' => 'ys_ecpay' ],
-	'ys_ec_ecpay_atm'     => [ 'enabled' => false, 'order' => 1, 'provider_id' => 'ys_ecpay' ],
-	'ys_ec_ecpay_cvs'     => [ 'enabled' => false, 'order' => 2, 'provider_id' => 'ys_ecpay' ],
-	'ys_ec_ecpay_barcode' => [ 'enabled' => false, 'order' => 3, 'provider_id' => 'ys_ecpay' ],
-] );
+// 🔴 方式清單由型錄導出。抄一份「四個方式」的固定名單，等於把「只有四個方式」
+// 這件已經不成立的事鎖成契約——新增方式之後這個 fixture 會安靜地測不到它們。
+$payment_state_map = [];
+$order_index       = 0;
+foreach ( EcpayPaymentCatalog::ids() as $catalog_method_id ) {
+	$payment_state_map[ $catalog_method_id ] = [ 'enabled' => false, 'order' => $order_index++, 'provider_id' => 'ys_ecpay' ];
+}
+$payment_state = wp_json_encode( $payment_state_map );
 $method_base = [
 	'ys_ec_ecpay_enabled'                    => '1',
 	'ys_provider_ys_ecpay_enabled'            => '1',
 	'ys_capability_ys_ecpay_payment_enabled'  => '1',
 	'ys_capability_ys_ecpay_shipping_enabled' => '1',
 	'ys_methods_payment_state'                 => $payment_state,
-	'ys_ec_ecpay_credit_enabled'               => '0',
-	'ys_ec_ecpay_atm_enabled'                  => '0',
-	'ys_ec_ecpay_cvs_enabled'                  => '0',
-	'ys_ec_ecpay_barcode_enabled'              => '0',
 ];
+foreach ( Settings::payment_method_keys() as $catalog_option ) {
+	$method_base[ $catalog_option ] = '0';
+}
 
 v0216l_reset( $method_base );
 $_POST = [ 'ys_ec_ecpay_enabled' => '1', 'ys_ec_ecpay_credit_enabled' => '1' ];
@@ -1320,6 +1323,59 @@ v0216l_check( 'G15c incomplete method rollback keeps readers fail-closed',
 
 v0216l_check( 'G15d handle_save routes payment/shipping complete state through the atomic method transaction',
 	false !== strpos( $handle_save_source, 'apply_methods_tab_atomically( $tab, $provider_enabled )' ) );
+
+// ═══ P：0.4.0 新增的一般支付方式與分期期數 ═══
+
+// P1 型錄裡的每一個方式都走同一條存檔路徑——新增一個方式不需要動存檔端。
+v0216l_reset( $method_base );
+$_POST = [ 'ys_ec_ecpay_enabled' => '1', 'ys_ec_ecpay_webatm_enabled' => '1' ];
+$method_result = null === $method_tab ? null : (string) $method_tab->invoke( null, 'payment', true );
+$method_after  = json_decode( (string) ( $GLOBALS['v0216l_settings']['ys_methods_payment_state'] ?? '' ), true );
+v0216l_check( 'P1 a method added to the catalogue commits through the same save path',
+	'' === $method_result
+		&& '1' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_webatm_enabled'] ?? '' )
+		&& true === ( $method_after['ys_ec_ecpay_webatm']['enabled'] ?? null ),
+	'r=' . var_export( $method_result, true ) );
+
+// P2 lifecycle 鏡像必須涵蓋型錄的全部方式；少一個＝那個方式在 core 眼中不存在。
+v0216l_check( 'P2 the lifecycle mirror covers every catalogue method',
+	is_array( $method_after ) && array_keys( $method_after ) === EcpayPaymentCatalog::ids() );
+
+// P3 分期期數：不合法的值必須在存檔時丟掉，而不是原樣存起來等綠界退件。
+v0216l_reset( $method_base );
+$_POST = [ 'ys_ec_ecpay_enabled' => '1', Settings::CREDIT_INSTALLMENT_PERIODS => ' 12, 3 ,999,6,3,30n ' ];
+$method_result = null === $method_tab ? null : (string) $method_tab->invoke( null, 'payment', true );
+v0216l_check( 'P3 instalment periods are normalised: unknown values dropped, deduped, canonical order',
+	'' === $method_result
+		&& '3,6,12,30N' === ( $GLOBALS['v0216l_settings'][ Settings::CREDIT_INSTALLMENT_PERIODS ] ?? '(missing)' )
+		&& '3,6,12,30N' === Settings::credit_installment_periods(),
+	'r=' . var_export( $method_result, true ) . ' stored=' . var_export( $GLOBALS['v0216l_settings'][ Settings::CREDIT_INSTALLMENT_PERIODS ] ?? null, true ) );
+
+// P4 全部不合法＝存成空字串。空字串是「分期不可用」的訊號，不是「保留舊值」。
+v0216l_reset( $method_base + [ Settings::CREDIT_INSTALLMENT_PERIODS => '3,6' ] );
+$_POST = [ 'ys_ec_ecpay_enabled' => '1', Settings::CREDIT_INSTALLMENT_PERIODS => '7,99,abc' ];
+$method_result = null === $method_tab ? null : (string) $method_tab->invoke( null, 'payment', true );
+v0216l_check( 'P4 an all-invalid instalment list stores empty rather than keeping the old value',
+	'' === $method_result
+		&& '' === ( $GLOBALS['v0216l_settings'][ Settings::CREDIT_INSTALLMENT_PERIODS ] ?? '(missing)' ),
+	'r=' . var_export( $method_result, true ) );
+
+// P5 沒送這個欄位＝不變更（舊表單相容）。
+v0216l_reset( $method_base + [ Settings::CREDIT_INSTALLMENT_PERIODS => '3,6' ] );
+$_POST = [ 'ys_ec_ecpay_enabled' => '1' ];
+$method_result = null === $method_tab ? null : (string) $method_tab->invoke( null, 'payment', true );
+v0216l_check( 'P5 a form without the instalment field leaves the stored periods untouched',
+	'' === $method_result
+		&& '3,6' === ( $GLOBALS['v0216l_settings'][ Settings::CREDIT_INSTALLMENT_PERIODS ] ?? '(missing)' )
+		&& ! in_array( Settings::CREDIT_INSTALLMENT_PERIODS, $GLOBALS['v0216l_write_log'], true ),
+	'r=' . var_export( $method_result, true ) );
+
+// P6 正規化本身：大小寫、空白、重複、未知值。
+v0216l_check( 'P6 normalisation is order-canonical and rejects everything ECPay does not accept',
+	'3,6,12,18,24,30N' === Settings::normalize_credit_installments( '30n,24,18,12,6,3' )
+		&& '' === Settings::normalize_credit_installments( '' )
+		&& '' === Settings::normalize_credit_installments( '4,7,11,30' )
+		&& '5,8,9,10' === Settings::normalize_credit_installments( '10,9,8,5' ) );
 
 echo "\nRESULT: $pass pass / $fail fail\n";
 exit( $fail > 0 ? 1 : 0 );

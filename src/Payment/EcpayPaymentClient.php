@@ -27,11 +27,15 @@ final class EcpayPaymentClient {
 	 * 「是否全額」與可退餘額，於是永遠無法精確退回那一筆。`max(1, …)` 更會把
 	 * 0 元訂單悄悄變成 1 元交易。
 	 *
-	 * @param object $order
+	 * @param object                $order
+	 * @param array<string,string>  $extra_fields 方式專屬的額外 AIO 欄位（例如銀聯的
+	 *                                            `UnionPay=1`、分期的 `CreditInstallment`）。
+	 *                                            會在**簽章之前**併入，因此一定納入
+	 *                                            CheckMacValue。
 	 * @return array{action_url:string,fields:array<string,string>,charged_amount:int}
-	 * @throws \InvalidArgumentException 金額非 canonical TWD 正整數
+	 * @throws \InvalidArgumentException 金額非 canonical TWD 正整數，或額外欄位不合法
 	 */
-	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment ): array {
+	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment, array $extra_fields = [] ): array {
 		// 🔴 R14 reader lease：付款表單以當下 payment 憑證簽 CMV——設定 commit
 		// 期間簽出的表單可能帶著「隨後被回滾／被換掉」的 signer，顧客送回時
 		// 必失驗。lease 拿不到＝丟例外，caller 以「未送出任何付款」語意拒絕。
@@ -72,6 +76,28 @@ final class EcpayPaymentClient {
 			// 信用卡退款的關帳狀態查詢（CreditDetail/QueryTrade）以 gwsr 為 key。
 			'NeedExtraPaidInfo' => 'Y',
 		];
+
+		// 🔴 方式專屬欄位只能**新增**，不能覆寫上面任何一欄。
+		//
+		// 覆寫的後果不是「多送一個參數」：`TotalAmount` 被換掉＝顧客被扣的金額
+		// 與我們記下的 `charged_amount` 不一致（退款端據此判定全額／部分）；
+		// `ReturnURL` 被換掉＝付款通知不會回到我們手上。這兩者都是簽得出合法
+		// CheckMacValue、卻靜默錯掉的失敗。因此撞名一律拒絕建單。
+		//
+		// 併入必須在簽章之前——簽完再加的欄位不在 CheckMacValue 裡，綠界會直接
+		// 判為驗章失敗。
+		foreach ( $extra_fields as $name => $value ) {
+			$name = (string) $name;
+			if ( '' === $name || ! is_scalar( $value ) ) {
+				throw new \InvalidArgumentException( '綠界付款方式的額外欄位必須是非空欄位名對應純量值。' );
+			}
+			if ( array_key_exists( $name, $fields ) ) {
+				throw new \InvalidArgumentException(
+					sprintf( '綠界付款方式的額外欄位 %s 與建單欄位撞名，已拒絕建立付款表單。', $name )
+				);
+			}
+			$fields[ $name ] = (string) $value;
+		}
 
 		$fields['CheckMacValue'] = CheckMacValue::generate(
 			$fields,
