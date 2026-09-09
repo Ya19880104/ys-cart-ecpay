@@ -27,6 +27,7 @@ $build = v005_read($root . '/bin/build-release.php');
 // 排除政策已抽到 bin/release-policy.php（builder 與 v004 共用同一份）。本檔驗的是
 // 「政策內容」，因此要讀政策檔；builder 只保留呼叫端，另行斷言它確實委派過去。
 $policy = v005_read($root . '/bin/release-policy.php');
+$release_source = v005_read($root . '/bin/release-source.php');
 
 v005_check(
     false !== strpos($payment, '$this->verify_payment_payload( $params )')
@@ -100,7 +101,8 @@ v005_check(
     && false !== strpos($policy, "str_starts_with(\$base, '.env')")
     && false !== strpos($policy, "str_ends_with(\$relative, '.log')")
     && false !== strpos($build, "require_once __DIR__ . '/release-policy.php'")
-    && false !== strpos($build, 'ys_cart_ecpay_release_scan('),
+    && false !== strpos($build, 'ys_cart_ecpay_release_head(')
+    && false !== strpos($release_source, 'ys_cart_ecpay_release_exclusion_reason('),
     'release build must exclude internal plans, env files, and logs (policy shared with v004)'
 );
 

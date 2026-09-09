@@ -268,10 +268,10 @@ final class EcpayPaymentClient {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => 'ECPay payment settings are incomplete.' ];
 		}
 
-		// CreditCheckCode 為官方必填（綠界後台「信用卡收單」查詢檢查碼）——未設定即無法查詢。
+		// CreditCheckCode 是信用卡明細查詢的商家檢查碼，非一般收款必填設定。
 		$credit_check_code = (string) ( $credentials['credit_check_code'] ?? '' );
 		if ( '' === $credit_check_code ) {
-			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '尚未設定「信用卡查詢檢查碼」（CreditCheckCode），請至綠界設定頁填入後再執行退款。' ];
+			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '本站信用卡退款查詢尚未設定商家檢查碼；可在綠界設定的「信用卡退款進階設定」填入，或至綠界後台處理退款。一般收款不受影響。' ];
 		}
 		if ( '' === $gwsr || $amount <= 0 ) {
 			return [ 'success' => false, 'state' => 'unknown', 'raw' => null, 'message' => '缺少授權單號（gwsr）或金額，無法查詢關帳狀態。' ];

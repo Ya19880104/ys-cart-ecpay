@@ -17,8 +17,15 @@ Standalone ECPay provider plugin for YS CART.
   - Post
 - HOME requests can explicitly use either the B2C/home or C2C credential profile,
   matching the capabilities enabled for that MerchantID in ECPay's merchant console.
-- Changing the HOME profile is a maintenance operation: disable every HOME method
-  first. The plugin refuses the change while an active or legacy HOME label exists.
+- B2C/home and C2C independently use payment settings, separate settings, or no
+  credentials. Shared settings follow payment test mode; separate settings keep
+  their own test mode. Switching sources preserves the saved separate settings.
+- Administrators can change credentials after the on-page warning. Existing bound
+  payments and pending payment/logistics requests may be affected. Permission,
+  encryption, short writer exclusion, verified saving and rollback still apply.
+- The merchant check code (CreditCheckCode) is optional for normal payment setup.
+  It is used by the advanced credit-card refund query, with the official location
+  documented at https://developers.ecpay.com.tw/2894/.
 - Shipping method visibility, sorting, base rates, and free-shipping rules are managed in YS CART Shipping Settings.
 - ECPay CVS electronic map integration using YS CART's existing `cvs_store_id`, `cvs_store_name`, and `cvs_store_addr` checkout fields.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.

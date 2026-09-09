@@ -1,28 +1,9 @@
 <?php
 /**
- * v0.2.16 — api tab 原子管線（R13 compute-first）＋ provider 維護鎖契約。
- *
- * L1  全等儲存＝no-op（desired 空、零寫入）
- * L2  signer 變更＋active label → 拒絕，且**零寫入**（compute-first：拒絕的
- *     request 連一個暫時值都沒寫過——R12 的「寫了再回滾」出網窗口不存在）
- * L3  authority 查詢失敗 → 拒絕＋零寫入
- * L4  乾淨狀態開 reuse（payment 空→effective signer 不變）→ commit＋readback
- * L4b 開 reuse 且 payment 完整（signer 會變）＋active label → 拒絕＋零寫入
- * L5  mid-commit 寫入失敗 → 全量回滾：已寫鍵還原、**原本 absent 的鍵恢復
- *     absent（delete，不是寫 ''）**——test_mode 語意不被 '' 汙染
- * L6a clear 整組四鍵清空（維護態 commit）
- * L6b secret 空白＝保留（key 不進 desired）
- * G1  reuse 生效中旋轉 payment key＋active label → 拒絕＋OLDPAY 全程不動
- * G2  clear 使用中的 explicit 組（fallback 切換）＋active label → 拒絕＋零寫入
- * G3  signer 變更＋任一方法啟用 → 拒絕
- * G4  維護態（全停用＋零 label）clear → commit
- * G5  非 signer 變更＋active labels → 放行（不觸發 gate）
- * G6  reuse toggle 會改變 signer＋方法啟用 → 拒絕
- * G8  rollback 單鍵失敗 → signer_gate_rollback_failed；其餘鍵仍還原（全量掃、不早退）
- * P1  維護鎖持有中 → create_order 拒送＋零 HTTP（與設定 commit 共用同一把鎖）
- * P2  對照組：無鎖同 fixture → 通過 pre-send gate（在後續欄位驗證才中止）
- * P3  逾期鎖 → is_held()=false（lease 語意）
- * P4  鎖四件套：NX 取得／owner-conditional 釋放／被接管後 fence=false
+ * API 設定原子儲存與 provider 維護鎖契約。
+ * 金鑰更換只提醒，不要求先停用方式或清空歷史付款／物流單。
+ * 保留空值與 absent 的差異、加密、readback、全量 rollback、writer/reader 互斥。
+ * 新來源表單只處理 separate 群組；舊無來源欄位表單保持原保存語義。
  */
 
 declare(strict_types=1);
@@ -49,6 +30,7 @@ namespace {
 	function wp_unslash( $v ) { return $v; }
 	function current_time( string $f ) { return date( $f ); }
 	function rest_url( string $p = '' ) { return 'https://stub.local/wp-json/' . $p; }
+	function admin_url( string $p = '' ) { return 'https://stub.local/wp-admin/' . $p; }
 	function wp_strip_all_tags( $t ) { return (string) $t; }
 	function wp_json_encode( $value, int $flags = 0, int $depth = 512 ) { return json_encode( $value, $flags, $depth ); }
 	function get_transient( string $key ) {
@@ -74,6 +56,7 @@ namespace {
 		public $timeout_orders = 0;
 		public $cancelled_orders = 0;
 		public bool $error_mode = false; // 只影響 authority／orders 查詢
+		public int $authority_reads = 0;
 		public bool $lock_read_error = false;
 		public bool $takeover_before_marker_delete = false;
 		public bool $complete_b2c_before_writer_insert = false;
@@ -101,9 +84,11 @@ namespace {
 			if ( preg_match( "/SELECT setting_value FROM wp_ys_ec_settings WHERE setting_key = '([^']+)'/", $sql, $m ) ) {
 				$this->last_error = '';
 				return array_key_exists( $m[1], $GLOBALS['v0216l_settings'] )
+					&& '' !== (string) $GLOBALS['v0216l_settings'][ $m[1] ]
 					? (string) $GLOBALS['v0216l_settings'][ $m[1] ]
 					: null;
 			}
+			++$this->authority_reads;
 			if ( $this->error_mode ) {
 				$this->last_error = 'injected';
 				return null;
@@ -386,6 +371,7 @@ function v0216l_reset( array $settings = [] ): void {
 	$GLOBALS['wpdb']->timeout_orders    = 0;
 	$GLOBALS['wpdb']->cancelled_orders  = 0;
 	$GLOBALS['wpdb']->error_mode        = false;
+	$GLOBALS['wpdb']->authority_reads   = 0;
 	$GLOBALS['wpdb']->lock_read_error   = false;
 	$GLOBALS['wpdb']->takeover_before_marker_delete = false;
 	$GLOBALS['wpdb']->complete_b2c_before_writer_insert = false;
@@ -433,24 +419,27 @@ $r = v0216l_apply();
 v0216l_check( 'L1 identical save is a no-op with zero writes',
 	'' === $r && [] === $GLOBALS['v0216l_write_log'], "r=$r writes=" . count( $GLOBALS['v0216l_write_log'] ) );
 
-// ── L2 signer 變更＋active label → 拒絕＋零寫入（compute-first 核心證明）──
+// ── L2 signer 變更＋active label：只提醒，允許儲存 ──
 v0216l_reset( v0216l_full_c2c() );
 $GLOBALS['wpdb']->active_count = 1;
 $_POST = [ 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];
 $r = v0216l_apply();
-v0216l_check( 'L2 signer change with active labels refused with ZERO writes',
-	'signer_change_active_labels' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& '2000933' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '' ),
+v0216l_check( 'L2 signer change with active labels commits without changing label history',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& '' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '(missing)' )
+		&& 1 === $GLOBALS['wpdb']->active_count,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
-// ── L3 authority 查詢失敗 → 拒絕＋零寫入 ──
+// ── L3 儲存不需查歷史物流單，既有查詢錯誤不阻擋 ──
 v0216l_reset( v0216l_full_c2c() );
 $GLOBALS['wpdb']->error_mode = true;
 $_POST = [ 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];
 $r = v0216l_apply();
-v0216l_check( 'L3 authority lookup failure refused with zero writes',
-	'signer_change_label_lookup_failed' === $r && [] === $GLOBALS['v0216l_write_log'], "r=$r" );
+v0216l_check( 'L3 historical label lookup errors do not prevent a verified settings save',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& '' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '(missing)' )
+		&& 0 === $GLOBALS['wpdb']->authority_reads, "r=$r" );
 
 // ── L4 乾淨狀態開 reuse（payment 空→signer 不變）→ commit＋readback ──
 v0216l_reset( [ 'ys_ec_ecpay_enabled' => '1', 'ys_ec_ecpay_logistics_reuse_payment' => '0' ] );
@@ -461,15 +450,16 @@ v0216l_check( 'L4 reuse-on with empty payment commits (effective signer unchange
 		&& [] === $GLOBALS['v0216l_options'],
 	"r=$r lock=" . json_encode( $GLOBALS['v0216l_options'] ) );
 
-// ── L4b 開 reuse 且 payment 完整（signer 會變）＋active label → 拒絕＋零寫入 ──
+// ── L4b 開 reuse 且 payment 完整＋active label：設定仍可保存 ──
 v0216l_reset( v0216l_full_payment() + [ 'ys_ec_ecpay_logistics_reuse_payment' => '0' ] );
 $GLOBALS['wpdb']->active_count = 1;
 // 擬真表單：merchant_id 欄位會回傳現值、secret 空白＝保留、test_mode unchecked＝'0'==現值
 $_POST = [ 'ys_ec_ecpay_logistics_reuse_payment' => '1', 'ys_ec_ecpay_payment_merchant_id' => '3507531' ];
 $r = v0216l_apply();
-v0216l_check( 'L4b reuse-on that changes effective signer is gated with zero writes',
-	'signer_change_active_labels' === $r && [] === $GLOBALS['v0216l_write_log']
-		&& '0' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_reuse_payment'] ?? '' ),
+v0216l_check( 'L4b reuse-on with active labels commits the selected source',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& '1' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_reuse_payment'] ?? '' )
+		&& 1 === $GLOBALS['wpdb']->active_count,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
 // ── L5 mid-commit 失敗 → 全量回滾＋absent 語意（原 absent 鍵 delete 恢復，不是 ''）──
@@ -511,7 +501,7 @@ $r = v0216l_apply();
 v0216l_check( 'L6b blank secret is preserved',
 	'enc:KEEPKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_hash_key'] ?? '' ), "r=$r" );
 
-// ── G1 reuse 生效中旋轉 payment key＋active label → 拒絕＋OLDPAY 全程不動 ──
+// ── G1 reuse 生效中旋轉 payment key＋active label：允許並讀回新值 ──
 v0216l_reset( v0216l_full_payment( 'OLDPAY' ) + [ 'ys_ec_ecpay_logistics_reuse_payment' => '1' ] );
 $GLOBALS['wpdb']->active_count = 1;
 $_POST = [
@@ -520,30 +510,33 @@ $_POST = [
 	'ys_ec_ecpay_payment_hash_key'        => 'NEWKEY',
 ];
 $r = v0216l_apply();
-v0216l_check( 'G1 payment-key rotation under reuse+active labels refused; OLDPAY never touched',
-	'signer_change_active_labels' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& 'enc:OLDPAY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
+v0216l_check( 'G1 payment-key rotation under reuse with active labels commits the new key',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& 1 === $GLOBALS['wpdb']->active_count,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
-// ── G2 clear 使用中的 explicit 組（fallback 切到 reuse）＋active → 拒絕＋零寫入 ──
+// ── G2 clear 使用中的 explicit 組＋active：依管理員設定清除 ──
 v0216l_reset( v0216l_full_c2c() + v0216l_full_payment() + [ 'ys_ec_ecpay_logistics_reuse_payment' => '1' ] );
 $GLOBALS['wpdb']->active_count = 1;
 $_POST = [ 'ys_ec_ecpay_logistics_reuse_payment' => '1', 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];
 $r = v0216l_apply();
-v0216l_check( 'G2 clearing in-use explicit group refused with zero writes',
-	'signer_change_active_labels' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& '2000933' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '' ),
+v0216l_check( 'G2 clearing an in-use explicit group verifies the empty row',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& '' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '(missing)' )
+		&& 1 === $GLOBALS['wpdb']->active_count,
 	"r=$r" );
 
-// ── G3 signer 變更＋任一方法啟用（零 label）→ 拒絕 ──
+// ── G3 signer 變更不要求先停用物流方式 ──
 v0216l_reset( v0216l_full_c2c() + [ 'ys_ec_ecpay_ship_unimart_c2c_enabled' => '1' ] );
 $_POST = [ 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];
 $r = v0216l_apply();
-v0216l_check( 'G3 signer change with an enabled method is refused',
-	'signer_change_requires_methods_disabled' === $r
-		&& '2000933' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '' ),
+v0216l_check( 'G3 signer change commits while the shipping method stays enabled',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& '' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '(missing)' )
+		&& '1' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_ship_unimart_c2c_enabled'],
 	"r=$r" );
 
 // ── G4 維護態 clear → commit ──
@@ -561,15 +554,17 @@ $r = v0216l_apply();
 v0216l_check( 'G5 non-signer-affecting save passes without gate',
 	'' === $r && '2000933' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_merchant_id'] ?? '' ), "r=$r" );
 
-// ── G6 reuse toggle 會改變 signer＋方法啟用 → 拒絕 ──
+// ── G6 reuse toggle 不要求先停用物流方式 ──
 v0216l_reset( v0216l_full_payment() + [
 	'ys_ec_ecpay_logistics_reuse_payment' => '0',
 	'ys_ec_ecpay_ship_unimart_c2c_enabled' => '1',
 ] );
 $_POST = [ 'ys_ec_ecpay_logistics_reuse_payment' => '1', 'ys_ec_ecpay_payment_merchant_id' => '3507531' ];
 $r = v0216l_apply();
-v0216l_check( 'G6 signer-changing reuse toggle with enabled method refused',
-	'signer_change_requires_methods_disabled' === $r && [] === $GLOBALS['v0216l_write_log'], "r=$r" );
+v0216l_check( 'G6 signer-changing reuse toggle commits while the method stays enabled',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& '1' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_reuse_payment']
+		&& '1' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_ship_unimart_c2c_enabled'], "r=$r" );
 
 // ── G7 兩個 settings writer：B 的 signer compute 不得早於 writer acquire ──
 v0216l_reset( [
@@ -592,10 +587,11 @@ $_POST = [
 ];
 $r = v0216l_apply();
 v0216l_check( 'G7 signer snapshots are recomputed after writer acquire',
-	'signer_change_active_labels' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& 'MIDQ' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_b2c_home_merchant_id'] ?? '' )
-		&& 'enc:QKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_b2c_home_hash_key'] ?? '' ),
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& 'MIDP' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_b2c_home_merchant_id'] ?? '' )
+		&& 'enc:QKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_b2c_home_hash_key'] ?? '' )
+		&& [] === $GLOBALS['v0216l_options'],
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
 // ── G8 rollback 單鍵失敗 → 誠實回報＋其餘鍵仍還原（全量掃）──
@@ -909,26 +905,28 @@ v0216l_check( 'P8f fulfillment claim HMAC is covered by a reader lease and pre-u
 
 // ═══ G9~G11：payment signer authority（R14）═══
 
-// ── G9 payment key 旋轉＋pending ECPay 訂單 → 拒絕＋零寫入 ──
+// ── G9 payment key 旋轉＋pending ECPay 訂單：提醒不阻擋 ──
 v0216l_reset( v0216l_full_payment( 'OLDPAY' ) );
 $GLOBALS['wpdb']->pending_orders = 2;
 $_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_payment_hash_key' => 'NEWKEY' ];
 $r = v0216l_apply();
-v0216l_check( 'G9 payment-key rotation with unresolved ECPay attempts refused with zero writes',
-	'payment_signer_change_active_attempts' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& 'enc:OLDPAY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
+v0216l_check( 'G9 payment-key rotation commits while unresolved attempts remain unchanged',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& 2 === $GLOBALS['wpdb']->pending_orders,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
-// ── G9b ATM/CVS/barcode 取號後的 offline_payment 仍是未決 signer authority ──
+// ── G9b ATM/CVS/barcode 待付款不阻擋設定更換 ──
 v0216l_reset( v0216l_full_payment( 'OLDPAY' ) );
 $GLOBALS['wpdb']->offline_payment_orders = 1;
 $_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_payment_hash_key' => 'NEWKEY' ];
 $r = v0216l_apply();
-v0216l_check( 'G9b payment-key rotation with an offline_payment attempt is refused with zero writes',
-	'payment_signer_change_active_attempts' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& 'enc:OLDPAY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
+v0216l_check( 'G9b payment-key rotation commits while offline payment remains unchanged',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& 1 === $GLOBALS['wpdb']->offline_payment_orders,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
 // ── G9c/G9d status-only terminal history 無 release receipt，不能無界永久鎖死 rotation ──
@@ -948,13 +946,25 @@ v0216l_check( 'G9d historical cancelled rows do not permanently block signer rot
 	'' === $r && 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
 	"r=$r" );
 
-// ── G10 payment key 旋轉＋付款方式仍啟用 → 拒絕 ──
+// ── G9e 儲存不需查歷史付款單，查詢錯誤不阻擋 ──
+v0216l_reset( v0216l_full_payment( 'OLDPAY' ) );
+$GLOBALS['wpdb']->pending_orders = 2;
+$GLOBALS['wpdb']->error_mode = true;
+$_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_payment_hash_key' => 'NEWKEY' ];
+$r = v0216l_apply();
+v0216l_check( 'G9e historical payment lookup errors do not prevent a verified settings save',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& 0 === $GLOBALS['wpdb']->authority_reads && 2 === $GLOBALS['wpdb']->pending_orders, "r=$r" );
+
+// ── G10 payment key 旋轉不要求先停用付款方式 ──
 v0216l_reset( v0216l_full_payment( 'OLDPAY' ) + [ 'ys_ec_ecpay_credit_enabled' => '1' ] );
 $_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_payment_hash_key' => 'NEWKEY' ];
 $r = v0216l_apply();
-v0216l_check( 'G10 payment-key rotation with an enabled payment method refused',
-	'payment_signer_change_requires_methods_disabled' === $r
-		&& 'enc:OLDPAY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
+v0216l_check( 'G10 payment-key rotation commits while the payment method stays enabled',
+	'' === $r && [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& '1' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_credit_enabled'],
 	"r=$r" );
 
 // ── G11 維護態（方式停用＋零 pending）payment 旋轉 → commit ──
@@ -965,7 +975,109 @@ v0216l_check( 'G11 clean maintenance state commits the payment signer change',
 	'' === $r && 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' ),
 	"r=$r" );
 
-// ═══ G12：lifecycle 鏡像原子性（R14）——本段定義 stub lifecycle class，必須最後跑 ═══
+// ── M1 shared/disabled 群組的隱藏欄位不能覆寫已保存憑證 ──
+$mode_base = v0216l_full_payment() + v0216l_full_c2c() + [
+	'ys_ec_ecpay_logistics_reuse_payment' => '1',
+	'ys_ec_ecpay_logistics_b2c_home_test_mode' => '0',
+	'ys_ec_ecpay_logistics_b2c_home_merchant_id' => 'B2C-ORIGINAL',
+	'ys_ec_ecpay_logistics_b2c_home_hash_key' => 'enc:B2C-ORIGINAL-KEY',
+	'ys_ec_ecpay_logistics_b2c_home_hash_iv' => 'enc:B2C-ORIGINAL-IV',
+];
+$group_keys = array_fill_keys( array_merge( array_values( Settings::LOGISTICS_B2C_HOME_KEYS ), array_values( Settings::LOGISTICS_C2C_KEYS ) ), true );
+v0216l_reset( $mode_base );
+$groups_before = array_intersect_key( $GLOBALS['v0216l_settings'], $group_keys );
+$_POST = [
+	'ys_ec_ecpay_payment_merchant_id' => '3507531',
+	'ys_ec_ecpay_payment_hash_key' => 'NEXTKEY',
+	'ys_ec_ecpay_logistics_b2c_home_source' => 'payment',
+	'ys_ec_ecpay_logistics_c2c_source' => 'disabled',
+];
+foreach ( [ 'logistics_b2c_home', 'logistics_c2c' ] as $group ) {
+	foreach ( [ 'test_mode' => '1', 'merchant_id' => 'HIDDEN', 'hash_key' => 'HIDDEN', 'hash_iv' => 'HIDDEN', 'clear' => '1' ] as $field => $value ) {
+		$_POST[ 'ys_ec_ecpay_' . $group . '_' . $field ] = $value;
+	}
+}
+$r = v0216l_apply();
+v0216l_check( 'M1 shared and disabled modes ignore all hidden group credential inputs',
+	'' === $r && $groups_before === array_intersect_key( $GLOBALS['v0216l_settings'], $group_keys )
+		&& 'payment' === Settings::logistics_source_mode( 'b2c_home' )
+		&& 'disabled' === Settings::logistics_source_mode( 'c2c' ), "r=$r" );
+v0216l_check( 'M1b shared resolver follows saved payment while disabled resolver is empty',
+	Settings::payment_credentials() === Settings::logistics_credentials_for_channel( 'b2c' )
+		&& 'NEXTKEY' === Settings::logistics_credentials_for_channel( 'b2c' )['hash_key']
+		&& '' === Settings::logistics_credentials_for_channel( 'c2c' )['merchant_id'] );
+v0216l_check( 'M1c a new source form preserves the old reuse setting',
+	'1' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_reuse_payment']
+		&& ! in_array( 'ys_ec_ecpay_logistics_reuse_payment', $GLOBALS['v0216l_write_log'], true ) );
+
+// ── M2 separate 群組可輸入自己的完整憑證 ──
+v0216l_reset( $mode_base );
+$_POST = [
+	'ys_ec_ecpay_payment_merchant_id' => '3507531',
+	'ys_ec_ecpay_logistics_b2c_home_source' => 'separate',
+	'ys_ec_ecpay_logistics_c2c_source' => 'disabled',
+	'ys_ec_ecpay_logistics_b2c_home_test_mode' => '1',
+	'ys_ec_ecpay_logistics_b2c_home_merchant_id' => 'B2C-NEW',
+	'ys_ec_ecpay_logistics_b2c_home_hash_key' => 'B2C-NEW-KEY',
+	'ys_ec_ecpay_logistics_b2c_home_hash_iv' => 'B2C-NEW-IV',
+];
+$r = v0216l_apply();
+v0216l_check( 'M2 separate mode commits its own tuple and environment',
+	'' === $r && [ 'test_mode' => true, 'merchant_id' => 'B2C-NEW', 'hash_key' => 'B2C-NEW-KEY', 'hash_iv' => 'B2C-NEW-IV' ] === Settings::logistics_credentials_for_channel( 'b2c' ), "r=$r" );
+
+// ── M3 legacy 是 UI 留原狀選項，不建立 source 設定 ──
+v0216l_reset( $mode_base );
+$_POST = [
+	'ys_ec_ecpay_payment_merchant_id' => '3507531',
+	'ys_ec_ecpay_logistics_b2c_home_source' => 'legacy',
+	'ys_ec_ecpay_logistics_c2c_source' => 'legacy',
+	'ys_ec_ecpay_logistics_b2c_home_clear' => '1',
+	'ys_ec_ecpay_logistics_c2c_clear' => '1',
+];
+$r = v0216l_apply();
+v0216l_check( 'M3 legacy selection preserves groups and does not write source rows',
+	'' === $r && array_intersect_key( $mode_base, $group_keys ) === array_intersect_key( $GLOBALS['v0216l_settings'], $group_keys )
+		&& null === Settings::logistics_source_mode( 'b2c_home' ) && null === Settings::logistics_source_mode( 'c2c' )
+		&& [] === array_intersect( array_values( Settings::LOGISTICS_SOURCE_KEYS ), $GLOBALS['v0216l_write_log'] ), "r=$r" );
+
+// ── M4 無效 scalar/array mode 必須在設定寫入前拒絕 ──
+foreach ( [ 'unknown', 42, [] ] as $index => $invalid_mode ) {
+	v0216l_reset( $mode_base );
+	$_POST = [ 'ys_ec_ecpay_logistics_b2c_home_source' => $invalid_mode, 'ys_ec_ecpay_logistics_c2c_source' => 'payment' ];
+	$r = v0216l_apply();
+	v0216l_check( 'M4 invalid source shape ' . $index . ' is refused with zero writes',
+		'invalid_logistics_source' === $r && [] === $GLOBALS['v0216l_write_log'] && $mode_base === $GLOBALS['v0216l_settings'], "r=$r" );
+}
+
+// ── M5 舊無 mode 表單仍保存勾選與 clear 的原語義 ──
+v0216l_reset( $mode_base );
+$_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];
+$r = v0216l_apply();
+v0216l_check( 'M5 old form without source controls keeps its legacy checkbox and clear semantics',
+	'' === $r && '0' === $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_reuse_payment']
+		&& '' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_logistics_c2c_hash_key'] ?? '(missing)' )
+		&& null === Settings::logistics_source_mode( 'c2c' ), "r=$r" );
+
+// ── R1 settings_for_render 使用真來源 helper，僅推導可等價的畫面選擇 ──
+$b2c_only = array_intersect_key( $mode_base, array_fill_keys( array_values( Settings::LOGISTICS_B2C_HOME_KEYS ), true ) );
+$render_cases = [
+	'persisted choice' => [ $mode_base + [ Settings::LOGISTICS_SOURCE_KEYS['b2c_home'] => 'payment', Settings::LOGISTICS_SOURCE_KEYS['c2c'] => 'disabled' ], [ 'payment', 'disabled' ] ],
+	'invalid persisted mode' => [ [ Settings::LOGISTICS_SOURCE_KEYS['b2c_home'] => '' ], [ 'legacy', 'disabled' ] ],
+	'complete separate group' => [ $b2c_only, [ 'separate', 'disabled' ] ],
+	'partial separate group' => [ [ Settings::LOGISTICS_B2C_HOME_KEYS['merchant_id'] => 'PARTIAL' ], [ 'legacy', 'disabled' ] ],
+	'legacy credentials' => [ [ Settings::LOGISTICS_KEYS['merchant_id'] => 'LEGACY' ], [ 'legacy', 'legacy' ] ],
+	'old shared source' => [ v0216l_full_payment() + [ 'ys_ec_ecpay_logistics_reuse_payment' => '1' ], [ 'payment', 'payment' ] ],
+	'ambiguous duplicate groups' => [ array_combine( array_values( Settings::LOGISTICS_C2C_KEYS ), array_values( $b2c_only ) ) + $b2c_only, [ 'legacy', 'legacy' ] ],
+];
+foreach ( $render_cases as $label => [ $stored, $expected ] ) {
+	v0216l_reset( $stored );
+	$rendered = EcpaySettings::settings_for_render();
+	v0216l_check( 'R1 render ' . $label . ' preserves effective meaning without writes',
+		$expected === [ $rendered['logistics_b2c_home_source_mode'], $rendered['logistics_c2c_source_mode'] ]
+			&& $stored === $GLOBALS['v0216l_settings'] && [] === $GLOBALS['v0216l_write_log'] );
+}
+
+// ═══ G12：lifecycle class stub 自此啟用 ═══
 eval( <<<'PHP'
 namespace YangSheep\Ecommerce\Core\Provider;
 final class YSProviderLifecycleState {
@@ -1098,18 +1210,21 @@ v0216l_check( 'G14e provider mirror uses non-mutating DB snapshot and verified l
 		&& '0' === ( $GLOBALS['v0216l_settings']['ys_provider_ys_ecpay_enabled'] ?? '' ),
 	'r=' . $provider_pair_result );
 
-// ── G14f API signer gate 不得透過 Core read 偷做 lazy migration ──
+// ── G14f API 儲存一次更新 signer 與所需 lifecycle rows，不呼叫 lazy read ──
 v0216l_reset( v0216l_full_payment( 'OLDPAY' ) + [
 	'ys_ec_ecpay_enabled'        => '1',
 	'ys_ec_ecpay_credit_enabled' => '0',
 ] );
 $_POST = [ 'ys_ec_ecpay_enabled' => '1', 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_payment_hash_key' => 'NEWKEY' ];
+\YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::$provider_read_saw_writer = false;
 $r = v0216l_apply();
-v0216l_check( 'G14f refused signer rotation models missing lifecycle migration with ZERO writes',
-	'payment_signer_change_requires_methods_disabled' === $r
-		&& [] === $GLOBALS['v0216l_write_log']
-		&& ! array_key_exists( 'ys_provider_ys_ecpay_enabled', $GLOBALS['v0216l_settings'] )
-		&& ! array_key_exists( 'ys_methods_payment_state', $GLOBALS['v0216l_settings'] ),
+v0216l_check( 'G14f signer rotation commits verified lifecycle rows without a lazy Core read',
+	'' === $r
+		&& [] !== $GLOBALS['v0216l_write_log']
+		&& 'enc:NEWKEY' === ( $GLOBALS['v0216l_settings']['ys_ec_ecpay_payment_hash_key'] ?? '' )
+		&& '1' === ( $GLOBALS['v0216l_settings']['ys_provider_ys_ecpay_enabled'] ?? '' )
+		&& true === ( json_decode( $GLOBALS['v0216l_settings']['ys_methods_payment_state'] ?? '', true )['ys_ec_ecpay_credit']['enabled'] ?? null )
+		&& false === \YangSheep\Ecommerce\Core\Provider\YSProviderLifecycleState::$provider_read_saw_writer,
 	"r=$r writes=" . implode( ',', $GLOBALS['v0216l_write_log'] ) );
 
 // ═══ G15：method legacy rows/list/L3 mirror 是同一個 writer transaction ═══

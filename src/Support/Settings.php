@@ -47,6 +47,12 @@ final class Settings {
 		'hash_iv'     => 'ys_ec_ecpay_logistics_c2c_hash_iv',
 	];
 
+	/** Explicit source selection; absent rows retain the legacy resolver. */
+	public const LOGISTICS_SOURCE_KEYS = [
+		'b2c_home' => 'ys_ec_ecpay_logistics_b2c_home_source',
+		'c2c'      => 'ys_ec_ecpay_logistics_c2c_source',
+	];
+
 	/** Which explicit credential profile signs HOME requests. */
 	public const HOME_CREDENTIAL_FAMILY = 'ys_ec_ecpay_home_credential_family';
 	public const FAMILY_B2C_HOME = 'b2c_home';
@@ -110,13 +116,13 @@ final class Settings {
 	public static function db_probe( string $key ): array {
 		global $wpdb;
 		$fail = [ 'ok' => false, 'existed' => false, 'value' => '' ];
-		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_var' ) ) {
+		if ( ! is_object( $wpdb ) || ! method_exists( $wpdb, 'prepare' ) || ! method_exists( $wpdb, 'get_row' ) ) {
 			return $fail;
 		}
 		$table            = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'settings';
 		$wpdb->last_error = '';
 		try {
-			$value = $wpdb->get_var( $wpdb->prepare(
+			$row = $wpdb->get_row( $wpdb->prepare(
 				"SELECT setting_value FROM {$table} WHERE setting_key = %s",
 				$key
 			) );
@@ -127,7 +133,14 @@ final class Settings {
 			return $fail;
 		}
 
-		return [ 'ok' => true, 'existed' => null !== $value, 'value' => null === $value ? '' : (string) $value ];
+		if ( null === $row ) {
+			return [ 'ok' => true, 'existed' => false, 'value' => '' ];
+		}
+		if ( ! is_object( $row ) || ! property_exists( $row, 'setting_value' ) || ! is_scalar( $row->setting_value ) ) {
+			return $fail;
+		}
+
+		return [ 'ok' => true, 'existed' => true, 'value' => (string) $row->setting_value ];
 	}
 
 	/**
@@ -212,6 +225,35 @@ final class Settings {
 	}
 
 	/**
+	 * null means no explicit selection; an invalid or unreadable selection is ''.
+	 *
+	 * @param array<string,string|null>|null $pending
+	 */
+	public static function logistics_source_mode( string $family, ?array $pending = null ): ?string {
+		$key = self::LOGISTICS_SOURCE_KEYS[ $family ] ?? '';
+		if ( '' === $key ) {
+			return '';
+		}
+		if ( null !== $pending && array_key_exists( $key, $pending ) ) {
+			$value = $pending[ $key ];
+			if ( null === $value ) {
+				return null;
+			}
+		} else {
+			$probe = self::db_probe( $key );
+			if ( ! $probe['ok'] ) {
+				return '';
+			}
+			if ( ! $probe['existed'] ) {
+				return null;
+			}
+			$value = $probe['value'];
+		}
+
+		return in_array( $value, [ 'disabled', 'payment', 'separate' ], true ) ? $value : '';
+	}
+
+	/**
 	 * Resolve credentials for an exact provider catalog channel.
 	 *
 	 * HOME is an independent ECPay LogisticsType. Production merchants may have
@@ -231,6 +273,17 @@ final class Settings {
 		$family = self::credential_family_for_channel( $channel, $pending );
 		if ( '' === $family ) {
 			return self::empty_credentials();
+		}
+
+		$source = self::logistics_source_mode( $family, $pending );
+		if ( null !== $source ) {
+			if ( 'disabled' === $source || '' === $source ) {
+				return self::empty_credentials();
+			}
+			$selected = 'payment' === $source
+				? self::payment_credentials( $pending )
+				: self::credentials( self::FAMILY_C2C === $family ? self::LOGISTICS_C2C_KEYS : self::LOGISTICS_B2C_HOME_KEYS, $pending );
+			return self::credentials_complete( $selected ) ? $selected : self::empty_credentials();
 		}
 
 		$b2c = self::credentials( self::LOGISTICS_B2C_HOME_KEYS, $pending );
@@ -276,12 +329,13 @@ final class Settings {
 		// and enabled method switches must identify exactly one credential family.
 		// This supports a single-family historical install without ever allowing
 		// the old tuple to service B2C/home and C2C simultaneously.
-		if ( self::credentials_started( $b2c ) || self::credentials_started( $c2c )
+		if ( ! self::credentials_complete( $legacy )
+			|| self::credentials_started( $b2c ) || self::credentials_started( $c2c )
 			|| $family !== self::unambiguous_legacy_family( $pending ) ) {
 			return self::empty_credentials();
 		}
 
-		return self::credentials_complete( $legacy ) ? $legacy : self::empty_credentials();
+		return $legacy;
 	}
 
 	/**

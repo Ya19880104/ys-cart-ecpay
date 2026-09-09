@@ -146,6 +146,7 @@ final class EcpaySettings {
 			array_values( Settings::LOGISTICS_B2C_HOME_KEYS ),
 			array_values( Settings::LOGISTICS_C2C_KEYS ),
 			array_values( Settings::LOGISTICS_KEYS ),
+			array_values( Settings::LOGISTICS_SOURCE_KEYS ),
 			[ 'ys_ec_ecpay_logistics_reuse_payment', Settings::HOME_CREDENTIAL_FAMILY ]
 		) ) );
 		$overlay = [];
@@ -193,8 +194,7 @@ final class EcpaySettings {
 	 *   Phase B  以 pending overlay 評估 before/after effective signer（零寫入）
 	 *   Phase C  取得 provider 維護鎖——出網 pre-send 讀同一把鎖，鎖持有中
 	 *            一律拒送（bracket 檢查），寫入窗口內沒有任何簽章請求出網
-	 *   Phase D  signer 變更時鎖內驗 gate：全部物流方式停用＋零 active/legacy
-	 *            label＋查詢成功
+	 *   金鑰變更由管理員確認頁面上的影響提示；不要求停用方式或清空歷史單據。
 	 *   Phase E  commit：每鍵 {existed,value} 備份（DB 直讀）→ fence → 寫入
 	 *            ＋DB readback → effective signer 對 after 驗證
 	 *   Phase F  任何失敗：**全量**回滾（不早退；原本不存在的 row 用 delete
@@ -217,7 +217,25 @@ final class EcpaySettings {
 			$desired[ Settings::HOME_CREDENTIAL_FAMILY ] = $family;
 		}
 
-		$desired['ys_ec_ecpay_logistics_reuse_payment'] = isset( $_POST['ys_ec_ecpay_logistics_reuse_payment'] ) ? '1' : '0';
+		$source_modes = [];
+		foreach ( Settings::LOGISTICS_SOURCE_KEYS as $family => $key ) {
+			if ( ! array_key_exists( $key, $_POST ) ) {
+				continue;
+			}
+			$mode = is_string( $_POST[ $key ] ) ? wp_unslash( $_POST[ $key ] ) : '';
+			if ( ! in_array( $mode, [ 'disabled', 'payment', 'separate', 'legacy' ], true ) ) {
+				return 'invalid_logistics_source';
+			}
+			$source_modes[ 'logistics_' . $family ] = $mode;
+			if ( 'legacy' !== $mode ) {
+				$desired[ $key ] = $mode;
+			}
+		}
+		// New forms choose each family separately. Preserve the old switch for
+		// families still using legacy resolution; old forms keep their behavior.
+		if ( [] === $source_modes || array_key_exists( 'ys_ec_ecpay_logistics_reuse_payment', $_POST ) ) {
+			$desired['ys_ec_ecpay_logistics_reuse_payment'] = isset( $_POST['ys_ec_ecpay_logistics_reuse_payment'] ) ? '1' : '0';
+		}
 
 		try {
 			foreach ( [
@@ -225,6 +243,9 @@ final class EcpaySettings {
 				'logistics_b2c_home' => Settings::LOGISTICS_B2C_HOME_KEYS,
 				'logistics_c2c'      => Settings::LOGISTICS_C2C_KEYS,
 			] as $prefix => $keys ) {
+				if ( isset( $source_modes[ $prefix ] ) && 'separate' !== $source_modes[ $prefix ] ) {
+					continue; // Hidden group inputs cannot erase or replace saved credentials.
+				}
 				$desired += self::desired_credentials_group( $prefix, $keys );
 			}
 		} catch ( \RuntimeException $e ) {
@@ -277,45 +298,7 @@ final class EcpaySettings {
 			foreach ( $desired as $key => $value ) {
 				$after_overlay[ $key ] = $value;
 			}
-			$after             = self::signer_snapshot( $after_overlay );
-			$logistics_changed = [ $before['b2c'], $before['home'], $before['c2c'] ]
-				!== [ $after['b2c'], $after['home'], $after['c2c'] ];
-			$payment_changed   = $before['payment'] !== $after['payment'];
-
-			// ── Phase C：signer 變更 gate（鎖內驗；此刻起新 reader 全被拒，
-			// 既有 reader 已在 acquire 的 readers-clear 檢查中排除）──
-			if ( $logistics_changed ) {
-				foreach ( EcpayShippingCatalog::all() as $method_id => $descriptor ) {
-					if ( self::home_method_is_enabled( (string) $method_id, $descriptor ) ) {
-						return 'signer_change_requires_methods_disabled';
-					}
-				}
-				$authority = self::all_methods_authority_state();
-				if ( 'error' === $authority ) {
-					return 'signer_change_label_lookup_failed';
-				}
-				if ( 'active' === $authority ) {
-					return 'signer_change_active_labels';
-				}
-			}
-			// 🔴 R14：payment signer 變更＝維護操作——(a) 全部付款方式停用
-			// （已簽出的結帳表單以舊 key 送回會失驗）(b) 零 unresolved payment
-			// attempt（pending 的 ECPay 訂單其 ReturnURL/notify/query 都按當下
-			// 憑證驗章，rotation 會讓結果無法收斂）(c) 狀態查詢成功。
-			if ( $payment_changed ) {
-				foreach ( self::PAYMENT_GATEWAY_IDS as $alias => $gateway_id ) {
-					if ( self::payment_method_is_enabled( $alias, $gateway_id ) ) {
-						return 'payment_signer_change_requires_methods_disabled';
-					}
-				}
-				$attempts = self::unresolved_payment_attempts_state();
-				if ( 'error' === $attempts ) {
-					return 'payment_signer_change_attempt_lookup_failed';
-				}
-				if ( 'active' === $attempts ) {
-					return 'payment_signer_change_active_attempts';
-				}
-			}
+			$after = self::signer_snapshot( $after_overlay );
 
 			// ── Phase E：commit（{existed,value} 備份→fence→寫入＋DB readback）──
 			// Core L1/L2/L3 lifecycle rows are in $desired as ordinary verified rows,
@@ -807,6 +790,9 @@ final class EcpaySettings {
 
 		$settings     = self::settings_for_render();
 		$nonce_action = self::NONCE_ACTION;
+		if ( 'api' === $settings['tab'] ) {
+			wp_enqueue_script( 'ys-cart-ecpay-admin-settings', YS_CART_ECPAY_URL . 'assets/js/admin-settings.js', [], YS_CART_ECPAY_VERSION, true );
+		}
 
 		if ( class_exists( YSAdminApp::class ) ) {
 			YSAdminApp::open( '綠界 ECPay 設定', '金物流 / 綠界' );
@@ -887,6 +873,9 @@ final class EcpaySettings {
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_key'], '' )
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_iv'], '' );
 		$out['home_credential_family'] = Settings::home_credential_family();
+		foreach ( Settings::LOGISTICS_SOURCE_KEYS as $family => $key ) {
+			$out[ 'logistics_' . $family . '_source_mode' ] = self::logistics_source_for_render( $family, $out );
+		}
 
 		$gateway_enabled_list  = self::read_enabled_list( 'gateway_enabled_list' );
 		$shipping_enabled_list = self::read_enabled_list( 'ys_ec_shipping_enabled_list' );
@@ -907,6 +896,29 @@ final class EcpaySettings {
 		}
 
 		return $out;
+	}
+
+	/** Show an equivalent choice without silently activating an old ambiguous tuple. */
+	private static function logistics_source_for_render( string $family, array $settings ): string {
+		$mode = Settings::logistics_source_mode( $family );
+		if ( null !== $mode ) {
+			return '' === $mode ? 'legacy' : $mode;
+		}
+		$prefix = 'logistics_' . $family;
+		$started = '' !== $settings[ $prefix . '_merchant_id' ]
+			|| $settings[ $prefix . '_hash_key_is_set' ] || $settings[ $prefix . '_hash_iv_is_set' ];
+		if ( $started ) {
+			$effective = Settings::logistics_credentials_for_channel( 'c2c' === $family ? 'c2c' : 'b2c' );
+			return '' !== $effective['merchant_id'] && '' !== $effective['hash_key'] && '' !== $effective['hash_iv']
+				? 'separate' : 'legacy';
+		}
+		if ( $settings['legacy_logistics_credentials_present'] ) {
+			return 'legacy';
+		}
+		$other = 'logistics_' . ( 'c2c' === $family ? 'b2c_home' : 'c2c' );
+		$other_started = '' !== $settings[ $other . '_merchant_id' ]
+			|| $settings[ $other . '_hash_key_is_set' ] || $settings[ $other . '_hash_iv_is_set' ];
+		return $settings['logistics_reuse_payment'] && ! $other_started ? 'payment' : 'disabled';
 	}
 
 	private static function normalize_tab( string $tab ): string {
