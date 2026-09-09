@@ -1049,6 +1049,43 @@ foreach ( [ 'unknown', 42, [] ] as $index => $invalid_mode ) {
 		'invalid_logistics_source' === $r && [] === $GLOBALS['v0216l_write_log'] && $mode_base === $GLOBALS['v0216l_settings'], "r=$r" );
 }
 
+// ── N1 交易模式：未實作的模式必須在寫入前整批拒絕，不得靜默降級 ──
+//
+// 這條的重點不是「拒絕」而是「不靜默降級」：若把 ecpg_web 存成 redirect，
+// 使用者會以為已切到站內付、實際仍走導轉，那是最難察覺的失敗形態。
+foreach ( [ 'ecpg_web', 'period', 'unknown' ] as $index => $unsupported ) {
+	v0216l_reset( $mode_base );
+	$_POST = [ Settings::PAYMENT_MODE => $unsupported ];
+	$r = v0216l_apply();
+	v0216l_check( 'N1 unsupported transaction mode ' . $index . ' is refused with zero writes',
+		'unsupported_payment_mode' === $r
+			&& [] === $GLOBALS['v0216l_write_log']
+			&& $mode_base === $GLOBALS['v0216l_settings']
+			&& ! array_key_exists( Settings::PAYMENT_MODE, $GLOBALS['v0216l_settings'] ), "r=$r" );
+}
+
+// ── N2 已實作的模式存得進去，且 payment_mode() 讀得回來 ──
+v0216l_reset( $mode_base );
+$_POST = [ Settings::PAYMENT_MODE => 'redirect' ];
+$r = v0216l_apply();
+v0216l_check( 'N2 the implemented redirect mode commits and reads back',
+	'' === $r
+		&& 'redirect' === ( $GLOBALS['v0216l_settings'][ Settings::PAYMENT_MODE ] ?? '' )
+		&& 'redirect' === Settings::payment_mode(), "r=$r" );
+
+// ── N3 沒送這個欄位＝不變更（舊表單相容） ──
+v0216l_reset( $mode_base + [ Settings::PAYMENT_MODE => 'redirect' ] );
+$_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531' ];
+$r = v0216l_apply();
+v0216l_check( 'N3 a form without the mode field leaves the stored mode untouched',
+	'' === $r && 'redirect' === ( $GLOBALS['v0216l_settings'][ Settings::PAYMENT_MODE ] ?? '' )
+		&& ! in_array( Settings::PAYMENT_MODE, $GLOBALS['v0216l_write_log'], true ), "r=$r" );
+
+// ── N4 資料列被人為改成未實作的值時，讀取端仍回退到唯一有實作的模式 ──
+v0216l_reset( $mode_base + [ Settings::PAYMENT_MODE => 'ecpg_web' ] );
+v0216l_check( 'N4 a hand-edited unsupported row still resolves to the implemented mode',
+	'redirect' === Settings::payment_mode() );
+
 // ── M5 舊無 mode 表單仍保存勾選與 clear 的原語義 ──
 v0216l_reset( $mode_base );
 $_POST = [ 'ys_ec_ecpay_payment_merchant_id' => '3507531', 'ys_ec_ecpay_logistics_c2c_clear' => '1' ];

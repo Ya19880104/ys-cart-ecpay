@@ -27,6 +27,14 @@ Standalone ECPay provider plugin for YS CART.
 - Administrators can change credentials after the on-page warning. Existing bound
   payments and pending payment/logistics requests may be affected. Permission,
   encryption, short writer exclusion, verified saving and rollback still apply.
+- The API tab exposes ECPay's transaction modes and this plugin's support for each.
+  Redirect (AIO) is the only implemented mode and stays the default: the card number
+  never reaches this site, so there is no PCI-DSS burden, and it does not charge
+  subscriptions automatically. ECPG Web (站內付 2.0) and AIO period contracts are
+  shown with their prerequisites but cannot be selected; posting one is refused with
+  `unsupported_payment_mode` rather than silently falling back. Background
+  authorisation (card numbers sent from this server) requires PCI-DSS SAQ-D and is
+  out of scope.
 - The merchant check code (CreditCheckCode) is optional for normal payment setup.
   It is used by the advanced credit-card refund query, with the official location
   documented at https://developers.ecpay.com.tw/2894/.

@@ -53,6 +53,45 @@ final class Settings {
 		'c2c'      => 'ys_ec_ecpay_logistics_c2c_source',
 	];
 
+	/**
+	 * 綠界交易模式。**目前只有一般支付（導轉 AIO）真的可用。**
+	 *
+	 * 綠界的金流分成幾種彼此獨立的服務，本外掛的支援狀態不同：
+	 *
+	 *   redirect  一般支付（全方位金流 AIO 導轉）——消費者跳到綠界付款頁完成付款，
+	 *             卡號全程不經過本站。信用卡／ATM／超商代碼／超商條碼皆走這條。
+	 *             **已實作，本外掛目前唯一可用的模式。不支援訂閱自動扣款。**
+	 *   ecpg_web  站內付 2.0 Web——綠界 JS SDK 在本站頁面渲染付款欄位，卡號直送綠界，
+	 *             官方載明無需 PCI-DSS。需先向綠界申請開通。**尚未實作。**
+	 *   period    定期定額（AIO 訂閱）——由綠界自己排程扣款並每期回呼通知我方。
+	 *             **尚未實作。**
+	 *
+	 * 🔴 未實作的模式不得被寫入：`payment_mode()` 對任何非 redirect 的值都回 redirect，
+	 * 儲存端也只接受 redirect。這是刻意的——讓使用者「選得到但存不進」會產生一個
+	 * 以為已切換、實際仍走舊路徑的假象，比不給選更危險。
+	 */
+	public const PAYMENT_MODE = 'ys_ec_ecpay_payment_mode';
+	public const MODE_REDIRECT = 'redirect';
+	public const MODE_ECPG_WEB = 'ecpg_web';
+	public const MODE_PERIOD   = 'period';
+
+	/** 本外掛目前真的能執行的交易模式。 */
+	public const IMPLEMENTED_PAYMENT_MODES = [ self::MODE_REDIRECT ];
+
+	/**
+	 * 目前生效的交易模式。未實作或無法辨識的值一律回一般支付。
+	 *
+	 * 讀不到設定（新站、DB 錯誤）也回一般支付：它是唯一有實作的模式，
+	 * 退到它不會讓任何既有站台的付款行為改變。
+	 */
+	public static function payment_mode(): string {
+		$stored = (string) self::get( self::PAYMENT_MODE, self::MODE_REDIRECT );
+
+		return in_array( $stored, self::IMPLEMENTED_PAYMENT_MODES, true )
+			? $stored
+			: self::MODE_REDIRECT;
+	}
+
 	/** Which explicit credential profile signs HOME requests. */
 	public const HOME_CREDENTIAL_FAMILY = 'ys_ec_ecpay_home_credential_family';
 	public const FAMILY_B2C_HOME = 'b2c_home';

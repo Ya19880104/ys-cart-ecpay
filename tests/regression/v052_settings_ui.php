@@ -16,16 +16,21 @@ function admin_url(string $path): string { return 'https://fixture.invalid/wp-ad
 function add_query_arg(string $key, string $value, string $url): string { return $url . '&' . rawurlencode($key) . '=' . rawurlencode($value); }
 function checked(mixed $actual, mixed $expected = true): void { if ((string) $actual === (string) $expected) { echo 'checked="checked"'; } }
 function selected(mixed $actual, mixed $expected): void { if ((string) $actual === (string) $expected) { echo 'selected="selected"'; } }
+function disabled(mixed $actual, mixed $expected = true): void { if ((string) $actual === (string) $expected) { echo 'disabled="disabled"'; } }
+function rest_url(string $path = ''): string { return 'https://fixture.invalid/wp-json/' . ltrim($path, '/'); }
+function wp_json_encode(mixed $value, int $flags = 0): string { return (string) json_encode($value, $flags | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); }
+function wp_create_nonce(string $action = ''): string { return 'fixture-rest-nonce'; }
 function wp_nonce_field(string $action): void { echo '<input type="hidden" name="_wpnonce" value="fixture-nonce">'; }
 function sanitize_key(string $value): string { return preg_replace('/[^a-z0-9_-]/', '', strtolower($value)); }
 function wp_unslash(string $value): string { return stripslashes($value); }
 
-function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c'): string {
+function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c', bool $testMode = true): string {
     $_GET = $error === '' ? [] : ['settings_error' => $error];
     $settings = [
         'tab' => $tab, 'tabs' => ['api' => 'API', 'payment' => '金流', 'shipping' => '物流'],
         'enabled' => true, 'payment_credit_check_code_is_set' => true,
         'home_credential_family' => $family, 'logistics_reuse_payment' => true,
+        'payment_mode' => 'redirect', 'payment_modes_implemented' => ['redirect'],
         'legacy_logistics_credentials_present' => true,
         'logistics_b2c_home_source_mode' => $b2c, 'logistics_c2c_source_mode' => $c2c,
         'payment_methods' => ['credit' => '信用卡'], 'credit_enabled' => true,
@@ -33,7 +38,7 @@ function render_settings(string $b2c = 'disabled', string $c2c = 'payment', stri
         'sender_name' => 'Fixture', 'sender_phone' => '', 'sender_zipcode' => '', 'sender_address' => '',
     ];
     foreach (['payment', 'logistics_b2c_home', 'logistics_c2c'] as $group) {
-        $settings[$group . '_test_mode'] = true;
+        $settings[$group . '_test_mode'] = 'payment' === $group ? $testMode : true;
         $settings[$group . '_merchant_id'] = 'fixture-"<&' . $group;
         $settings[$group . '_hash_key_is_set'] = true;
         $settings[$group . '_hash_iv_is_set'] = true;
@@ -126,6 +131,31 @@ $homeBoth = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home'));
 $bothDetails = first($homeBoth, '//details[summary="宅配使用的設定"]');
 check('home family shown collapsed without warning when both groups are in use', $bothDetails !== null && !$bothDetails->hasAttribute('open') && !str_contains($homeBoth->document->textContent, '已設為「不使用」') && first($homeBoth, '//select[@name="ys_ec_ecpay_home_credential_family"]//option[@value="b2c_home"][@selected]') !== null);
 check('obsolete gate error strings are gone', !str_contains(dom(render_settings('disabled', 'disabled', 'api', 'signer_change_active_labels'))->document->textContent, '仍有未結束或升級前的物流單'));
+// ── 交易模式：只有已實作的模式可選，未實作的看得到但存不進 ──
+$modeXp = dom(render_settings('payment', 'separate'));
+$modeInputs = [];
+foreach ($modeXp->query('//input[@name="ys_ec_ecpay_payment_mode"]') as $input) {
+    $modeInputs[$input->getAttribute('value')] = [
+        'type' => $input->getAttribute('type'),
+        'disabled' => $input->hasAttribute('disabled'),
+        'checked' => $input->hasAttribute('checked'),
+    ];
+}
+check('all three ECPay transaction modes are visible', array_keys($modeInputs) === ['redirect', 'ecpg_web', 'period']);
+check('only the implemented mode is selectable and preselected', ($modeInputs['redirect'] ?? null) !== null && !$modeInputs['redirect']['disabled'] && $modeInputs['redirect']['checked']);
+check('unimplemented modes are shown but cannot be submitted', ($modeInputs['ecpg_web']['disabled'] ?? false) && ($modeInputs['period']['disabled'] ?? false));
+$modeText = $modeXp->document->textContent;
+check('redirect mode states no PCI burden and no subscription support', str_contains($modeText, '卡號全程不經過本站') && str_contains($modeText, '不支援訂閱自動扣款'));
+check('ECPG mode states it needs application and carries no PCI-DSS requirement', str_contains($modeText, '無需 PCI-DSS') && str_contains($modeText, '申請開通'));
+check('background authorisation is explicitly declared out of scope', str_contains($modeText, 'PCI-DSS SAQ-D') && str_contains($modeText, '不支援、也不規劃支援'));
+check('server IP helper is present and does not claim a mandatory allow list', first($modeXp, '//code[@id="ys-ec-ecpay-server-ip"]') !== null && str_contains($modeText, '並未要求設定 IP 白名單'));
+check('unsupported mode rejection is visible', str_contains(dom(render_settings('disabled', 'disabled', 'api', 'unsupported_payment_mode'))->document->textContent, '本外掛尚未支援'));
+
+// ── 測試／正式環境：畫面要說得出目前打哪個端點 ──
+$prodXp = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home', false));
+check('production mode names the live endpoint', str_contains($prodXp->document->textContent, 'payment.ecpay.com.tw') && str_contains($prodXp->document->textContent, '會真實扣款'));
+check('test mode names the stage endpoint', str_contains($modeText, 'payment-stage.ecpay.com.tw') && str_contains($modeText, '不會真的扣款'));
+
 $failed = array_values(array_filter($checks, static fn(array $check): bool => !$check['pass']));
 echo json_encode(['pass' => count($checks) - count($failed), 'fail' => count($failed), 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
 exit($failed === [] ? 0 : 1);

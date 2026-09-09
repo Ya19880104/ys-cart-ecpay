@@ -16,6 +16,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 	<?php
 	$ys_ec_settings_errors = [
 		'invalid_logistics_source'           => __( '物流設定選項無效，請重新選擇後儲存。設定未變更。', 'ys-cart-ecpay' ),
+		'unsupported_payment_mode'            => __( '所選的交易模式本外掛尚未支援，設定未變更。目前僅支援「一般支付（導轉）」。', 'ys-cart-ecpay' ),
 		'invalid_home_credential_family'      => __( '宅配憑證來源無效，設定未變更。', 'ys-cart-ecpay' ),
 		'secret_encrypt_failed'               => __( '金鑰加密能力不可用（YS CART 核心未載入或版本過舊），設定未變更。', 'ys-cart-ecpay' ),
 		'settings_crash_repair_requires_full_credentials' => __( '前次設定寫入未完整結束，簽章操作已安全停用。請在 API 設定頁重新輸入每一組 MerchantID／HashKey／HashIV，或明確勾選清除此組憑證，再儲存以完成全量修復。', 'ys-cart-ecpay' ),
@@ -77,6 +78,92 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 		</div>
 
 		<?php if ( 'api' === $tab ) : ?>
+			<?php
+			$ys_ec_mode      = (string) ( $settings['payment_mode'] ?? 'redirect' );
+			$ys_ec_supported = (array) ( $settings['payment_modes_implemented'] ?? [ 'redirect' ] );
+			$ys_ec_mode_can  = static fn( string $m ): bool => in_array( $m, $ys_ec_supported, true );
+			?>
+			<div class="ysca-card ysca-mt-md">
+				<div class="ysca-card__body">
+					<h2><?php esc_html_e( '交易模式', 'ys-cart-ecpay' ); ?></h2>
+					<p class="description"><?php esc_html_e( '綠界的金流分成幾種各自獨立的服務。以下列出本外掛目前支援與尚未支援的模式，未支援者僅供了解與提前申請。', 'ys-cart-ecpay' ); ?></p>
+
+					<label class="ysca-choice ysca-mt-md">
+						<input type="radio" name="ys_ec_ecpay_payment_mode" value="redirect" <?php checked( $ys_ec_mode, 'redirect' ); ?> <?php disabled( ! $ys_ec_mode_can( 'redirect' ) ); ?>>
+						<strong><?php esc_html_e( '一般支付（導轉）', 'ys-cart-ecpay' ); ?></strong>
+						<span class="ys-ec-badge ys-ec-badge-green ysca-badge--xs"><?php esc_html_e( '目前支援', 'ys-cart-ecpay' ); ?></span>
+					</label>
+					<p class="description ysca-choice-copy">
+						<?php esc_html_e( '消費者跳轉到綠界付款頁完成付款，卡號全程不經過本站，因此沒有 PCI-DSS 負擔。', 'ys-cart-ecpay' ); ?><br>
+						<?php esc_html_e( '涵蓋：信用卡、ATM 虛擬帳號、超商代碼、超商條碼。', 'ys-cart-ecpay' ); ?><br>
+						<?php esc_html_e( '⚠ 這個模式不支援訂閱自動扣款——訂閱訂單會照常建立，但需要顧客自行付款。', 'ys-cart-ecpay' ); ?>
+					</p>
+
+					<label class="ysca-choice ysca-mt-md">
+						<input type="radio" name="ys_ec_ecpay_payment_mode" value="ecpg_web" <?php checked( $ys_ec_mode, 'ecpg_web' ); ?> <?php disabled( ! $ys_ec_mode_can( 'ecpg_web' ) ); ?>>
+						<strong><?php esc_html_e( '站內付 2.0 Web（特店專用）', 'ys-cart-ecpay' ); ?></strong>
+						<span class="ys-ec-badge ys-ec-badge-gray ysca-badge--xs"><?php esc_html_e( '尚未支援', 'ys-cart-ecpay' ); ?></span>
+					</label>
+					<p class="description ysca-choice-copy">
+						<?php esc_html_e( '由綠界的 JS 元件在本站頁面直接渲染付款欄位，消費者不離開結帳頁；卡號輸入後直送綠界，綠界官方載明此模式無需 PCI-DSS 認證。', 'ys-cart-ecpay' ); ?><br>
+						<?php esc_html_e( '需要先向綠界申請開通此服務（一般特約商店預設沒有）。', 'ys-cart-ecpay' ); ?>
+					</p>
+					<details class="ysca-mt-md">
+						<summary><?php esc_html_e( '站內付 2.0 開通方式與伺服器資訊', 'ys-cart-ecpay' ); ?></summary>
+						<div class="ysca-panel--warning ysca-stack-sm ysca-mt-md">
+							<ol>
+								<li><?php esc_html_e( '登入綠界廠商後台，向綠界業務或客服（02-2655-1775）申請開通「站內付 2.0」。', 'ys-cart-ecpay' ); ?></li>
+								<li><?php esc_html_e( '確認合約模式（代收付／新型閘道）與要開通的付款方式。', 'ys-cart-ecpay' ); ?></li>
+								<li><?php esc_html_e( '若綠界要求提供本站的伺服器來源 IP，可從下方複製。', 'ys-cart-ecpay' ); ?></li>
+							</ol>
+						</div>
+						<div class="ys-ec-form-group ysca-mt-md">
+							<label><strong><?php esc_html_e( '伺服器對外 IP', 'ys-cart-ecpay' ); ?></strong></label>
+							<div class="ysca-inline-actions ysca-inline-actions--start">
+								<code id="ys-ec-ecpay-server-ip" class="ysca-code-pill ysca-code-pill--lg"><?php esc_html_e( '查詢中…', 'ys-cart-ecpay' ); ?></code>
+								<button type="button" id="ys-ec-ecpay-refresh-ip" class="ysca-btn ysca-btn--sm"><?php esc_html_e( '重新查詢', 'ys-cart-ecpay' ); ?></button>
+							</div>
+							<p class="description"><?php esc_html_e( '綠界官方文件並未要求設定 IP 白名單；此處僅在綠界主動索取來源 IP 時提供方便複製。', 'ys-cart-ecpay' ); ?></p>
+						</div>
+					</details>
+
+					<label class="ysca-choice ysca-mt-md">
+						<input type="radio" name="ys_ec_ecpay_payment_mode" value="period" <?php checked( $ys_ec_mode, 'period' ); ?> <?php disabled( ! $ys_ec_mode_can( 'period' ) ); ?>>
+						<strong><?php esc_html_e( '定期定額（訂閱）', 'ys-cart-ecpay' ); ?></strong>
+						<span class="ys-ec-badge ys-ec-badge-gray ysca-badge--xs"><?php esc_html_e( '規劃中', 'ys-cart-ecpay' ); ?></span>
+					</label>
+					<p class="description ysca-choice-copy">
+						<?php esc_html_e( '建立委託後由綠界自己排程扣款，每期扣款結果再回呼通知本站；金額固定、期數固定。', 'ys-cart-ecpay' ); ?><br>
+						<?php esc_html_e( '與本站訂閱模組的對接流程尚未實作。', 'ys-cart-ecpay' ); ?>
+					</p>
+
+					<p class="description ysca-mt-md">
+						<?php esc_html_e( '另有「信用卡幕後授權」（卡號由本站直接傳送給綠界）需通過 PCI-DSS SAQ-D 認證，本外掛不支援、也不規劃支援。', 'ys-cart-ecpay' ); ?>
+					</p>
+				</div>
+			</div>
+			<script>
+			(function () {
+				var el = document.getElementById('ys-ec-ecpay-server-ip');
+				var btn = document.getElementById('ys-ec-ecpay-refresh-ip');
+				if (!el || !btn) { return; }
+				var root = (typeof ysEcAdmin !== 'undefined' && ysEcAdmin.headlessRoot) ? ysEcAdmin.headlessRoot : <?php echo wp_json_encode( rest_url( 'ys-ecommerce-headless/v1' ) ); ?>;
+				var nonce = (typeof ysEcAdmin !== 'undefined' && ysEcAdmin.restNonce) ? ysEcAdmin.restNonce : <?php echo wp_json_encode( wp_create_nonce( 'wp_rest' ) ); ?>;
+				function load() {
+					el.textContent = <?php echo wp_json_encode( __( '查詢中…', 'ys-cart-ecpay' ) ); ?>;
+					fetch(root + '/admin/server/info', { headers: { 'X-WP-Nonce': nonce }, credentials: 'same-origin' })
+						.then(function (r) { return r.json(); })
+						.then(function (b) {
+							el.textContent = (b && b.data && b.data.ip)
+								? b.data.ip
+								: <?php echo wp_json_encode( __( '查詢失敗', 'ys-cart-ecpay' ) ); ?>;
+						})
+						.catch(function () { el.textContent = <?php echo wp_json_encode( __( '連線錯誤', 'ys-cart-ecpay' ) ); ?>; });
+				}
+				btn.addEventListener('click', load);
+				load();
+			}());
+			</script>
 			<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md">
 				<p><?php esc_html_e( '更換金鑰會造成原本已綁定付款的用戶失效，請小心操作。進行中的付款與物流單也可能受影響。', 'ys-cart-ecpay' ); ?></p>
 			</div>
@@ -101,7 +188,14 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							<input class="ysca-input ysca-field--md" type="password" name="ys_ec_ecpay_payment_hash_iv" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $settings['payment_hash_iv_is_set'] ? __( '已儲存，留空不變更', 'ys-cart-ecpay' ) : '' ); ?>">
 						</label>
 					</div>
-					<p class="description"><?php esc_html_e( '共用此組的物流會一起套用上方金流的測試模式與商店設定。', 'ys-cart-ecpay' ); ?></p>
+					<p class="description">
+						<?php if ( ! empty( $settings['payment_test_mode'] ) ) : ?>
+							<strong><?php esc_html_e( '目前為測試環境', 'ys-cart-ecpay' ); ?></strong>：<?php esc_html_e( '交易送往 payment-stage.ecpay.com.tw，不會真的扣款。請填綠界提供的測試商店代號與金鑰。', 'ys-cart-ecpay' ); ?>
+						<?php else : ?>
+							<strong><?php esc_html_e( '目前為正式環境', 'ys-cart-ecpay' ); ?></strong>：<?php esc_html_e( '交易送往 payment.ecpay.com.tw，會真實扣款。請確認填的是綠界核發的正式商店代號與金鑰。', 'ys-cart-ecpay' ); ?>
+						<?php endif; ?>
+						<br><?php esc_html_e( '共用此組的物流會一起套用上方金流的測試模式與商店設定。', 'ys-cart-ecpay' ); ?>
+					</p>
 					<details class="ysca-mt-md">
 						<summary><?php esc_html_e( '信用卡退款進階設定（選填）', 'ys-cart-ecpay' ); ?></summary>
 						<label class="ysca-field ysca-mt-md">

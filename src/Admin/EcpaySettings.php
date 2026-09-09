@@ -147,7 +147,7 @@ final class EcpaySettings {
 			array_values( Settings::LOGISTICS_C2C_KEYS ),
 			array_values( Settings::LOGISTICS_KEYS ),
 			array_values( Settings::LOGISTICS_SOURCE_KEYS ),
-			[ 'ys_ec_ecpay_logistics_reuse_payment', Settings::HOME_CREDENTIAL_FAMILY ]
+			[ 'ys_ec_ecpay_logistics_reuse_payment', Settings::HOME_CREDENTIAL_FAMILY, Settings::PAYMENT_MODE ]
 		) ) );
 		$overlay = [];
 		foreach ( $keys as $key ) {
@@ -205,6 +205,19 @@ final class EcpaySettings {
 	private static function apply_api_tab_atomically( bool $provider_enabled ): string {
 		// ── Phase A：desired state（零寫入）──
 		$desired = [ Settings::ENABLED => $provider_enabled ? '1' : '0' ];
+
+		// 交易模式：舊表單沒有此欄位＝不變更。只接受**已實作**的模式；未實作的值
+		// 一律拒絕整次儲存，不靜默改寫成 redirect——若默默存成別的值，使用者會以為
+		// 已經切到站內付／定期定額，實際上付款仍走導轉，那是最糟的失敗形態。
+		if ( array_key_exists( Settings::PAYMENT_MODE, $_POST ) ) {
+			$mode = is_string( $_POST[ Settings::PAYMENT_MODE ] )
+				? sanitize_key( wp_unslash( (string) $_POST[ Settings::PAYMENT_MODE ] ) )
+				: '';
+			if ( ! in_array( $mode, Settings::IMPLEMENTED_PAYMENT_MODES, true ) ) {
+				return 'unsupported_payment_mode';
+			}
+			$desired[ Settings::PAYMENT_MODE ] = $mode;
+		}
 
 		// HOME family：舊表單沒有此欄位＝不變更，不是切回預設。
 		if ( array_key_exists( 'ys_ec_ecpay_home_credential_family', $_POST ) ) {
@@ -676,6 +689,8 @@ final class EcpaySettings {
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_key'], '' )
 			|| '' !== (string) Settings::get( Settings::LOGISTICS_KEYS['hash_iv'], '' );
 		$out['home_credential_family'] = Settings::home_credential_family();
+		$out['payment_mode']          = Settings::payment_mode();
+		$out['payment_modes_implemented'] = Settings::IMPLEMENTED_PAYMENT_MODES;
 		foreach ( Settings::LOGISTICS_SOURCE_KEYS as $family => $key ) {
 			$out[ 'logistics_' . $family . '_source_mode' ] = self::logistics_source_for_render( $family, $out );
 		}
