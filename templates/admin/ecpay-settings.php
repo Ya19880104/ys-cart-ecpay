@@ -17,17 +17,13 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 	$ys_ec_settings_errors = [
 		'invalid_logistics_source'           => __( '物流設定選項無效，請重新選擇後儲存。設定未變更。', 'ys-cart-ecpay' ),
 		'invalid_home_credential_family'      => __( '宅配憑證來源無效，設定未變更。', 'ys-cart-ecpay' ),
-		'signer_change_active_labels'         => __( '仍有未結束或升級前的物流單，為避免舊單回呼、查詢或列印失驗，本次會改變簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
-		'signer_change_label_lookup_failed'   => __( '無法確認既有物流單狀態，已採安全模式，本次會改變簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
 		'secret_encrypt_failed'               => __( '金鑰加密能力不可用（YS CART 核心未載入或版本過舊），設定未變更。', 'ys-cart-ecpay' ),
-		'payment_signer_change_active_attempts' => __( '仍有未終局的綠界付款訂單（pending／offline_payment）。為避免其回呼與查詢失驗，本次會改變金流簽章憑證的儲存未套用；請待付款終局後再變更。', 'ys-cart-ecpay' ),
 		'settings_crash_repair_requires_full_credentials' => __( '前次設定寫入未完整結束，簽章操作已安全停用。請在 API 設定頁重新輸入每一組 MerchantID／HashKey／HashIV，或明確勾選清除此組憑證，再儲存以完成全量修復。', 'ys-cart-ecpay' ),
 		'settings_crash_repair_requires_api_tab' => __( '前次 API 憑證設定未完整結束，簽章操作仍安全停用；付款／物流方式頁不能解除此隔離。請回 API 設定頁完成全量憑證修復。', 'ys-cart-ecpay' ),
 		'provider_lifecycle_commit_failed_rolled_back' => __( '供應商啟用狀態與 Core lifecycle 同步失敗，已還原原設定。', 'ys-cart-ecpay' ),
 		'provider_lifecycle_rollback_failed' => __( '供應商啟用狀態同步失敗且無法完整還原；系統已維持簽章隔離。請先修復資料庫寫入問題，再到 API 設定頁完成全量修復。', 'ys-cart-ecpay' ),
 		'method_lifecycle_commit_failed_rolled_back' => __( '付款／物流方式與 Core lifecycle 同步失敗，已還原本次設定。', 'ys-cart-ecpay' ),
 		'method_lifecycle_rollback_failed' => __( '付款／物流方式同步失敗且無法完整還原；系統已維持簽章隔離。請先修復資料庫寫入問題，再到 API 設定頁完成全量修復。', 'ys-cart-ecpay' ),
-		'payment_signer_change_attempt_lookup_failed' => __( '無法確認進行中付款訂單的狀態，已採安全模式，本次會改變金流簽章憑證的儲存未套用。', 'ys-cart-ecpay' ),
 		'settings_maintenance_lock_unavailable' => __( '目前有另一個設定儲存、或簽章操作（建單／查詢／回呼／列印）正在進行中，請稍後再試。設定未變更。', 'ys-cart-ecpay' ),
 		'settings_state_read_failed'          => __( '無法可靠讀取目前設定狀態（資料庫查詢失敗），已安全中止，設定未變更。', 'ys-cart-ecpay' ),
 		'settings_commit_failed_rolled_back'  => __( '設定寫入未完全成功，已全數還原為儲存前狀態，請稍後重試。', 'ys-cart-ecpay' ),
@@ -171,21 +167,38 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					</div>
 				</div>
 			<?php endforeach; ?>
+			<?php
+			$ys_ec_home_family   = (string) ( $settings['home_credential_family'] ?? '' );
+			$ys_ec_b2c_in_use    = 'disabled' !== (string) ( $settings['logistics_b2c_home_source_mode'] ?? 'disabled' );
+			$ys_ec_c2c_in_use    = 'disabled' !== (string) ( $settings['logistics_c2c_source_mode'] ?? 'disabled' );
+			// 兩組都在使用時才真的有得選。但若宅配目前指向的那一組已停用，必須讓管理員看見並改選；
+			// 欄位沒有顯示時就不會送出，後端把「未提供」視為不變更（不會切回預設）。
+			$ys_ec_home_conflict = ( 'c2c' === $ys_ec_home_family && ! $ys_ec_c2c_in_use )
+				|| ( 'b2c_home' === $ys_ec_home_family && ! $ys_ec_b2c_in_use );
+			$ys_ec_show_home     = ( $ys_ec_b2c_in_use && $ys_ec_c2c_in_use ) || $ys_ec_home_conflict;
+			?>
+			<?php if ( $ys_ec_show_home ) : ?>
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
-					<details>
+					<details<?php echo $ys_ec_home_conflict ? ' open' : ''; ?>>
 						<summary><?php esc_html_e( '宅配使用的設定', 'ys-cart-ecpay' ); ?></summary>
+					<?php if ( $ys_ec_home_conflict ) : ?>
+						<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md">
+							<p><?php esc_html_e( '宅配目前指向的那一組已設為「不使用」，黑貓／郵局宅配將沒有可用的設定。請改選另一組，或把該組改回使用。', 'ys-cart-ecpay' ); ?></p>
+						</div>
+					<?php endif; ?>
 					<label class="ysca-field ysca-mt-md">
 						<span class="ysca-field__label"><?php esc_html_e( '黑貓／郵局宅配使用', 'ys-cart-ecpay' ); ?></span>
 						<select class="ysca-input ysca-field--md" name="ys_ec_ecpay_home_credential_family">
-							<option value="b2c_home" <?php selected( $settings['home_credential_family'], 'b2c_home' ); ?>><?php esc_html_e( 'B2C／宅配這組', 'ys-cart-ecpay' ); ?></option>
-							<option value="c2c" <?php selected( $settings['home_credential_family'], 'c2c' ); ?>><?php esc_html_e( 'C2C 這組', 'ys-cart-ecpay' ); ?></option>
+							<option value="b2c_home" <?php selected( $ys_ec_home_family, 'b2c_home' ); ?>><?php esc_html_e( 'B2C／宅配這組', 'ys-cart-ecpay' ); ?></option>
+							<option value="c2c" <?php selected( $ys_ec_home_family, 'c2c' ); ?>><?php esc_html_e( 'C2C 這組', 'ys-cart-ecpay' ); ?></option>
 						</select>
 					</label>
-					<p class="description"><?php esc_html_e( '請依綠界為該商店代號開通的宅配服務，選擇對應的一組設定。', 'ys-cart-ecpay' ); ?></p>
+					<p class="description"><?php esc_html_e( '黑貓／郵局宅配依綠界合約可能掛在 B2C 或 C2C 的商店代號下；兩組都有使用時，請依綠界實際為你開通宅配的那一組選擇。', 'ys-cart-ecpay' ); ?></p>
 					</details>
 				</div>
 			</div>
+			<?php endif; ?>
 		<?php endif; ?>
 
 		<?php if ( 'payment' === $tab ) : ?>

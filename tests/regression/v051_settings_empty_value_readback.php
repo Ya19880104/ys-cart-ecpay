@@ -66,7 +66,7 @@ function v051_check( string $label, bool $ok ): void {
 
 $db = new V051ResultTransport();
 $GLOBALS['wpdb'] = $db;
-$db->rows = [ 'empty' => '', 'zero' => '0', 'ordinary' => 'setting-text' ];
+$db->rows = [ 'empty' => '', 'zero' => '0', 'ordinary' => 'setting-text', 'nullcell' => null ];
 $query = "SELECT setting_value FROM wp_ys_ec_settings WHERE setting_key = 'empty'";
 v051_check( 'actual wpdb get_var collapses an existing empty string to null', null === $db->get_var( $query ) );
 $row = $db->get_row( $query );
@@ -78,6 +78,10 @@ foreach ( [ 'empty' => '', 'zero' => '0', 'ordinary' => 'setting-text' ] as $key
 	v051_check( "db_probe $key uses one result read", 1 === count( $db->read_queries ) - $count );
 }
 v051_check( 'db_probe distinguishes missing row from existing empty value', [ 'ok' => true, 'existed' => false, 'value' => '' ] === Settings::db_probe( 'missing' ) );
+$count = count( $db->read_queries );
+v051_check( 'db_probe reads an existing NULL cell as an absent value, not as a read failure', [ 'ok' => true, 'existed' => false, 'value' => '' ] === Settings::db_probe( 'nullcell' ) );
+v051_check( 'db_probe NULL cell uses one result read', 1 === count( $db->read_queries ) - $count );
+v051_check( 'actual wpdb get_var collapses the NULL cell too', null === $db->get_var( "SELECT setting_value FROM wp_ys_ec_settings WHERE setting_key = 'nullcell'" ) );
 foreach ( [ 'error', 'throw' ] as $fault ) {
 	$db->fault = $fault;
 	v051_check( "db_probe $fault fails without claiming absence was verified", [ 'ok' => false, 'existed' => false, 'value' => '' ] === Settings::db_probe( 'empty' ) );

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 - 2026-09-09（需 YS CART core >= 2.58.0）
+
+### Fixed
+
+- 儲存核對：`setting_value` 在資料表上是 nullable LONGTEXT，先前 `Settings::db_probe()` 把 NULL 當成讀取失敗而中止整次儲存（`settings_state_read_failed`）。現在依 core `get_setting()` 的既有語意把 NULL 視為「不存在」，只有真正的查詢錯誤或不可判定的型別才中止。
+
+### Changed
+
+- 「宅配使用的設定」只在 B2C 與 C2C 兩組都在使用時顯示；若宅配目前指向的那一組已設為「不使用」，改為展開並顯示警告提醒改選。欄位未顯示時不會送出，原本的選擇保持不變。
+- 移除 0.3.2 拿掉金鑰變更閘門後殘留、已零引用的九個方法（`payment_method_is_enabled`、`unresolved_payment_attempts_state`、`sync_provider_lifecycle_verified`、`lifecycle_provider_enabled_state`、`home_method_is_enabled`、`method_is_enabled_from_db`、`setting_truthy`、`all_methods_authority_state`、`label_authority_state`）與四則已無生產者的錯誤文案，無行為變更。
+- 程式註解中的「信用卡查詢檢查碼」統一改為綠界官方名稱「商家檢查碼（CreditCheckCode）」。
+
 ## 0.3.2 - 2026-09-09（需 YS CART core >= 2.58.0）
 
 ### Fixed

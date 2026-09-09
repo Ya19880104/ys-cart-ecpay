@@ -136,7 +136,15 @@ final class Settings {
 		if ( null === $row ) {
 			return [ 'ok' => true, 'existed' => false, 'value' => '' ];
 		}
-		if ( ! is_object( $row ) || ! property_exists( $row, 'setting_value' ) || ! is_scalar( $row->setting_value ) ) {
+		if ( ! is_object( $row ) || ! property_exists( $row, 'setting_value' ) ) {
+			return $fail;
+		}
+		// setting_value 在資料表上是 nullable LONGTEXT；core 的 get_setting() 把 NULL 當「不存在」讀。
+		// 沿用同一語意：一個可判定的 NULL 不是讀取失敗，不該讓整次儲存中止。
+		if ( null === $row->setting_value ) {
+			return [ 'ok' => true, 'existed' => false, 'value' => '' ];
+		}
+		if ( ! is_scalar( $row->setting_value ) ) {
 			return $fail;
 		}
 
@@ -389,7 +397,7 @@ final class Settings {
 			'hash_iv'     => self::decrypt_secret( $raw_iv ),
 		];
 
-		// 信用卡查詢檢查碼（僅 PAYMENT_KEYS 有；logistics 各群組無此欄位）。
+		// 商家檢查碼 CreditCheckCode（僅 PAYMENT_KEYS 有；logistics 各群組無此欄位；選填）。
 		if ( isset( $keys['credit_check_code'] ) ) {
 			$credentials['credit_check_code'] = self::decrypt_secret(
 				self::read_with_pending( $keys['credit_check_code'], '', $pending )

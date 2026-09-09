@@ -20,12 +20,12 @@ function wp_nonce_field(string $action): void { echo '<input type="hidden" name=
 function sanitize_key(string $value): string { return preg_replace('/[^a-z0-9_-]/', '', strtolower($value)); }
 function wp_unslash(string $value): string { return stripslashes($value); }
 
-function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = ''): string {
+function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c'): string {
     $_GET = $error === '' ? [] : ['settings_error' => $error];
     $settings = [
         'tab' => $tab, 'tabs' => ['api' => 'API', 'payment' => '金流', 'shipping' => '物流'],
         'enabled' => true, 'payment_credit_check_code_is_set' => true,
-        'home_credential_family' => 'c2c', 'logistics_reuse_payment' => true,
+        'home_credential_family' => $family, 'logistics_reuse_payment' => true,
         'legacy_logistics_credentials_present' => true,
         'logistics_b2c_home_source_mode' => $b2c, 'logistics_c2c_source_mode' => $c2c,
         'payment_methods' => ['credit' => '信用卡'], 'credit_enabled' => true,
@@ -117,6 +117,15 @@ check('payment tab remains independent', first($payment, '//input[@name="ys_ec_e
 check('shipping sender remains', first($shipping, '//input[@name="ys_ec_ecpay_sender_name"]') !== null);
 check('diagnostics callbacks remain in their existing tab', str_contains(dom(render_settings('disabled', 'disabled', 'diagnostics'))->document->textContent, 'https://fixture.invalid/callback'));
 check('save action and nonce unchanged', first($xp, '//input[@name="action"]')?->getAttribute('value') === 'ys_cart_ecpay_save_settings' && first($xp, '//input[@name="_wpnonce"]') !== null);
+$homeHidden = dom(render_settings('payment', 'disabled', 'api', '', 'b2c_home'));
+check('home family choice hidden when only one group is in use', first($homeHidden, '//select[@name="ys_ec_ecpay_home_credential_family"]') === null && !str_contains($homeHidden->document->textContent, '宅配使用的設定'));
+$homeConflict = dom(render_settings('payment', 'disabled', 'api', '', 'c2c'));
+$conflictDetails = first($homeConflict, '//details[summary="宅配使用的設定"]');
+check('home family shown open with a warning when it points at a disabled group', $conflictDetails !== null && $conflictDetails->hasAttribute('open') && first($homeConflict, '//select[@name="ys_ec_ecpay_home_credential_family"]') !== null && str_contains($homeConflict->document->textContent, '已設為「不使用」'));
+$homeBoth = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home'));
+$bothDetails = first($homeBoth, '//details[summary="宅配使用的設定"]');
+check('home family shown collapsed without warning when both groups are in use', $bothDetails !== null && !$bothDetails->hasAttribute('open') && !str_contains($homeBoth->document->textContent, '已設為「不使用」') && first($homeBoth, '//select[@name="ys_ec_ecpay_home_credential_family"]//option[@value="b2c_home"][@selected]') !== null);
+check('obsolete gate error strings are gone', !str_contains(dom(render_settings('disabled', 'disabled', 'api', 'signer_change_active_labels'))->document->textContent, '仍有未結束或升級前的物流單'));
 $failed = array_values(array_filter($checks, static fn(array $check): bool => !$check['pass']));
 echo json_encode(['pass' => count($checks) - count($failed), 'fail' => count($failed), 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
 exit($failed === [] ? 0 : 1);

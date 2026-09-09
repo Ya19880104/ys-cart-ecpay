@@ -20,6 +20,10 @@ Standalone ECPay provider plugin for YS CART.
 - B2C/home and C2C independently use payment settings, separate settings, or no
   credentials. Shared settings follow payment test mode; separate settings keep
   their own test mode. Switching sources preserves the saved separate settings.
+- The home-delivery (黑貓／郵局) source selector appears only when both the B2C/home
+  and C2C groups are in use. If the selected group is set to "not used", it opens with
+  a warning so the choice can be corrected; when hidden it is not submitted and the
+  saved choice is unchanged.
 - Administrators can change credentials after the on-page warning. Existing bound
   payments and pending payment/logistics requests may be affected. Permission,
   encryption, short writer exclusion, verified saving and rollback still apply.
