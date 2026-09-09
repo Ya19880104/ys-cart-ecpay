@@ -128,6 +128,35 @@ final class EcpayPaymentController {
 			}
 			$program_fields['ecpay_payment_type'] = sanitize_text_field( (string) ( $params['PaymentType'] ?? '' ) );
 
+			// 🔴 v0.4.0：分期落空的偵測。
+			//
+			// 綠界官方在「信用卡分期付款」明載：**「若廠商未開通刷卡分期期數時，
+			// 交易會自動改為信用卡一次付清。」**
+			//
+			// 這是一個看起來完全成功的失敗：`RtnCode=1`、金額相符、訂單轉為已付款，
+			// 但消費者選的是分期、實際被一次扣完。沒有任何既有檢查會發現它——金額
+			// 核對比的是我們送出的金額，而那個金額本來就沒變。
+			//
+			// `stage` 是唯一的證據：它是綠界回報的**實際**期數。分期方式付款卻收到
+			// stage < 2，就代表落回一次付清。這裡不擋 ACK（款項確實收到了，拒絕
+			// ACK 只會讓綠界無止盡重送），而是留下明確的證據與一筆 error log，讓
+			// 業主查得到「為什麼客人抱怨沒有分期」。
+			//
+			// 🔴 日後若加上「我們自己按期數加費」，這條檢查會從稽核升級為對帳關鍵：
+			// 落回一次付清代表消費者被多收了手續費卻沒拿到分期。
+			$paid_method = is_array( $detail_now ) ? (string) ( $detail_now['payment_method'] ?? '' ) : '';
+			if ( 'ys_ec_ecpay_credit_installment' === $paid_method && array_key_exists( 'stage', $params ) ) {
+				$reported_stage = (int) $program_fields['ecpay_stage'];
+				if ( $reported_stage < 2 ) {
+					$program_fields['ecpay_installment_fallback'] = '1';
+					YSLogger::error( 'ecpay', '分期交易被綠界改以一次付清成立（廠商可能未開通該期數）', [
+						'order_id'          => (int) $order->id,
+						'merchant_trade_no' => sanitize_text_field( (string) ( $params['MerchantTradeNo'] ?? '' ) ),
+						'reported_stage'    => $reported_stage,
+					] );
+				}
+			}
+
 			$gwsr = sanitize_text_field( (string) ( $params['gwsr'] ?? '' ) );
 			if ( '' !== $gwsr || $program_fields ) {
 				// 走核心共用 CAS。此處與退款 ledger（`_ys_ecpay_refunds`）是同一個

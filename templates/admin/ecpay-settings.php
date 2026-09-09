@@ -336,6 +336,25 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						);
 						?>
 					</p>
+
+					<details class="ysca-mt-md">
+						<summary><?php esc_html_e( '分期手續費怎麼算？', 'ys-cart-ecpay' ); ?></summary>
+						<div class="ysca-stack-sm ysca-mt-md">
+							<p class="description">
+								<?php esc_html_e( '綠界導轉的分期，期數是消費者在綠界付款頁上選的——我們送出訂單時還不知道最後會分幾期，因此沒辦法在結帳頁依期數加收手續費。', 'ys-cart-ecpay' ); ?>
+							</p>
+							<p class="description">
+								<strong><?php esc_html_e( '要讓消費者負擔分期成本，用綠界自己的「消費者自費分期」：', 'ys-cart-ecpay' ); ?></strong><br>
+								<?php esc_html_e( '訂單滿 1,000 元時綠界會在付款頁提供，手續費由消費者一次付清，商家收到全額，不需要我們加價。它是信用卡一次付清與分期的附加服務，預設就開著（一般前台會員無法申請關閉；特約會員要關閉請洽所屬業務）。', 'ys-cart-ecpay' ); ?>
+							</p>
+							<p class="description">
+								<?php esc_html_e( '⚠ 綠界規則：若廠商未開通所選期數，交易會自動改為信用卡一次付清。這是一筆看起來成功的交易，消費者卻沒有分到期。本外掛會比對綠界回報的實際期數，落回一次付清時在訂單的付款紀錄留下標記並寫入錯誤日誌。', 'ys-cart-ecpay' ); ?>
+							</p>
+							<p class="description">
+								<?php esc_html_e( '⚠ 綠界規則：分期不可與紅利折抵、定期定額同時設定；銀聯卡不支援分期；卡號判定為簽帳金融卡時綠界會擋下分期交易。', 'ys-cart-ecpay' ); ?>
+							</p>
+						</div>
+					</details>
 				</div>
 			</div>
 		<?php endif; ?>

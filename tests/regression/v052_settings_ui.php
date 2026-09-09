@@ -216,6 +216,28 @@ check('instalment periods field round trips the stored value', $periods !== null
 check('instalment periods list the values ECPay accepts', str_contains($payText, '3、5、6、8、9、10、12、18、24、30N'));
 check('empty instalment periods are explained as hiding the method', str_contains($payText, '留空則'));
 
+// 🔴 手續費：綠界導轉不可能在結帳頁依期數加費（期數是消費者在綠界頁面選的）。
+// 這段文案是商家唯一會讀到的說明，寫錯會讓人去綠界後台找一個不存在的設定。
+$feeDetails = first($payXp, '//details[summary="分期手續費怎麼算？"]');
+check('the instalment fee question is answered on the page', $feeDetails !== null);
+check(
+    'it says why we cannot price per period ourselves',
+    str_contains($payText, '期數是消費者在綠界付款頁上選的') && str_contains($payText, '沒辦法在結帳頁依期數加收手續費')
+);
+check(
+    'it points at ECPay 消費者自費分期 with its real terms',
+    str_contains($payText, '消費者自費分期') && str_contains($payText, '1,000 元')
+        && str_contains($payText, '商家收到全額') && str_contains($payText, '一般前台會員無法申請關閉')
+);
+check(
+    'it warns that an unactivated period silently becomes a single payment',
+    str_contains($payText, '自動改為信用卡一次付清') && str_contains($payText, '寫入錯誤日誌')
+);
+check(
+    'it states the combinations ECPay forbids',
+    str_contains($payText, '紅利折抵') && str_contains($payText, '銀聯卡不支援分期') && str_contains($payText, '簽帳金融卡')
+);
+
 $failed = array_values(array_filter($checks, static fn(array $check): bool => !$check['pass']));
 echo json_encode(['pass' => count($checks) - count($failed), 'fail' => count($failed), 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
 exit($failed === [] ? 0 : 1);
