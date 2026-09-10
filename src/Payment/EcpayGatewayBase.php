@@ -162,11 +162,6 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		$method_id     = $this->get_id();
-		$operation_key = class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch' )
-			? (string) \YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch::current_operation_key()
-			: '';
-
 		// v0.3.0：先算出實際要送出的金額（非 canonical TWD 正整數會直接拋例外），
 		// 並在**送出付款表單之前**連同環境與商店身分一起持久化。
 		try {
@@ -199,35 +194,68 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		$charged_amount = (int) ( $form_data['charged_amount'] ?? 0 );
-		$credentials    = Settings::payment_credentials();
-		$environment    = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
-		$merchant_id    = (string) ( $credentials['merchant_id'] ?? '' );
+		$error = $this->persist_payment_identity( $order_id, $merchant_trade_no, (int) ( $form_data['charged_amount'] ?? 0 ) );
+		if ( null !== $error ) {
+			return $error;
+		}
 
-		// payment_detail 走核心共用 CAS（v0.3.0：YSPaymentDetailStore），其餘為獨立
-		// 純量欄位，不參與 JSON 整包覆蓋，維持一般 update。
+		return [
+			'success'      => true,
+			'redirect_url' => $form_data['action_url'],
+			'form_data'    => $form_data,
+			'message'      => '',
+		];
+	}
+
+	/**
+	 * 建單識別的持久化（v0.5.0 由 process_payment 抽出，導轉與站內付共用）
+	 *
+	 * payment_detail 走核心共用 CAS（YSPaymentDetailStore），其餘為獨立純量欄位。
+	 *
+	 * 🔴 兩段寫入任一失敗都**必須**中止建單：
+	 *   - `mer_trade_no` 是這筆交易與綠界之間唯一的對應鍵——付款通知靠它找回訂單、退款靠它
+	 *     送 DoAction。舊版忽略回傳值仍把付款表單交給使用者，於是消費者付了款，而我們沒有
+	 *     任何欄位可以認回這筆錢。
+	 *   - gateway identity：付款通知回來時核心以 gateway_id 決定由哪個 provider 處理、退款以
+	 *     它判定歸屬；沒寫進去卻讓使用者付了款，這筆交易在系統裡不屬於任何 gateway。
+	 *
+	 * @param int                 $order_id
+	 * @param string              $merchant_trade_no 穩定交易識別（見 make_merchant_trade_no）
+	 * @param int                 $charged_amount    **實際送出的金額**——退款端據此判定全額／部分
+	 * @param array<string,mixed> $extra_detail      方式專屬的額外 payment_detail 鍵（例如站內付的流程種類）
+	 * @return array<string,mixed>|null null＝全部落盤；否則是可直接回傳的失敗結果
+	 */
+	protected function persist_payment_identity( int $order_id, string $merchant_trade_no, int $charged_amount, array $extra_detail = [] ): ?array {
+		$method_id     = $this->get_id();
+		$operation_key = class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch' )
+			? (string) \YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch::current_operation_key()
+			: '';
+		$credentials = Settings::payment_credentials();
+		$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
+		$merchant_id = (string) ( $credentials['merchant_id'] ?? '' );
+
 		$persisted = OrderPaymentDetail::mutate(
 			$order_id,
-			static function ( array $detail ) use ( $merchant_trade_no, $method_id, $charged_amount, $environment, $merchant_id, $operation_key ): array {
+			static function ( array $detail ) use ( $merchant_trade_no, $method_id, $charged_amount, $environment, $merchant_id, $operation_key, $extra_detail ): array {
 				$detail['mer_trade_no']            = $merchant_trade_no;
 				$detail['ecpay_merchant_trade_no'] = $merchant_trade_no;
 				// 這個交易編號屬於哪一次 dispatch operation——續作時據此沿用同一個。
 				$detail['ecpay_operation_key'] = $operation_key;
-				$detail['payment_provider']        = 'ecpay';
-				$detail['payment_method']          = $method_id;
+				$detail['payment_provider']    = 'ecpay';
+				$detail['payment_method']      = $method_id;
 				// 實際送出的金額——退款端據此判定全額／部分，不再回頭讀 $order->total。
 				$detail['ecpay_charged_amount'] = $charged_amount;
 				// 環境與商店身分：設定被切換（stage↔live、換商店代號）之後，若不綁定
 				// 這兩個值，退款會拿著**另一個環境／另一家商店**的憑證去操作這筆交易。
 				$detail['ecpay_environment'] = $environment;
 				$detail['ecpay_merchant_id'] = $merchant_id;
+				foreach ( $extra_detail as $key => $value ) {
+					$detail[ (string) $key ] = $value;
+				}
 				return $detail;
 			}
 		);
 
-		// v0.3.0：寫入失敗**必須**中止建單。`mer_trade_no` 是這筆交易與綠界之間唯一
-		// 的對應鍵——付款通知靠它找回訂單、退款靠它送 DoAction。舊版忽略回傳值仍然
-		// 把付款表單交給使用者，於是消費者付了款，而我們沒有任何欄位可以認回這筆錢。
 		if ( ! $persisted->is_persisted() ) {
 			YSLogger::error( 'ecpay', 'CRITICAL: 建單 payment_detail 寫入失敗，拒絕簽發付款表單', array_merge(
 				[
@@ -246,10 +274,6 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		// v0.3.0：gateway identity 寫入失敗**不得**交付款表單。
-		// 付款通知回來時，核心以 gateway_id 決定由哪個 provider 處理、退款以它判定
-		// 歸屬；沒寫進去卻讓使用者付了款，這筆交易在系統裡不屬於任何 gateway——
-		// 通知無人認領、退款也找不到執行者。
 		$identity = ScalarColumnWriter::write( $order_id, [
 			'gateway_id'     => $method_id,
 			'payment_method' => $method_id,
@@ -270,12 +294,7 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		return [
-			'success'      => true,
-			'redirect_url' => $form_data['action_url'],
-			'form_data'    => $form_data,
-			'message'      => '',
-		];
+		return null;
 	}
 
 	public function process_refund( int $order_id, float $amount, string $reason = '', array $context = [] ): array {

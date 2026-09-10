@@ -29,8 +29,12 @@
  * 方式開關），也不收 `DigitalPayment`（它是「只顯示數位支付」的分組選擇器，
  * 不是一個獨立方式）。
  *
- * 站內付 2.0（ECPG）與定期定額不在這裡：它們是**另一種交易模式**，
- * 見 {@see \YangSheep\YSCartEcpay\Support\Settings::IMPLEMENTED_PAYMENT_MODES}。
+ * v0.5.0 起多一個例外：**站內付 2.0 綁卡信用卡**（`ys_ec_ecpay_ecpg_credit`，`transport`
+ * 為 `ecpg`）。它不是導轉——卡號在本站頁面由綠界 JS 元件收取、直送綠界，訂閱以綁定
+ * 的 BindCardID 幕後續扣。它仍放在同一張型錄，是因為「有哪些付款方式」這個問題在
+ * 後台、manifest、註冊三處都只能有一個答案；差別由 `transport` 標明，導轉專用的欄位
+ * （`choose_payment`／`extra_fields`）對它沒有意義，保留是為了讓型錄形狀一致。
+ * 定期定額（綠界端排程）仍不在這裡，見 {@see \YangSheep\YSCartEcpay\Support\Settings::IMPLEMENTED_PAYMENT_MODES}。
  * ─────────────────────────────────────────────────────────────────────────
  *
  * 🔴 `activation` 不是文案，是「開了會壞」的警告
@@ -68,6 +72,7 @@ final class EcpayPaymentCatalog {
 	 * - `default_enabled` 是否預設啟用。需要開通的方式一律 false。
 	 * - `enabled_option`  啟用開關的設定 key。
 	 * - `class`           付款方式類別（每個方式一個獨立類別）。
+	 * - `transport`       `aio`（導轉，預設）或 `ecpg`（站內付 2.0）。v0.5.0 新增。
 	 *
 	 * @var array<string,array<string,mixed>>
 	 */
@@ -215,7 +220,34 @@ final class EcpayPaymentCatalog {
 			'enabled_option'  => 'ys_ec_ecpay_bnpl_enabled',
 			'class'           => EcpayBnplGateway::class,
 		],
+		// ── 站內付 2.0（特約商店；卡號在本站頁面由綠界元件收取）────────────────
+		'ys_ec_ecpay_ecpg_credit'        => [
+			'alias'           => 'ecpg_credit',
+			'label'           => '信用卡（站內付 2.0 綁卡）',
+			'title'           => '綠界信用卡（站內付）',
+			// 不走 AIO；下面兩欄對它沒有意義，只為型錄形狀一致。
+			'choose_payment'  => 'Credit',
+			'extra_fields'    => [],
+			'min_amount'      => 1.0,
+			'activation'      => '需為綠界特約商店並申請開通「站內付 2.0」與「綁定信用卡」。卡號在本站頁面由綠界元件收取、直送綠界（官方載明無需 PCI-DSS）；訂閱訂單付款時綁定卡片，之後由本站排程自動續扣。',
+			'default_enabled' => false,
+			'enabled_option'  => 'ys_ec_ecpay_ecpg_credit_enabled',
+			'class'           => EcpayEcpgCreditGateway::class,
+			'transport'       => 'ecpg',
+		],
 	];
+
+	public const TRANSPORT_AIO  = 'aio';
+	public const TRANSPORT_ECPG = 'ecpg';
+
+	/** 方式的傳輸模型；未標明＝導轉（AIO）。未知方式回空字串。 */
+	public static function transport( string $method_id ): string {
+		$descriptor = self::METHODS[ $method_id ] ?? null;
+		if ( null === $descriptor ) {
+			return '';
+		}
+		return (string) ( $descriptor['transport'] ?? self::TRANSPORT_AIO );
+	}
 
 	/**
 	 * 全部方式（method_id => descriptor）。

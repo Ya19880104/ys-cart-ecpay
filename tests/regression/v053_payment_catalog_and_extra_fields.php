@@ -12,7 +12,7 @@
  *      被換掉＝顧客被扣的金額與我們記下的 `charged_amount` 不一致（退款端據此
  *      判定全額／部分）；`ReturnURL` 被換掉＝付款通知不會回到我們手上。
  *
- * 另外驗證型錄本身：11 個方式的 ChoosePayment 都在綠界官方合法值內、每個 gateway
+ * 另外驗證型錄本身：12 個方式（11 個導轉＋1 個站內付 2.0 綁卡）的 ChoosePayment 都在綠界官方合法值內、每個 gateway
  * 類別的 id 都查得到 descriptor、不在型錄裡的 gateway 必須 fail-closed。
  *
  * Run: php tests/regression/v053_payment_catalog_and_extra_fields.php
@@ -53,6 +53,7 @@ namespace {
 
 namespace YangSheep\Ecommerce\Gateways {
     interface YSGatewayInterface {}
+    interface YSOrderScopedTokenChargeGatewayInterface extends YSGatewayInterface {}
 }
 
 namespace YangSheep\Ecommerce\Models {
@@ -110,10 +111,15 @@ namespace {
     require_once $root . '/src/Payment/EcpayPaymentClient.php';
     require_once $root . '/src/Payment/EcpayGatewayBase.php';
     require_once $root . '/src/Payment/EcpayPaymentCatalog.php';
+    // v0.5.0：站內付 2.0 綁卡閘道與它的三個純函式依賴（本檔沒有 autoloader）。
+    require_once $root . '/src/Ecpg/EcpgAesCodec.php';
+    require_once $root . '/src/Ecpg/EcpgClient.php';
+    require_once $root . '/src/Ecpg/EcpgOrderContext.php';
     foreach ([
         'EcpayCreditGateway', 'EcpayAtmGateway', 'EcpayWebAtmGateway', 'EcpayCvsGateway',
         'EcpayBarcodeGateway', 'EcpayCreditInstallmentGateway', 'EcpayUnionPayGateway',
         'EcpayApplePayGateway', 'EcpayTwqrGateway', 'EcpayWeiXinGateway', 'EcpayBnplGateway',
+        'EcpayEcpgCreditGateway',
     ] as $gateway) {
         require_once $root . '/src/Payment/' . $gateway . '.php';
     }
@@ -214,7 +220,7 @@ namespace {
             && ('' === (string) $descriptor['activation'] || empty($descriptor['default_enabled']));
     }
     $assert($catalogOk, 'C1 每個 descriptor 的 id／ChoosePayment／開關 key／預設值都合規');
-    $assert(count(EcpayPaymentCatalog::all()) === 11, 'C2 型錄共 11 個一般支付方式');
+    $assert(count(EcpayPaymentCatalog::all()) === 12, 'C2 型錄共 12 個方式（11 個一般支付＋1 個站內付 2.0 綁卡）');
     $assert(
         EcpayPaymentCatalog::alias_to_id() === array_flip(EcpayPaymentCatalog::id_to_alias()),
         'C3 alias↔id 兩個方向互為反函數'

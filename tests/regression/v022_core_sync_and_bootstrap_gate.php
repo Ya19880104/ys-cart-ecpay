@@ -337,13 +337,13 @@ namespace {
 
     $bootstrap_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/ys-cart-ecpay.php' );
     $assert(
-        str_contains( $bootstrap_src, "define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );" ),
-        '(h) 宣告的最低核心版本是 2.58.0（typed replay＋deferred shipping hook）'
+        str_contains( $bootstrap_src, "define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.61.7' );" ),
+        '(h) 宣告的最低核心版本是 2.61.7（order-scoped token-charge 契約：站內付綁卡續扣所需）'
     );
 
     // 模擬 bootstrap 的常數（測試 process 不載入主檔；上一個斷言已證明主檔
     // 定義的就是這個值）。
-    define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );
+    define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.61.7' );
 
     // 核心常數不存在（外掛單獨啟用、或核心未載入）→ met=false／core_missing，
     // 不得當成「可能沒問題」。
@@ -371,17 +371,17 @@ namespace {
         '(h3) 🔴 gate 不符 → admin_notices＋return 先於 init()，gateway／物流／REST／CLI 一律不註冊'
     );
 
-    // 核心太舊（2.56.12 < 2.58.0）→ met=false／core_too_old，訊息帶出所需版本。
+    // 核心太舊（2.56.12 < 2.61.7）→ met=false／core_too_old，訊息帶出所需版本。
     define( 'YS_ECOMMERCE_VERSION', '2.56.12' );
     $gate_old = Plugin::core_requirements();
     $assert(
         false === $gate_old['met']
         && 'core_too_old' === $gate_old['reason']
-        && str_contains( $gate_old['message'], '2.58.0' ),
+        && str_contains( $gate_old['message'], '2.61.7' ),
         '(h4) 核心太舊 → core_too_old 且訊息帶出所需版本'
     );
 
-    // 版本足夠時的放行路徑：define 不可重定義，無法在同一 process 內模擬 2.58.0；
+    // 版本足夠時的放行路徑：define 不可重定義，無法在同一 process 內模擬 2.61.7；
     // 以來源斷言版本比較確實以 YS_CART_ECPAY_REQUIRES_CORE 為準（'<' 擋下、否則續行）。
     $plugin_src = (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Plugin.php' );
     $assert(

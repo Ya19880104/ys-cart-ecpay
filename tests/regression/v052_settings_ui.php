@@ -181,7 +181,7 @@ foreach ($payXp->query('//input[@type="checkbox"]') as $box) {
     }
 }
 check('every catalogue payment method renders a toggle', array_keys($rows) === array_keys($renderedToggles));
-check('exactly the eleven redirect methods are offered', count($rows) === 11);
+check('exactly the twelve catalogue methods are offered (11 redirect + 1 ECPG bind-card)', count($rows) === 12);
 
 // 需開通的方式預設不能是勾起來的——勾著等於讓沒開通的站直接對外開賣。
 $activationOff = true;

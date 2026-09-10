@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 - 2026-09-10（需 YS CART core >= 2.61.7）
+
+### Added
+
+- **站內付 2.0 綁卡信用卡**（`ys_ec_ecpay_ecpg_credit`，軌 B）。綠界成為與 PayUni 同級的真 token provider：
+  - 結帳時本外掛不碰綠界，只持久化穩定的交易識別（由核心 operation key 導出的 MerchantTradeNo、實際金額、流程種類、會員鍵），把顧客送到**本站網域**的託管付款頁。頁面依官方順序載入 jQuery → node-forge → 綠界 JS SDK，卡號欄位由綠界元件渲染、卡號直送綠界（官方載明無需 PCI-DSS）。
+  - 訂閱訂單走「交易且綁卡」（`GetTokenbyBindingCard` → `CreateBindCard`）：一次授權既付本期又拿到 `BindCardID`，以 YSCrypto 加密存進核心卡片庫並設為該閘道的預設卡。一般訂單走純交易（`GetTokenbyTrade` → `CreatePayment`），不留卡。已登入且已綁卡的顧客可在付款頁直接用已綁定的卡付款（`CreatePaymentWithCardID`），免再輸卡號。
+  - 續約由核心排程呼叫 `process_token_charge()`，以 `BindCardID` 幕後授權（`CreatePaymentWithCardID`，Need3D=0），契約與 PayUni 逐條對齊：前置拒絕（政策閘、訂單狀態、卡片權威四態、金額精確整數）、送出前把 dispatch 標成 submitted、交易識別先落盤、結果分成 success／provider_failed／indeterminate 原樣交回核心。
+  - 3D 驗證用整頁導轉（綠界禁止 iframe）。結果最多從三條路進來（同步回應、OrderResultURL、ReturnURL），全部匯集到同一段冪等落地：MerchantID → MerchantTradeNo 歸屬 → RtnCode → TradeStatus → 金額（比**建單時實際送出**的金額）→ TradeNo，通過才推進已付款並存卡；第二次進來被狀態機業務拒絕時讀成「已付」而非錯誤。
+  - 對綠界的回應規則：解不開／不是本店的＝400、找不到訂單＝404、已處理（含重複）＝`1|OK`、**我們自己寫不進 DB**（含綁卡存不進去——`BindCardID` 只在那份 payload 裡）＝500 不 ACK，讓綠界依其機制重送。
+  - 站內付 AES-JSON 客戶端：`Data` 編解碼與官方 PHP SDK `AesService` 逐字一致（json_encode → urlencode → AES-128-CBC → Base64；以官方測試向量釘住）；信封只有 `Timestamp`（不帶發票／物流的 `Revision`）；Token／交易走 `ecpg`、查詢走 `ecpayment` 兩個 domain 不混用；逾時、HTTP 非 200、Data 解不開、RtnCode 10300066 一律判「結果不明」，絕不壓成失敗。
+  - 本方式預設關閉，後台標明需為綠界特約商店並開通「站內付 2.0」與「綁定信用卡」；manifest 的 `allowed_hosts` 補上 `ecpg(-stage)`／`ecpayment(-stage)`，回呼路由 `/ecpay/ecpg/return`（S2S）與 `/ecpay/ecpg/result`（3D 導回）。
+- 測試：`v055` AES 官方向量、`v056` 客戶端契約（信封／分類／送出前置）、`v057` 型錄接線＋首刷持久化＋續扣契約、`v058` 結果落地與回呼（子程序驗 ACK 規則）；`v053` 的型錄計數更新為 12。
+
+### Changed
+
+- **最低核心版本提高到 2.61.7**（原 2.58.0）：綁卡續扣依賴該版的 order-scoped token-charge 契約（`YSOrderScopedTokenChargeGatewayInterface`、`YSSavedCardChargePolicy` 續約閘、`YSCreditCard` token 權威、`YSPaymentDispatch` 卡片身分綁定）。舊核心上外掛照舊不註冊任何方式並顯示後台通知。
+- 「交易模式」選擇器的語意收窄為**一般支付（導轉）的交易模型**；站內付 2.0 綁卡以獨立付款方式與導轉方式並存，不經過該選擇器（`ecpg_web` 全域模式仍未實作，畫面說明已更新）。
+- `EcpayGatewayBase::process_payment()` 的建單識別持久化抽成 `persist_payment_identity()`，導轉與站內付共用同一段（行為與訊息不變）。
+- 型錄 descriptor 新增 `transport`（`aio`／`ecpg`），`EcpayPaymentCatalog::transport()` 導出。
+
+### Fixed
+
+- `Plugin::REGISTERED_GATEWAY_IDS` 只列 0.4.0 之前的四個方式：只開 WebATM／分期／銀聯／Apple Pay／TWQR／微信／BNPL 時，付款回呼路由根本不會註冊，綠界通知打到 404、訂單永遠停在待付款。現在與型錄同集合（`v057` 釘住兩邊相等）。
+
 ## 0.4.1 - 2026-09-10（需 YS CART core >= 2.58.0）
 
 ### Added

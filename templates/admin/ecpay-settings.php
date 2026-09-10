@@ -102,11 +102,12 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					<label class="ysca-choice ysca-mt-md">
 						<input type="radio" name="ys_ec_ecpay_payment_mode" value="ecpg_web" <?php checked( $ys_ec_mode, 'ecpg_web' ); ?> <?php disabled( ! $ys_ec_mode_can( 'ecpg_web' ) ); ?>>
 						<strong><?php esc_html_e( '站內付 2.0 Web（特店專用）', 'ys-cart-ecpay' ); ?></strong>
-						<span class="ys-ec-badge ys-ec-badge-gray ysca-badge--xs"><?php esc_html_e( '尚未支援', 'ys-cart-ecpay' ); ?></span>
+						<span class="ys-ec-badge ys-ec-badge-gray ysca-badge--xs"><?php esc_html_e( '全域切換尚未支援；綁卡信用卡已以付款方式提供', 'ys-cart-ecpay' ); ?></span>
 					</label>
 					<p class="description ysca-choice-copy">
 						<?php esc_html_e( '由綠界的 JS 元件在本站頁面直接渲染付款欄位，消費者不離開結帳頁；卡號輸入後直送綠界，綠界官方載明此模式無需 PCI-DSS 認證。', 'ys-cart-ecpay' ); ?><br>
-						<?php esc_html_e( '需要先向綠界申請開通此服務（一般特約商店預設沒有）。', 'ys-cart-ecpay' ); ?>
+						<?php esc_html_e( '需要先向綠界申請開通此服務（一般特約商店預設沒有）。', 'ys-cart-ecpay' ); ?><br>
+						<?php esc_html_e( 'v0.5.0 起，「信用卡（站內付 2.0 綁卡）」在「金流方式」分頁以獨立付款方式提供，可與導轉方式並存：訂閱商品用它綁卡自動續扣，一般商品可繼續走導轉。這裡的模式切換只影響一般支付。', 'ys-cart-ecpay' ); ?>
 					</p>
 					<details class="ysca-mt-md">
 						<summary><?php esc_html_e( '站內付 2.0 開通方式與伺服器資訊', 'ys-cart-ecpay' ); ?></summary>
@@ -299,7 +300,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			<div class="ysca-card ysca-mt-md">
 				<div class="ysca-card__body">
 					<h2><?php esc_html_e( '金流方式', 'ys-cart-ecpay' ); ?></h2>
-					<p class="description"><?php esc_html_e( '以下為一般支付（導轉）可用的付款方式。消費者會跳到綠界付款頁完成付款，卡號全程不經過本站。', 'ys-cart-ecpay' ); ?></p>
+					<p class="description"><?php esc_html_e( '以下為一般支付（導轉）可用的付款方式。消費者會跳到綠界付款頁完成付款，卡號全程不經過本站。「信用卡（站內付 2.0 綁卡）」例外：卡號在本站頁面由綠界元件收取、直送綠界，付款成功後可自動續扣訂閱。', 'ys-cart-ecpay' ); ?></p>
 					<?php foreach ( (array) $settings['payment_methods'] as $ys_ec_pm_key => $ys_ec_pm ) : ?>
 						<?php
 						$ys_ec_pm_label      = is_array( $ys_ec_pm ) ? (string) ( $ys_ec_pm['label'] ?? '' ) : (string) $ys_ec_pm;

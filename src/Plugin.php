@@ -18,6 +18,8 @@ use YangSheep\Ecommerce\Utils\YSCrypto;
 use YangSheep\YSCartEcpay\Admin\EcpaySettings;
 use YangSheep\YSCartEcpay\Api\EcpayLogisticsController;
 use YangSheep\YSCartEcpay\Api\EcpayPaymentController;
+use YangSheep\YSCartEcpay\Api\EcpgPaymentController;
+use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Api\EcpayPrintController;
 use YangSheep\YSCartEcpay\Payment\EcpayGatewayBase;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
@@ -51,11 +53,26 @@ final class Plugin {
 	 */
 	private const RESULT_CODE_PATTERN = '/^[A-Za-z0-9]{32}$/D';
 
+	/**
+	 * 付款回呼路由要不要註冊，看的是「有沒有任何一個付款方式開著」。
+	 *
+	 * 🔴 v0.5.0 前這裡只列 0.4.0 之前的四個方式：只開 WebATM／分期／站內付時，
+	 * 付款通知路由根本不會註冊——綠界回呼打到 404，訂單永遠停在待付款。
+	 * 現在與型錄同集合（tests/regression/v057 釘住兩邊相等）。
+	 */
 	private const REGISTERED_GATEWAY_IDS = [
 		'ys_ec_ecpay_credit',
 		'ys_ec_ecpay_atm',
+		'ys_ec_ecpay_webatm',
 		'ys_ec_ecpay_cvs',
 		'ys_ec_ecpay_barcode',
+		'ys_ec_ecpay_credit_installment',
+		'ys_ec_ecpay_unionpay',
+		'ys_ec_ecpay_applepay',
+		'ys_ec_ecpay_twqr',
+		'ys_ec_ecpay_weixin',
+		'ys_ec_ecpay_bnpl',
+		'ys_ec_ecpay_ecpg_credit',
 	];
 
 	/**
@@ -810,6 +827,10 @@ final class Plugin {
 	public function register_public_routes(): void {
 		if ( $this->has_enabled_payment_methods() ) {
 			EcpayPaymentController::register_routes();
+		}
+		// 站內付 2.0 的六條路只在該方式開著時存在：關掉方式＝付款頁與回呼一起消失。
+		if ( $this->is_method_enabled( 'payment', EcpgOrderContext::GATEWAY_ID ) ) {
+			EcpgPaymentController::register_routes();
 		}
 
 		if ( ! $this->has_enabled_shipping_methods() ) {

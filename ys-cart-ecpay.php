@@ -2,8 +2,8 @@
 /**
  * Plugin Name: YS CART - ECPay
  * Plugin URI: https://github.com/Ya19880104/ys-cart-ecpay
- * Description: ECPay AIO payment and domestic logistics provider for YS CART.
- * Version: 0.4.1
+ * Description: ECPay AIO payment, ECPG bind-card subscription payment and domestic logistics provider for YS CART.
+ * Version: 0.5.0
  * Requires at least: 6.2
  * Requires PHP: 8.1
  * Requires Plugins: ys-cart
@@ -13,7 +13,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'YS_CART_ECPAY_VERSION', '0.4.1' );
+define( 'YS_CART_ECPAY_VERSION', '0.5.0' );
 define( 'YS_CART_ECPAY_FILE', __FILE__ );
 define( 'YS_CART_ECPAY_DIR', plugin_dir_path( __FILE__ ) );
 define( 'YS_CART_ECPAY_URL', plugin_dir_url( __FILE__ ) );
@@ -43,8 +43,13 @@ spl_autoload_register(
  * Pair contract: shared payment_detail CAS, stable payment operation keys,
  * typed replay reservation and deferred shipping hooks. The latter two prevent
  * a logistics callback from publishing effects before all projections persist.
+ *
+ * v0.5.0 raises the floor to 2.61.7: the ECPG bind-card gateway is a real token
+ * provider and relies on the order-scoped token-charge contract shipped there
+ * (YSOrderScopedTokenChargeGatewayInterface, YSSavedCardChargePolicy renewal
+ * gate, YSCreditCard token authority, YSPaymentDispatch card-identity binding).
  */
-define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.58.0' );
+define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.61.7' );
 
 add_action(
 	'plugins_loaded',

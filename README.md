@@ -53,6 +53,15 @@ Standalone ECPay provider plugin for YS CART.
   documented at https://developers.ecpay.com.tw/2894/.
 - Shipping method visibility, sorting, base rates, and free-shipping rules are managed in YS CART Shipping Settings.
 - ECPay CVS electronic map integration using YS CART's existing `cvs_store_id`, `cvs_store_name`, and `cvs_store_addr` checkout fields.
+- **ECPay 站內付 2.0 bind-card credit card** (`ys_ec_ecpay_ecpg_credit`, 0.5.0) for
+  contracted merchants: the card number is collected on a hosted page on the shop's
+  own domain by ECPay's JS SDK and sent straight to ECPay (no PCI-DSS burden per
+  ECPay). Subscription orders pay and bind in one authorisation (`CreateBindCard`);
+  the returned BindCardID is stored encrypted in YS CART's card vault and later
+  renewals charge it in the background (`CreatePaymentWithCardID`) through the same
+  order-scoped token-charge contract PayUni uses. Non-subscription orders use the
+  same page without binding. Ships disabled; requires ECPay activation of 站內付 2.0
+  and 綁定信用卡. Coexists with the redirect (AIO) methods.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.
 
 ## Requirements
@@ -61,13 +70,14 @@ Standalone ECPay provider plugin for YS CART.
 - PHP 8.1+
 - PHP `mbstring` is recommended but not required; the provider includes a UTF-8-safe
   fallback for ECPay field-length limits.
-- **YS CART 2.58.0+** (hard requirement; on top of the 2.56.12 set — typed
+- **YS CART 2.61.7+** (hard requirement; on top of the 2.56.12 set — typed
   fulfillment, durable logistics query, saved-address provider identity,
   encrypted-secret capability — the 2.58.0 pair contract additionally requires the shared
   `payment_detail` CAS service, stable payment operation keys, typed replay
-  reservations, and deferred shipping pipeline hooks)
+  reservations, and deferred shipping pipeline hooks; 0.5.0 further requires the
+  2.61.7 order-scoped token-charge contract used by ECPG bind-card renewals)
 
-### Why YS CART 2.58.0 is a hard requirement
+### Why YS CART 2.61.7 is a hard requirement
 
 This plugin does not carry its own writer for the order `payment_detail` column.
 It writes through the core's `YSPaymentDetailStore` compare-and-swap service and
@@ -75,7 +85,10 @@ relies on the core's `YSPaymentDispatch` operation keys so that every payment
 attempt derives a stable transaction identity. Logistics callbacks also reserve
 typed replay authority and defer the public pipeline hook until the provider's
 payment-detail, order, and label projections are durable. The complete capability
-set is available from 2.58.0.
+set is available from 2.58.0. The ECPG bind-card gateway (0.5.0) is a real token
+provider: it opts into `YSOrderScopedTokenChargeGatewayInterface`, binds the chosen
+card identity to the renewal attempt through `YSPaymentDispatch`, and reads the
+stored BindCardID through `YSCreditCard`'s token authority — all shipped in 2.61.7.
 
 If the core is older, the plugin **registers no payment gateways and no shipping
 methods** and shows an admin notice instead. A provider that is registered but
