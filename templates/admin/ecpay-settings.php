@@ -13,23 +13,6 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			<?php esc_html_e( '綠界設定已儲存。', 'ys-cart-ecpay' ); ?>
 		</div>
 	<?php endif; ?>
-	<?php if ( isset( $_GET['stores_built'] ) ) : ?>
-		<?php $ys_ec_built = (int) $_GET['stores_built']; ?>
-		<div class="ys-ec-notice <?php echo $ys_ec_built > 0 ? 'ys-ec-notice-success' : 'ys-ec-notice-warning'; ?>">
-			<span class="dashicons <?php echo $ys_ec_built > 0 ? 'dashicons-yes-alt' : 'dashicons-warning'; ?>"></span>
-			<?php if ( $ys_ec_built > 0 ) : ?>
-				<?php
-				printf(
-					/* translators: %s: store count */
-					esc_html__( '門市目錄已更新，共 %s 間門市。', 'ys-cart-ecpay' ),
-					esc_html( number_format_i18n( $ys_ec_built ) )
-				);
-				?>
-			<?php else : ?>
-				<?php esc_html_e( '門市目錄更新後仍是空的。請確認該通路的商店代號與 HashKey／HashIV 正確、且綠界後台已對這組 MerchantID 開通該項物流服務。', 'ys-cart-ecpay' ); ?>
-			<?php endif; ?>
-		</div>
-	<?php endif; ?>
 	<?php
 	$ys_ec_settings_errors = [
 		'invalid_logistics_source'           => __( '物流設定選項無效，請重新選擇後儲存。設定未變更。', 'ys-cart-ecpay' ),
@@ -428,25 +411,6 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 								</span>
 							</label>
 
-							<?php // 只有啟用中的方式才需要目錄；沒啟用的不該對站主喊「顧客選不了門市」。 ?>
-							<?php if ( isset( $method['store_directory_count'] ) && ! empty( $settings[ (string) $key . '_enabled' ] ) ) : ?>
-								<?php $ys_ec_dir_count = (int) $method['store_directory_count']; ?>
-								<p class="ysca-field__hint">
-									<?php if ( 0 === $ys_ec_dir_count ) : ?>
-										<strong><?php esc_html_e( '門市目錄尚未建立', 'ys-cart-ecpay' ); ?></strong>
-										<?php esc_html_e( '——顧客現在選不了門市。按下方「立即更新門市目錄」即可建立。', 'ys-cart-ecpay' ); ?>
-									<?php else : ?>
-										<?php
-										printf(
-											/* translators: %s: store count */
-											esc_html__( '門市目錄：已快取 %s 間門市。', 'ys-cart-ecpay' ),
-											esc_html( number_format_i18n( $ys_ec_dir_count ) )
-										);
-										?>
-									<?php endif; ?>
-								</p>
-							<?php endif; ?>
-
 							<?php if ( ! empty( $method['supports_return_store'] ) ) : ?>
 								<label class="ysca-field ysca-mt-sm">
 									<span class="ysca-field__label"><?php esc_html_e( '退貨門市代號（選填）', 'ys-cart-ecpay' ); ?></span>
@@ -475,15 +439,6 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							<?php endif; ?>
 						</div>
 					<?php endforeach; ?>
-
-					<p class="ysca-mt-md">
-						<button type="submit" name="ys_ec_ecpay_refresh_stores" value="1" class="ysca-btn ysca-btn--secondary">
-							<?php esc_html_e( '立即更新門市目錄', 'ys-cart-ecpay' ); ?>
-						</button>
-						<span class="ysca-field__hint">
-							<?php esc_html_e( '門市清單平常由每日兩次的排程維持。剛裝好、剛換憑證、或站台流量低導致排程沒跑時，用這顆手動補上。', 'ys-cart-ecpay' ); ?>
-						</span>
-					</p>
 
 					<p class="description ysca-mt-md">
 						<?php esc_html_e( '運費、免運門檻與排序由 YS CART 物流設定管理。', 'ys-cart-ecpay' ); ?>

@@ -9,7 +9,6 @@ use YangSheep\Ecommerce\Admin\YSAdminApp;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
-use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayStoreDirectory;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
@@ -51,19 +50,6 @@ final class EcpaySettings {
 
 		check_admin_referer( self::NONCE_ACTION );
 
-		// v0.5.1：「立即更新門市目錄」——只重建快取，不動任何設定。
-		// 新裝的站在第一次排程（twicedaily）跑完前目錄是空的，顧客選店必定失敗；
-		// 低流量站的 WP cron 又可能遲遲不觸發，所以站主要有一個手動出口。
-		if ( isset( $_POST['ys_ec_ecpay_refresh_stores'] ) ) {
-			$counts = EcpayStoreDirectory::refresh_enabled_channels();
-			wp_safe_redirect( add_query_arg( [
-				'page'         => 'ys-provider-ecpay',
-				'tab'          => 'shipping',
-				'stores_built' => (string) array_sum( $counts ),
-			], admin_url( 'admin.php' ) ) );
-			exit;
-		}
-
 		$tab = self::normalize_tab( sanitize_key( wp_unslash( (string) ( $_POST['ys_ec_ecpay_tab'] ?? self::DEFAULT_TAB ) ) ) );
 		$provider_enabled = isset( $_POST['ys_ec_ecpay_enabled'] );
 		$settings_error   = '';
@@ -87,11 +73,6 @@ final class EcpaySettings {
 		];
 		if ( '' === $settings_error ) {
 			$redirect_args['updated'] = '1';
-			// v0.5.1：物流設定一存檔就把門市目錄補起來。這是站主的操作路徑，慢幾秒
-			// 沒關係；顧客的選店路徑仍然只讀快取、絕不同步出網。
-			if ( 'shipping' === $tab ) {
-				$redirect_args['stores_built'] = (string) array_sum( EcpayStoreDirectory::refresh_enabled_channels() );
-			}
 		} else {
 			$redirect_args['settings_error'] = $settings_error;
 		}
@@ -686,13 +667,6 @@ final class EcpaySettings {
 			if ( true === $descriptor['requires_goods_weight'] ) {
 				$out['shipping_methods'][ $alias ]['goods_weight'] =
 					(string) Settings::get( 'shipping_' . $method_id . '_goods_weight', '' );
-			}
-
-			// v0.5.1：門市目錄的現況攤在設定頁上。目錄是空的＝顧客一定選不了店，
-			// 站主必須看得到，不能只從顧客的客訴才知道。
-			if ( ! empty( $descriptor['requires_store'] ) ) {
-				$out['shipping_methods'][ $alias ]['store_directory_count'] =
-					EcpayStoreDirectory::cached_count( (string) $descriptor['logistics_subtype'] );
 			}
 		}
 

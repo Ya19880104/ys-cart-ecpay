@@ -112,17 +112,6 @@ final class EcpayStoreDirectory {
 	}
 
 	/**
-	 * 後台診斷用：這個通路的門市目錄現在快取了幾間（**不出網**、查不到就是 0）。
-	 *
-	 * v0.5.1：新裝的站在第一次排程跑完之前目錄是空的，顧客一選店就會拿到
-	 * 「無法取得門市的伺服器權威資料」。站主看不到這個狀態就只能乾等，所以把它
-	 * 攤在設定頁上，並配一顆「立即更新」。
-	 */
-	public static function cached_count( string $subtype ): int {
-		return count( self::cached_store_list( $subtype ) );
-	}
-
-	/**
 	 * 向綠界重新抓一份門市清單並快取（**不在回呼路徑上同步呼叫**）
 	 *
 	 * @return int 快取到幾間門市；0 代表沒抓到（不會把失敗快取成空清單）
