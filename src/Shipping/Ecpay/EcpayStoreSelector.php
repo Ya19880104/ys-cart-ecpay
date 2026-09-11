@@ -585,9 +585,9 @@ final class EcpayStoreSelector {
 
 		$authority = self::read_selection_authority( $data );
 		$record    = $authority['record'];
-		if ( null !== $authority['reject'] || ! is_array( $record ) || 1 !== (int) ( $record['store_verified'] ?? 0 ) ) {
+		if ( null !== $authority['reject'] || ! is_array( $record ) ) {
 			return [
-				'error' => $authority['reject'] ?? '目前無法取得門市的伺服器權威資料，請稍後重新選擇門市。',
+				'error' => $authority['reject'] ?? '取貨門市的選擇已逾時或無效，請重新選擇門市。',
 				'store' => [],
 			];
 		}
@@ -597,8 +597,18 @@ final class EcpayStoreSelector {
 			'store_name'    => trim( (string) ( $record['store_name'] ?? '' ) ),
 			'store_address' => trim( (string) ( $record['store_address'] ?? '' ) ),
 		];
-		if ( '' === $store['store_id'] || '' === $store['store_name'] || '' === $store['store_address'] ) {
-			return [ 'error' => '門市權威資料不完整，請重新選擇門市。', 'store' => [] ];
+
+		// 🔴 v0.5.2：只有 `store_id` 缺席才是硬錯，不再要求 `store_verified===1`。
+		//
+		// 上 wire 的只有 `CVSStoreID`（建單的 `ReceiverStoreID`），它由一次性 nonce
+		// 綁定在這張 token 裡、綠界建單時自行驗證——瀏覽器偽造不了它（見 verify_selection）。
+		// `store_verified` 只反映「我方門市目錄查不查得到這間店的**顯示名稱**」，目錄還沒
+		// 建好時名稱／地址來自綠界回呼本身。訂單成立那一刻的 claim_selection_authoritative
+		// 從來就只認 store_id、不看 store_verified；這裡的欄位驗證卻更嚴，把合法訂單擋在
+		// 「稍後重新選擇門市」——顧客再選一百次也一樣，因為目錄空不空跟這次選店無關。
+		// 現在兩條路徑一致：有店號就過，名稱缺了只影響顯示。
+		if ( '' === $store['store_id'] ) {
+			return [ 'error' => '門市資料不完整，請重新選擇門市。', 'store' => [] ];
 		}
 
 		return [ 'error' => null, 'store' => $store ];

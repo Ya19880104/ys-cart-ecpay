@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 - 2026-09-11（需 YS CART core >= 2.61.7）
+
+### Fixed
+
+- 🔴🔴 **選完超商門市卻結不了帳**（客戶站事故，接續 0.5.1）：顧客選好門市，結帳時被擋在「目前無法取得門市的伺服器權威資料，請稍後重新選擇門市。」——再選幾次都一樣。**這才是主因，門市目錄有沒有建好其實不影響下單能力。**
+  - 根因：上 wire 的只有 `CVSStoreID`（建單的 `ReceiverStoreID`），它由一次性 nonce 綁在選店 token 裡、綠界建單時自行驗證，瀏覽器偽造不了。`store_verified` 只反映「我方門市目錄查不查得到這間店的**顯示名稱**」。訂單成立那一刻的認領（`claim_selection_authoritative`）從來就只認 store_id、不看 store_verified；但結帳前的欄位驗證（`inspect_selection_authoritative`）卻硬性要 `store_verified===1`，於是目錄一空就把合法訂單擋死。
+  - 修正：讓欄位驗證與訂單成立一致——**有店號就放行**，名稱缺了只影響顯示。回呼端維持原本的降級（查得到用目錄的 canonical 名稱並標 verified；查不到用綠界回呼帶回的 `CVSStoreName`／`CVSAddress` 並標 unverified），只是 unverified 不再是結帳的 gate。
+  - 契約 `v053_store_selection_accepts_unverified` 釘住「gate 移除」與「inspect 與 claim 一致」；`store_verified===1` 的端到端仍由 `v035`／`v036` 覆蓋。
+
 ## 0.5.1 - 2026-09-11（需 YS CART core >= 2.61.7）
 
 ### Fixed
