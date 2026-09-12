@@ -37,6 +37,11 @@ return [
 			'shipping_requester'  => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingRequester::class,
 			'carrier_adapter'     => \YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter::class,
 		],
+		// Core 2.67.0 才具備 runtime method-provider authority。Rolling upgrade 先升 ECPay 時，
+		// 舊 Core 必須繼續把此能力視為 absent，保留原本 strict-v1／AIO／物流行為。
+		...( defined( 'YS_ECOMMERCE_VERSION' ) && version_compare( (string) YS_ECOMMERCE_VERSION, '2.67.0', '>=' )
+			? [ 'temperature_layer_mapping_v1' => \YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog::temperature_layer_mapping_capability() ]
+			: [] ),
 	],
 	'admin_page'         => [
 		'slug'                => 'ys-provider-ecpay',

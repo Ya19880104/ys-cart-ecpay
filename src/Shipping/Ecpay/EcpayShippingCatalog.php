@@ -642,6 +642,44 @@ final class EcpayShippingCatalog {
 	}
 
 	/**
+	 * Core `temperature_layer_mapping_v1` capability derived from the descriptor matrix.
+	 *
+	 * Every ECPay logistics method has exactly one immutable wire temperature. The profile key and
+	 * wire class therefore use the same canonical room/chilled/frozen value. An unknown future code
+	 * is omitted from the mapping so that it cannot acquire an inferred temperature authority.
+	 *
+	 * @return array{schema_version:int,shipping_methods:array<string,array{mapping_profiles:array<string,array{wire_temperature_class:string,mapping_version:int}>}>}
+	 */
+	public static function temperature_layer_mapping_capability(): array {
+		$methods = [];
+		foreach ( self::METHODS as $method_id => $descriptor ) {
+			$profile = match ( (string) ( $descriptor['temperature'] ?? '' ) ) {
+				self::TEMP_ROOM    => 'room',
+				self::TEMP_CHILLED => 'chilled',
+				self::TEMP_FROZEN  => 'frozen',
+				default            => '',
+			};
+			if ( '' === $profile ) {
+				continue;
+			}
+
+			$methods[ $method_id ] = [
+				'mapping_profiles' => [
+					$profile => [
+						'wire_temperature_class' => $profile,
+						'mapping_version'        => 1,
+					],
+				],
+			];
+		}
+
+		return [
+			'schema_version'   => 1,
+			'shipping_methods' => $methods,
+		];
+	}
+
+	/**
 	 * 後台「物流方式」分頁的渲染資料——同樣由本表導出。
 	 *
 	 * @return array<string,array<string,mixed>>
