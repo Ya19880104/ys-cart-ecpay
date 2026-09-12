@@ -23,6 +23,7 @@ function wp_json_encode(mixed $value, int $flags = 0): string { return (string) 
 function wp_create_nonce(string $action = ''): string { return 'fixture-rest-nonce'; }
 function wp_nonce_field(string $action): void { echo '<input type="hidden" name="_wpnonce" value="fixture-nonce">'; }
 function sanitize_key(string $value): string { return preg_replace('/[^a-z0-9_-]/', '', strtolower($value)); }
+require_once dirname(__DIR__) . '/fixtures/core_admin_partials_stub.php';
 require_once dirname(__DIR__, 2) . '/src/Payment/EcpayPaymentCatalog.php';
 require_once dirname(__DIR__, 2) . '/src/Shipping/Ecpay/EcpayShippingCatalog.php';
 require_once dirname(__DIR__, 2) . '/src/Support/Settings.php';
@@ -142,7 +143,19 @@ $bothDetails = first($homeBoth, '//details[summary="宅配使用的設定"]');
 check('home family shown collapsed without warning when both groups are in use', $bothDetails !== null && !$bothDetails->hasAttribute('open') && !str_contains($homeBoth->document->textContent, '已設為「不使用」') && first($homeBoth, '//select[@name="ys_ec_ecpay_home_credential_family"]//option[@value="b2c_home"][@selected]') !== null);
 check('obsolete gate error strings are gone', !str_contains(dom(render_settings('disabled', 'disabled', 'api', 'signer_change_active_labels'))->document->textContent, '仍有未結束或升級前的物流單'));
 // ── 交易模式：只有已實作的模式可選，未實作的看得到但存不進 ──
-$modeXp = dom(render_settings('payment', 'separate'));
+$partialHtml = render_settings('payment', 'separate');
+$modeXp = dom($partialHtml);
+check(
+    'settings compose the Core Surface, flat Sections, Field, Notice, NavTabs and Button partials',
+    substr_count($partialHtml, 'data-stub-partial="surface"') === 1
+        && substr_count($partialHtml, 'data-stub-partial="section"') === 6
+        && substr_count($partialHtml, 'data-variant="flat"') === 6
+        && substr_count($partialHtml, 'data-stub-partial="field"') >= 1
+        && substr_count($partialHtml, 'data-stub-partial="notice"') === 1
+        && substr_count($partialHtml, 'data-stub-partial="nav-tabs"') === 1
+        && substr_count($partialHtml, 'data-stub-partial="button"') === 2
+        && !str_contains($partialHtml, 'class="ysca-card')
+);
 $modeInputs = [];
 foreach ($modeXp->query('//input[@name="ys_ec_ecpay_payment_mode"]') as $input) {
     $modeInputs[$input->getAttribute('value')] = [

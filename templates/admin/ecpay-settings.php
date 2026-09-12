@@ -5,13 +5,41 @@ $tab                   = (string) ( $settings['tab'] ?? 'api' );
 $tabs                  = (array) ( $settings['tabs'] ?? [] );
 $page_url              = (string) ( $settings['page_url'] ?? admin_url( 'admin.php?page=ys-provider-ecpay' ) );
 $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_url( 'admin.php?page=ys-ec-shipping' ) );
+$ys_ec_partials = class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminSurfacePartial::class )
+	&& class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminSectionPartial::class )
+	&& class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminFieldPartial::class )
+	&& class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminButtonPartial::class )
+	&& class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminNoticePartial::class )
+	&& class_exists( \YangSheep\Ecommerce\Admin\Partials\YSAdminNavTabsPartial::class );
+$ys_ec_open_section = static function ( string $title, string $description = '' ) use ( $ys_ec_partials ): void {
+	if ( $ys_ec_partials ) {
+		\YangSheep\Ecommerce\Admin\Partials\YSAdminSectionPartial::open( [
+			'title' => $title,
+			'description' => $description,
+			'variant' => 'flat',
+		] );
+		return;
+	}
+	echo '<div class="ysca-card ysca-mt-md"><div class="ysca-card__body"><h2>' . esc_html( $title ) . '</h2>';
+	if ( '' !== $description ) {
+		echo '<p class="description">' . esc_html( $description ) . '</p>';
+	}
+};
+$ys_ec_close_section = static function () use ( $ys_ec_partials ): void {
+	if ( $ys_ec_partials ) {
+		\YangSheep\Ecommerce\Admin\Partials\YSAdminSectionPartial::close();
+		return;
+	}
+	echo '</div></div>';
+};
 ?>
-<div class="ysca-page-root">
+<?php if ( $ys_ec_partials ) : ?>
+	<?php \YangSheep\Ecommerce\Admin\Partials\YSAdminSurfacePartial::open( [ 'title' => __( '綠界 ECPay 設定', 'ys-cart-ecpay' ), 'description' => __( '管理綠界憑證、付款方式、物流方式與回呼資訊。', 'ys-cart-ecpay' ), 'variant' => 'wide' ] ); ?>
+<?php else : ?>
+	<div class="ysca-page-root">
+<?php endif; ?>
 	<?php if ( isset( $_GET['updated'] ) ) : ?>
-		<div class="ys-ec-notice ys-ec-notice-success">
-			<span class="dashicons dashicons-yes-alt"></span>
-			<?php esc_html_e( '綠界設定已儲存。', 'ys-cart-ecpay' ); ?>
-		</div>
+		<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminNoticePartial::render( [ 'text' => __( '綠界設定已儲存。', 'ys-cart-ecpay' ), 'tone' => 'success', 'dashicon' => 'yes-alt' ] ); } else { echo '<div class="ys-ec-notice ys-ec-notice-success"><span class="dashicons dashicons-yes-alt"></span>' . esc_html__( '綠界設定已儲存。', 'ys-cart-ecpay' ) . '</div>'; } ?>
 	<?php endif; ?>
 	<?php
 	$ys_ec_settings_errors = [
@@ -33,19 +61,23 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 	$ys_ec_settings_error = sanitize_key( wp_unslash( (string) ( $_GET['settings_error'] ?? '' ) ) );
 	?>
 	<?php if ( isset( $ys_ec_settings_errors[ $ys_ec_settings_error ] ) ) : ?>
-		<div class="ys-ec-notice ys-ec-notice-error">
-			<span class="dashicons dashicons-warning"></span>
-			<?php echo esc_html( $ys_ec_settings_errors[ $ys_ec_settings_error ] ); ?>
-		</div>
+		<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminNoticePartial::render( [ 'text' => $ys_ec_settings_errors[ $ys_ec_settings_error ], 'tone' => 'danger', 'dashicon' => 'warning', 'attrs' => [ 'role' => 'alert' ] ] ); } else { echo '<div class="ys-ec-notice ys-ec-notice-error"><span class="dashicons dashicons-warning"></span>' . esc_html( $ys_ec_settings_errors[ $ys_ec_settings_error ] ) . '</div>'; } ?>
 	<?php endif; ?>
 
 	<?php if ( class_exists( \YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock::class )
 		&& \YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock::crashed_flag_present() ) : ?>
-		<div class="notice notice-error">
-			<p><?php esc_html_e( '🔴 前次綠界設定儲存未正常完成（程序中斷），憑證狀態尚未驗證——所有綠界出網操作（建單／查詢／回呼驗章／列印）已暫停。請核對本頁各組憑證欄位後重新儲存一次；儲存成功即恢復。', 'ys-cart-ecpay' ); ?></p>
-		</div>
+		<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminNoticePartial::render( [ 'text' => __( '🔴 前次綠界設定儲存未正常完成（程序中斷），憑證狀態尚未驗證——所有綠界出網操作（建單／查詢／回呼驗章／列印）已暫停。請核對本頁各組憑證欄位後重新儲存一次；儲存成功即恢復。', 'ys-cart-ecpay' ), 'tone' => 'danger', 'dashicon' => 'warning', 'attrs' => [ 'role' => 'alert' ] ] ); } else { echo '<div class="notice notice-error"><p>' . esc_html__( '🔴 前次綠界設定儲存未正常完成（程序中斷），憑證狀態尚未驗證——所有綠界出網操作（建單／查詢／回呼驗章／列印）已暫停。請核對本頁各組憑證欄位後重新儲存一次；儲存成功即恢復。', 'ys-cart-ecpay' ) . '</p></div>'; } ?>
 	<?php endif; ?>
 
+	<?php if ( $ys_ec_partials ) : ?>
+		<?php
+		$ys_ec_tab_items = [];
+		foreach ( $tabs as $key => $label ) {
+			$ys_ec_tab_items[] = [ 'label' => (string) $label, 'href' => add_query_arg( 'tab', (string) $key, $page_url ), 'active' => $tab === (string) $key ];
+		}
+		\YangSheep\Ecommerce\Admin\Partials\YSAdminNavTabsPartial::render( [ 'items' => $ys_ec_tab_items, 'a11y' => [ 'aria_label' => __( '綠界設定分頁', 'ys-cart-ecpay' ) ] ] );
+		?>
+	<?php else : ?>
 	<div class="ys-ec-filters ysca-tabs ysca-tabs--with-indicator" role="tablist" aria-label="<?php esc_attr_e( '綠界設定分頁', 'ys-cart-ecpay' ); ?>">
 		<?php foreach ( $tabs as $key => $label ) : ?>
 			<?php $is_active = $tab === (string) $key; ?>
@@ -58,24 +90,25 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			</a>
 		<?php endforeach; ?>
 	</div>
+	<?php endif; ?>
 
 	<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="ysca-form">
 		<input type="hidden" name="action" value="ys_cart_ecpay_save_settings">
 		<input type="hidden" name="ys_ec_ecpay_tab" value="<?php echo esc_attr( $tab ); ?>">
 		<?php wp_nonce_field( $nonce_action ); ?>
 
-		<div class="ysca-card">
-			<div class="ysca-card__body">
+		<?php $ys_ec_open_section( __( '供應商狀態', 'ys-cart-ecpay' ) ); ?>
+			<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminFieldPartial::open( [ 'a11y' => [ 'aria_label' => __( '綠界供應商啟用狀態', 'ys-cart-ecpay' ) ] ] ); } ?>
 				<label class="ysca-switch-label">
 					<span class="ysca-switch">
-						<input type="checkbox" name="ys_ec_ecpay_enabled" value="1" <?php checked( $settings['enabled'] ); ?>>
+						<input id="ys-ec-ecpay-enabled" type="checkbox" name="ys_ec_ecpay_enabled" value="1" <?php checked( $settings['enabled'] ); ?>>
 						<span class="ysca-switch-slider"></span>
 					</span>
 					<strong><?php esc_html_e( '啟用綠界 ECPay', 'ys-cart-ecpay' ); ?></strong>
 				</label>
 				<p class="description"><?php esc_html_e( '供應商啟用後，才會顯示並註冊對應的金流、物流方法。', 'ys-cart-ecpay' ); ?></p>
-			</div>
-		</div>
+			<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminFieldPartial::close(); } ?>
+		<?php $ys_ec_close_section(); ?>
 
 		<?php if ( 'api' === $tab ) : ?>
 			<?php
@@ -83,9 +116,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			$ys_ec_supported = (array) ( $settings['payment_modes_implemented'] ?? [ 'redirect' ] );
 			$ys_ec_mode_can  = static fn( string $m ): bool => in_array( $m, $ys_ec_supported, true );
 			?>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '交易模式', 'ys-cart-ecpay' ); ?></h2>
+			<?php $ys_ec_open_section( __( '交易模式', 'ys-cart-ecpay' ) ); ?>
 					<p class="description"><?php esc_html_e( '綠界的金流分成幾種各自獨立的服務。以下列出本外掛目前支援與尚未支援的模式，未支援者僅供了解與提前申請。', 'ys-cart-ecpay' ); ?></p>
 
 					<label class="ysca-choice ysca-mt-md">
@@ -122,7 +153,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							<label><strong><?php esc_html_e( '伺服器對外 IP', 'ys-cart-ecpay' ); ?></strong></label>
 							<div class="ysca-inline-actions ysca-inline-actions--start">
 								<code id="ys-ec-ecpay-server-ip" class="ysca-code-pill ysca-code-pill--lg"><?php esc_html_e( '查詢中…', 'ys-cart-ecpay' ); ?></code>
-								<button type="button" id="ys-ec-ecpay-refresh-ip" class="ysca-btn ysca-btn--sm"><?php esc_html_e( '重新查詢', 'ys-cart-ecpay' ); ?></button>
+								<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminButtonPartial::render( [ 'label' => __( '重新查詢', 'ys-cart-ecpay' ), 'type' => 'button', 'size' => 'sm', 'id' => 'ys-ec-ecpay-refresh-ip' ] ); } else { echo '<button type="button" id="ys-ec-ecpay-refresh-ip" class="ysca-btn ysca-btn--sm">' . esc_html__( '重新查詢', 'ys-cart-ecpay' ) . '</button>'; } ?>
 							</div>
 							<p class="description"><?php esc_html_e( '綠界官方文件並未要求設定 IP 白名單；此處僅在綠界主動索取來源 IP 時提供方便複製。', 'ys-cart-ecpay' ); ?></p>
 						</div>
@@ -141,8 +172,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					<p class="description ysca-mt-md">
 						<?php esc_html_e( '另有「信用卡幕後授權」（卡號由本站直接傳送給綠界）需通過 PCI-DSS SAQ-D 認證，本外掛不支援、也不規劃支援。', 'ys-cart-ecpay' ); ?>
 					</p>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 			<script>
 			(function () {
 				var el = document.getElementById('ys-ec-ecpay-server-ip');
@@ -165,12 +195,8 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 				load();
 			}());
 			</script>
-			<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md">
-				<p><?php esc_html_e( '更換金鑰會造成原本已綁定付款的用戶失效，請小心操作。進行中的付款與物流單也可能受影響。', 'ys-cart-ecpay' ); ?></p>
-			</div>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '金流設定', 'ys-cart-ecpay' ); ?></h2>
+			<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminNoticePartial::render( [ 'text' => __( '更換金鑰會造成原本已綁定付款的用戶失效，請小心操作。進行中的付款與物流單也可能受影響。', 'ys-cart-ecpay' ), 'tone' => 'warning', 'dashicon' => 'warning', 'class_extra' => 'ysca-mt-md' ] ); } else { echo '<div class="ys-ec-notice ys-ec-notice-warning ysca-mt-md"><p>' . esc_html__( '更換金鑰會造成原本已綁定付款的用戶失效，請小心操作。進行中的付款與物流單也可能受影響。', 'ys-cart-ecpay' ) . '</p></div>'; } ?>
+			<?php $ys_ec_open_section( __( '金流設定', 'ys-cart-ecpay' ) ); ?>
 					<div class="ysca-form-grid">
 						<label class="ysca-field">
 							<span class="ysca-field__label"><?php esc_html_e( '金流測試模式', 'ys-cart-ecpay' ); ?></span>
@@ -206,8 +232,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 						</label>
 						<p class="description"><?php esc_html_e( '請至綠界後台「信用卡收單 → 信用卡授權資訊」查看。', 'ys-cart-ecpay' ); ?> <a href="https://developers.ecpay.com.tw/2894/" target="_blank" rel="noopener noreferrer"><?php esc_html_e( '綠界官方說明', 'ys-cart-ecpay' ); ?></a></p>
 					</details>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 
 			<?php
 			$ys_ec_logistics_groups = [
@@ -221,9 +246,8 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 				$ys_ec_source_id   = 'ys-ec-ecpay-' . $ys_ec_group . '-source';
 				$ys_ec_fields_id   = 'ys-ec-ecpay-' . $ys_ec_group . '-fields';
 				?>
-				<div class="ysca-card ysca-mt-md">
-					<div class="ysca-card__body">
-						<h2><label for="<?php echo esc_attr( $ys_ec_source_id ); ?>"><?php echo esc_html( $ys_ec_group_label ); ?></label></h2>
+				<?php $ys_ec_open_section( $ys_ec_group_label ); ?>
+						<label class="ysca-field__label" for="<?php echo esc_attr( $ys_ec_source_id ); ?>"><?php esc_html_e( '憑證來源', 'ys-cart-ecpay' ); ?></label>
 						<select class="ysca-input ysca-field--md" id="<?php echo esc_attr( $ys_ec_source_id ); ?>" name="ys_ec_ecpay_<?php echo esc_attr( $ys_ec_group ); ?>_source" aria-controls="<?php echo esc_attr( $ys_ec_fields_id ); ?>" data-ys-ecpay-logistics-source>
 							<option value="disabled" <?php selected( $ys_ec_source_mode, 'disabled' ); ?>><?php esc_html_e( '不使用', 'ys-cart-ecpay' ); ?></option>
 							<option value="payment" <?php selected( $ys_ec_source_mode, 'payment' ); ?>><?php esc_html_e( '共用上方金流設定', 'ys-cart-ecpay' ); ?></option>
@@ -259,8 +283,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							</div>
 							<p class="description"><?php esc_html_e( '勾選並儲存後，清除此組的測試模式與商店設定。', 'ys-cart-ecpay' ); ?></p>
 						</fieldset>
-					</div>
-				</div>
+				<?php $ys_ec_close_section(); ?>
 			<?php endforeach; ?>
 			<?php
 			$ys_ec_home_family   = (string) ( $settings['home_credential_family'] ?? '' );
@@ -273,8 +296,7 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 			$ys_ec_show_home     = ( $ys_ec_b2c_in_use && $ys_ec_c2c_in_use ) || $ys_ec_home_conflict;
 			?>
 			<?php if ( $ys_ec_show_home ) : ?>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
+			<?php $ys_ec_open_section( __( '宅配憑證', 'ys-cart-ecpay' ) ); ?>
 					<details<?php echo $ys_ec_home_conflict ? ' open' : ''; ?>>
 						<summary><?php esc_html_e( '宅配使用的設定', 'ys-cart-ecpay' ); ?></summary>
 					<?php if ( $ys_ec_home_conflict ) : ?>
@@ -291,15 +313,12 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					</label>
 					<p class="description"><?php esc_html_e( '黑貓／郵局宅配依綠界合約可能掛在 B2C 或 C2C 的商店代號下；兩組都有使用時，請依綠界實際為你開通宅配的那一組選擇。', 'ys-cart-ecpay' ); ?></p>
 					</details>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 			<?php endif; ?>
 		<?php endif; ?>
 
 		<?php if ( 'payment' === $tab ) : ?>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '金流方式', 'ys-cart-ecpay' ); ?></h2>
+			<?php $ys_ec_open_section( __( '金流方式', 'ys-cart-ecpay' ) ); ?>
 					<p class="description"><?php esc_html_e( '以下為一般支付（導轉）可用的付款方式。消費者會跳到綠界付款頁完成付款，卡號全程不經過本站。「信用卡（站內付 2.0 綁卡）」例外：卡號在本站頁面由綠界元件收取、直送綠界，付款成功後可自動續扣訂閱。', 'ys-cart-ecpay' ); ?></p>
 					<?php foreach ( (array) $settings['payment_methods'] as $ys_ec_pm_key => $ys_ec_pm ) : ?>
 						<?php
@@ -356,26 +375,20 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							</p>
 						</div>
 					</details>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 		<?php endif; ?>
 
 		<?php if ( 'shipping' === $tab ) : ?>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '寄件人資料', 'ys-cart-ecpay' ); ?></h2>
+			<?php $ys_ec_open_section( __( '寄件人資料', 'ys-cart-ecpay' ) ); ?>
 					<div class="ysca-form-grid">
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件人姓名', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_sender_name" value="<?php echo esc_attr( $settings['sender_name'] ); ?>"></label>
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件人電話', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--md" type="text" name="ys_ec_ecpay_sender_phone" value="<?php echo esc_attr( $settings['sender_phone'] ); ?>"></label>
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '郵遞區號', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--compact" type="text" name="ys_ec_ecpay_sender_zipcode" value="<?php echo esc_attr( $settings['sender_zipcode'] ); ?>"></label>
 						<label class="ysca-field"><span class="ysca-field__label"><?php esc_html_e( '寄件地址', 'ys-cart-ecpay' ); ?></span><input class="ysca-input ysca-field--lg" type="text" name="ys_ec_ecpay_sender_address" value="<?php echo esc_attr( $settings['sender_address'] ); ?>"></label>
 					</div>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '物流方式', 'ys-cart-ecpay' ); ?></h2>
+			<?php $ys_ec_open_section( __( '物流方式', 'ys-cart-ecpay' ) ); ?>
 					<p class="description">
 						<?php esc_html_e( '超商 B2C／C2C 與宅配能力以綠界後台對該 MerchantID 的實際開通狀態為準；宅配使用哪組憑證請在 API 設定明確指定。', 'ys-cart-ecpay' ); ?>
 					</p>
@@ -447,14 +460,11 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 					<p class="description">
 						<?php esc_html_e( '貨到付款是否代收，由訂單實際的付款方式決定，不需要（也不能）在這裡另外開關。', 'ys-cart-ecpay' ); ?>
 					</p>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 		<?php endif; ?>
 
 		<?php if ( 'diagnostics' === $tab ) : ?>
-			<div class="ysca-card ysca-mt-md">
-				<div class="ysca-card__body">
-					<h2><?php esc_html_e( '回呼網址', 'ys-cart-ecpay' ); ?></h2>
+			<?php $ys_ec_open_section( __( '回呼網址', 'ys-cart-ecpay' ) ); ?>
 					<table class="widefat striped">
 						<tbody>
 							<?php foreach ( (array) $settings['callback_urls'] as $label => $url ) : ?>
@@ -465,15 +475,11 @@ $shipping_settings_url = (string) ( $settings['shipping_settings_url'] ?? admin_
 							<?php endforeach; ?>
 						</tbody>
 					</table>
-				</div>
-			</div>
+			<?php $ys_ec_close_section(); ?>
 		<?php endif; ?>
 
 		<div class="ysca-inline-actions ysca-inline-actions--start ysca-mt-md">
-			<button type="submit" class="ysca-btn ysca-btn--primary">
-				<span class="dashicons dashicons-saved ysca-icon--sm"></span>
-				<?php esc_html_e( '儲存綠界設定', 'ys-cart-ecpay' ); ?>
-			</button>
+			<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminButtonPartial::render( [ 'label' => __( '儲存綠界設定', 'ys-cart-ecpay' ), 'variant' => 'primary', 'type' => 'submit', 'dashicon' => 'saved' ] ); } else { echo '<button type="submit" class="ysca-btn ysca-btn--primary"><span class="dashicons dashicons-saved ysca-icon--sm"></span>' . esc_html__( '儲存綠界設定', 'ys-cart-ecpay' ) . '</button>'; } ?>
 		</div>
 	</form>
-</div>
+<?php if ( $ys_ec_partials ) { \YangSheep\Ecommerce\Admin\Partials\YSAdminSurfacePartial::close(); } else { echo '</div>'; } ?>
