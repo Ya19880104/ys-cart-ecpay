@@ -5,6 +5,7 @@ namespace YangSheep\YSCartEcpay\Payment;
 
 defined( 'ABSPATH' ) || exit;
 
+use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Support\CheckMacValue;
 use YangSheep\YSCartEcpay\Support\HttpFormClient;
 use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
@@ -68,7 +69,7 @@ final class EcpayPaymentClient {
 			'ItemName'          => $item_name,
 			'ReturnURL'         => rest_url( 'ys-ecommerce/v1/ecpay/notify' ),
 			'OrderResultURL'    => rest_url( 'ys-ecommerce/v1/ecpay/return' ),
-			'ClientBackURL'     => home_url( '/checkout/thankyou/' ),
+			'ClientBackURL'     => EcpgOrderContext::thank_you_url( $order ),
 			'ChoosePayment'     => $choose_payment,
 			'EncryptType'       => '1',
 			'PaymentInfoURL'    => rest_url( 'ys-ecommerce/v1/ecpay/payment-info' ),

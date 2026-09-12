@@ -7,6 +7,7 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
@@ -269,9 +270,14 @@ final class EcpayPaymentController {
 			? $this->find_order_by_merchant_trade_no( (string) ( $params['MerchantTradeNo'] ?? '' ) )
 			: null;
 
-		$url = $order
-			? home_url( '/checkout/thankyou/' . rawurlencode( (string) ( $order->order_key ?? '' ) ) )
-			: home_url( '/checkout/' );
+		if ( $order ) {
+			// The signed browser callback is the point at which this session earns
+			// access to the order thank-you view (including guest checkout).
+			YSOrder::issue_tks_token( (int) $order->id );
+			$url = EcpgOrderContext::thank_you_url( $order );
+		} else {
+			$url = home_url( '/checkout/' );
+		}
 
 		wp_safe_redirect( $url );
 		exit;
