@@ -404,9 +404,16 @@ namespace {
 
 	$reset();
 	$order = $make_order();
-	YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'from' => 'processing', 'to' => 'processing', 'message' => 'not allowed' ];
+	YSPaymentLifecycleService::$paid_result = [ 'success' => true, 'retryable' => false, 'outcome' => 'already_applied', 'from' => 'processing', 'to' => 'processing', 'message' => '' ];
 	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_result' );
-	$assert( 'already_paid' === $r['status'] && 'done' === $r['vault'], 'A9 state-machine business rejection (second delivery) → already_paid, vault still idempotently applied' );
+	$assert( 'paid' === $r['status'] && 'done' === $r['vault'], 'A9 processing duplicate follows real Core idempotent success and vault remains idempotent' );
+
+	$reset();
+	$order = $make_order();
+	$order->status = 'cancelled';
+	YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'outcome' => 'rejected', 'from' => 'cancelled', 'to' => 'processing', 'message' => 'not allowed' ];
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'persist_failed' === $r['status'] && true === $r['retryable'] && 'skipped' === $r['vault'] && [] === YSCreditCard::$created, 'A9b cancelled order plus provider success stays unacknowledged for reconciliation and never creates a card effect' );
 
 	$reset();
 	$order = $make_order();

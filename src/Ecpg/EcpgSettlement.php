@@ -181,7 +181,20 @@ final class EcpgSettlement {
 				] );
 				return self::outcome( self::STATUS_PERSIST_FAILED, '訂單狀態寫入失敗。', self::VAULT_SKIPPED, true );
 			}
-			// 業務拒絕＝狀態機不允許（通常是已經 processing）：同一筆結果第二次進來。
+			// 只有已付款／履約中的狀態能證明這是同一筆成功結果的重送。
+			// cancelled/refunded/failed/timeout 的非 retryable 拒絕不是付款證據；
+			// 若綠界此刻回報成功，必須停在待人工收斂而不是 ACK 或建立卡片效果。
+			$from = is_array( $transition ) && is_string( $transition['from'] ?? null )
+				? (string) $transition['from']
+				: (string) ( $order->status ?? '' );
+			if ( ! in_array( $from, [ 'processing', 'paid', 'shipped', 'awaiting_ship', 'completed' ], true ) ) {
+				YSLogger::error( 'ecpay', 'CRITICAL: ECPG 成功結果與訂單終局狀態衝突', [
+					'order_id' => $order_id,
+					'source'   => $source,
+					'from'     => $from,
+				] );
+				return self::outcome( self::STATUS_PERSIST_FAILED, '付款結果與訂單狀態衝突。', self::VAULT_SKIPPED, true );
+			}
 			$status = self::STATUS_ALREADY_PAID;
 		}
 

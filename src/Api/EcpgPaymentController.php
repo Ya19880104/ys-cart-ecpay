@@ -328,7 +328,7 @@ final class EcpgPaymentController {
 
 		$outcome = EcpgSettlement::apply( $order, $data, 'ecpg_return' );
 		if ( EcpgSettlement::STATUS_PERSIST_FAILED === $outcome['status']
-			|| ( EcpgSettlement::STATUS_PAID === $outcome['status'] && EcpgSettlement::VAULT_FAILED === $outcome['vault'] ) ) {
+			|| EcpgSettlement::VAULT_FAILED === $outcome['vault'] ) {
 			// 我們自己寫不進去：不 ACK，讓綠界重送。綁卡的 BindCardID 只在這份 payload 裡。
 			$this->respond_text( '0|Persist Failed', 500 );
 		}

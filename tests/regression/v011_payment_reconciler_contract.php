@@ -35,6 +35,7 @@ $plugin = v011_read('src/Plugin.php');
 $settings = v011_read('src/Support/Settings.php');
 $client = v011_read('src/Payment/EcpayPaymentClient.php');
 $reconciler = v011_read('src/Payment/EcpayPaymentReconciler.php');
+$ecpg_reconciler = v011_read('src/Payment/EcpgPaymentReconciler.php');
 
 echo "## ECPay payment reconciliation contract\n";
 
@@ -43,6 +44,14 @@ v011_check(
     str_contains($plugin, "add_action( 'ys_ec_register_payment_reconcilers'")
         && str_contains($plugin, 'public function register_payment_reconcilers')
         && str_contains($plugin, '$registry->register( new EcpayPaymentReconciler() );')
+);
+
+v011_check(
+    'ECPG has a dedicated AES-JSON reconciler registered before the AIO reconciler',
+    str_contains($plugin, '$registry->register( new EcpgPaymentReconciler() );')
+        && strpos($plugin, '$registry->register( new EcpgPaymentReconciler() );') < strpos($plugin, '$registry->register( new EcpayPaymentReconciler() );')
+        && str_contains($ecpg_reconciler, '( new EcpgClient() )->query_trade')
+        && str_contains($reconciler, 'self::ECPG_GATEWAY_ID === $gateway_id')
 );
 
 v011_check(

@@ -24,6 +24,7 @@ use YangSheep\YSCartEcpay\Api\EcpayPrintController;
 use YangSheep\YSCartEcpay\Payment\EcpayGatewayBase;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
+use YangSheep\YSCartEcpay\Payment\EcpgPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShipping;
 use YangSheep\YSCartEcpay\Shipping\Ecpay\EcpayShippingCatalog;
@@ -1603,6 +1604,7 @@ final class Plugin {
 			return;
 		}
 
+		$registry->register( new EcpgPaymentReconciler() );
 		$registry->register( new EcpayPaymentReconciler() );
 	}
 

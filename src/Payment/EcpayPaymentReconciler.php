@@ -10,9 +10,15 @@ use YangSheep\Ecommerce\Services\Payment\YSPaymentReconcileResult;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentReconcilerInterface;
 
 final class EcpayPaymentReconciler implements YSPaymentReconcilerInterface {
+	private const ECPG_GATEWAY_ID = 'ys_ec_ecpay_ecpg_credit';
+
 	public function supports( object $order ): bool {
 		$detail = $this->payment_detail( $order );
 		$gateway_id = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+		if ( self::ECPG_GATEWAY_ID === $gateway_id
+			|| self::ECPG_GATEWAY_ID === (string) ( $detail['payment_method'] ?? '' ) ) {
+			return false;
+		}
 
 		return 'ecpay' === (string) ( $detail['payment_provider'] ?? '' )
 			|| '' !== (string) ( $detail['ecpay_merchant_trade_no'] ?? '' )
