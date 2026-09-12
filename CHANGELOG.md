@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.4 - 2026-09-12（AIO／物流需 YS CART core >= 2.61.7；ECPG 需 Core >= 2.66.3；多溫層 mapping 需 Core >= 2.67.0）
+
+### Changed
+
+- ECPG 結算把首單綁卡納入 Core `YSPaymentEffects` durable receipt：只有 receipt effect 完成才 ACK；重播先 query 已保存 receipt，續單／custom payment 不再等待不存在的首單 subscription row，也不覆寫既有 mandate。ECPG method-level gate 要求 Core 2.66.3 的完整 receipt 與初始訂閱卡片綁定 API；AIO 與物流的全域 floor 維持 2.61.7。
+- ECPG 補單／查詢走專屬 reconciler，不再誤接 AIO client；訂單已進 shipping／completed 時，vault retry 仍須 durable receipt 的綁卡 effect 完成才 ACK。
+- 既有 ECPay 設定頁改由 Core Surface／Section／Field／Button 等 Partials 組合；設定來源、欄位名稱、save action、nonce、PRG 與 capability gate 不變。
+- 11 個物流方法的 `temperature_layer_mapping_v1` 由同一份 shipping catalog 導出，每個方法只宣告其 exact `room`／`chilled`／`frozen` profile。能力只在載入 Core 2.67.0+ 時出現；runtime decision／digest／wire provider 均為 registered method 的 `ecpay`，manifest id `ys_ecpay` 仍只管理 lifecycle。Rolling upgrade 在舊 Core 保持 capability absent、strict-v1／AIO／物流行為不變。
+
 ## 0.5.3 - 2026-09-11（需 YS CART core >= 2.61.7）
 
 ### Removed

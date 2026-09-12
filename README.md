@@ -70,12 +70,17 @@ Standalone ECPay provider plugin for YS CART.
 - PHP 8.1+
 - PHP `mbstring` is recommended but not required; the provider includes a UTF-8-safe
   fallback for ECPay field-length limits.
-- **YS CART 2.61.7+** (hard requirement; on top of the 2.56.12 set — typed
+- **YS CART 2.61.7+** (global AIO and logistics requirement; on top of the 2.56.12 set — typed
   fulfillment, durable logistics query, saved-address provider identity,
   encrypted-secret capability — the 2.58.0 pair contract additionally requires the shared
   `payment_detail` CAS service, stable payment operation keys, typed replay
   reservations, and deferred shipping pipeline hooks; 0.5.0 further requires the
   2.61.7 order-scoped token-charge contract used by ECPG bind-card renewals)
+- **ECPG bind-card:** Core 2.66.3+ with the complete payment-effects receipt and
+  initial-subscription card-binding APIs. When that method-level gate is not met,
+  AIO payments and logistics remain available under the global 2.61.7 floor.
+- **Multi-temperature mapping:** paired Core 2.67.0+. The provider exposes its
+  11-method `temperature_layer_mapping_v1` capability only when that Core is loaded.
 
 ### Why YS CART 2.61.7 is a hard requirement
 
@@ -84,11 +89,13 @@ It writes through the core's `YSPaymentDetailStore` compare-and-swap service and
 relies on the core's `YSPaymentDispatch` operation keys so that every payment
 attempt derives a stable transaction identity. Logistics callbacks also reserve
 typed replay authority and defer the public pipeline hook until the provider's
-payment-detail, order, and label projections are durable. The complete capability
-set is available from 2.58.0. The ECPG bind-card gateway (0.5.0) is a real token
-provider: it opts into `YSOrderScopedTokenChargeGatewayInterface`, binds the chosen
-card identity to the renewal attempt through `YSPaymentDispatch`, and reads the
-stored BindCardID through `YSCreditCard`'s token authority — all shipped in 2.61.7.
+payment-detail, order, and label projections are durable. The shared AIO and
+logistics capability set is available from 2.61.7. The ECPG bind-card gateway is a
+real token provider: it opts into `YSOrderScopedTokenChargeGatewayInterface`, binds
+the chosen card identity through `YSPaymentDispatch`, and reads the stored BindCardID
+through `YSCreditCard`'s token authority. Version 0.5.4 additionally requires Core
+2.66.3's complete `YSPaymentEffects` receipt API and initial-subscription card binder
+before ECPG is registered; the base plugin gate remains 2.61.7.
 
 If the core is older, the plugin **registers no payment gateways and no shipping
 methods** and shows an admin notice instead. A provider that is registered but
