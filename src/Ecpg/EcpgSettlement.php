@@ -41,6 +41,16 @@ final class EcpgSettlement {
 	public const VAULT_FAILED  = 'failed';
 	public const VAULT_SKIPPED = 'skipped';
 
+	/** States that already prove the same order is paid or in fulfillment. */
+	private const PAID_FULFILLMENT_STATES = [
+		'processing'    => true,
+		'paid'          => true,
+		'awaiting_ship' => true,
+		'shipping'      => true,
+		'shipped'       => true,
+		'completed'     => true,
+	];
+
 	/**
 	 * 以 MerchantTradeNo 找回訂單（`mer_trade_no` 或 `ecpay_merchant_trade_no` 任一命中）。
 	 *
@@ -187,7 +197,7 @@ final class EcpgSettlement {
 			$from = is_array( $transition ) && is_string( $transition['from'] ?? null )
 				? (string) $transition['from']
 				: (string) ( $order->status ?? '' );
-			if ( ! in_array( $from, [ 'processing', 'paid', 'shipped', 'awaiting_ship', 'completed' ], true ) ) {
+			if ( ! isset( self::PAID_FULFILLMENT_STATES[ $from ] ) ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: ECPG 成功結果與訂單終局狀態衝突', [
 					'order_id' => $order_id,
 					'source'   => $source,
