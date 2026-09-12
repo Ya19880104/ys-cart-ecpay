@@ -40,6 +40,11 @@ namespace {
         return 'https://fixture.invalid' . $path;
     }
 
+    function add_query_arg(array $query, string $url): string
+    {
+        return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($query);
+    }
+
     function wp_strip_all_tags($value): string
     {
         return strip_tags((string) $value);
@@ -60,6 +65,7 @@ namespace YangSheep\Ecommerce\Models {
     class YSOrder
     {
         public static function find(int $id): ?object { return null; }
+        public static function generate_order_key(int $id, string $number): string { return 'fixture-key-' . $id . '-' . $number; }
     }
 }
 
