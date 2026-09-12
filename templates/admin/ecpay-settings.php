@@ -34,7 +34,7 @@ $ys_ec_close_section = static function () use ( $ys_ec_partials ): void {
 };
 ?>
 <?php if ( $ys_ec_partials ) : ?>
-	<?php \YangSheep\Ecommerce\Admin\Partials\YSAdminSurfacePartial::open( [ 'title' => __( '綠界 ECPay 設定', 'ys-cart-ecpay' ), 'description' => __( '管理綠界憑證、付款方式、物流方式與回呼資訊。', 'ys-cart-ecpay' ), 'variant' => 'wide' ] ); ?>
+	<?php \YangSheep\Ecommerce\Admin\Partials\YSAdminSurfacePartial::open( [ 'description' => __( '管理綠界憑證、付款方式、物流方式與回呼資訊。', 'ys-cart-ecpay' ), 'variant' => 'wide' ] ); ?>
 <?php else : ?>
 	<div class="ysca-page-root">
 <?php endif; ?>

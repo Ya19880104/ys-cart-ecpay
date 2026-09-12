@@ -145,6 +145,11 @@ check('obsolete gate error strings are gone', !str_contains(dom(render_settings(
 // ── 交易模式：只有已實作的模式可選，未實作的看得到但存不進 ──
 $partialHtml = render_settings('payment', 'separate');
 $modeXp = dom($partialHtml);
+$duplicatePageTitles = $modeXp->query('//*[self::h1 or self::h2][normalize-space(.)="綠界 ECPay 設定"]');
+check(
+    'settings surface leaves the visible page title to YSAdminApp and does not repeat it as an inner heading',
+    $duplicatePageTitles !== false && $duplicatePageTitles->length === 0
+);
 check(
     'settings compose the Core Surface, flat Sections, Field, Notice, NavTabs and Button partials',
     substr_count($partialHtml, 'data-stub-partial="surface"') === 1

@@ -13,7 +13,23 @@ abstract class EcpayAdminPartialStub
 
 final class YSAdminSurfacePartial extends EcpayAdminPartialStub
 {
-    public static function open(array $args = []): void { echo '<section class="ysca-surface" data-stub-partial="surface"><header><h1>' . self::text($args, 'title') . '</h1></header><div class="ysca-surface__body">'; }
+    public static function open(array $args = []): void
+    {
+        $title = (string) ($args['title'] ?? '');
+        $description = (string) ($args['description'] ?? '');
+        echo '<section class="ysca-surface" data-stub-partial="surface">';
+        if ($title !== '' || $description !== '') {
+            echo '<header>';
+            if ($title !== '') {
+                echo '<h2>' . self::text($args, 'title') . '</h2>';
+            }
+            if ($description !== '') {
+                echo '<p>' . self::text($args, 'description') . '</p>';
+            }
+            echo '</header>';
+        }
+        echo '<div class="ysca-surface__body">';
+    }
     public static function close(): void { echo '</div></section>'; }
 }
 
