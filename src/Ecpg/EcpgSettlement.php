@@ -8,6 +8,9 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSCreditCard;
 use YangSheep\Ecommerce\Models\YSOrder;
+use YangSheep\Ecommerce\Models\YSSubscription;
+use YangSheep\Ecommerce\Services\Payment\YSPaymentDetailStore;
+use YangSheep\Ecommerce\Services\Payment\YSPaymentEffects;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
@@ -21,8 +24,8 @@ use YangSheep\YSCartEcpay\Support\Settings;
  * 3D 驗證後瀏覽器導回的 OrderResultURL、綠界幕後送的 ReturnURL（最多重送 4 次）。
  * 三條路都走這裡，順序不定、可能重複——因此每一步都必須是冪等的：
  *
- *   - 付款成功 → `mark_paid()`：核心狀態機只接受 pending／offline_payment → processing，
- *     第二次進來會被業務拒絕（retryable=false），這裡把它讀成 `already_paid`，不是錯。
+	 *   - 付款成功 → `mark_paid()`：processing 重送由核心以同一 receipt 冪等續作；若訂單已進入
+	 *     後續履約狀態，這裡只從該 attempt 已存在的 processing receipt 續作 provider effect。
  *   - 存卡 → `YSCreditCard::create_or_get()`：以 token_hash 去重，重跑拿到同一列。
  *
  * 🔴 驗證順序：MerchantID → MerchantTradeNo 歸屬 → RtnCode → TradeStatus → 金額 → TradeNo。
@@ -206,9 +209,12 @@ final class EcpgSettlement {
 				return self::outcome( self::STATUS_PERSIST_FAILED, '付款結果與訂單狀態衝突。', self::VAULT_SKIPPED, true );
 			}
 			$status = self::STATUS_ALREADY_PAID;
+			if ( '' === trim( (string) ( $transition['receipt_id'] ?? '' ) ) ) {
+				$transition['receipt_id'] = self::existing_paid_receipt( $order_id );
+			}
 		}
 
-		return self::outcome( $status, '', self::vault_card( $order, $data, $source ) );
+		return self::outcome( $status, '', self::vault_card( $order, $data, $source, $transition ) );
 	}
 
 	/**
@@ -233,44 +239,139 @@ final class EcpgSettlement {
 	}
 
 	/**
+	 * 履約狀態的重送不會從 Core transition 取得 receipt；只接受原付款 CAS
+	 * 已原子寫下、且仍對應目前 attempt 的 processing receipt，不另造一張。
+	 */
+	private static function existing_paid_receipt( int $order_id ): string {
+		if ( $order_id <= 0
+			|| ! class_exists( YSPaymentDetailStore::class )
+			|| ! method_exists( YSPaymentDetailStore::class, 'read' )
+			|| ! class_exists( YSPaymentEffects::class )
+			|| ! method_exists( YSPaymentEffects::class, 'receipt_id' )
+			|| ! method_exists( YSPaymentEffects::class, 'receipt' ) ) {
+			return '';
+		}
+
+		$detail = YSPaymentDetailStore::read( $order_id );
+		if ( ! is_array( $detail ) ) {
+			return '';
+		}
+		$receipt = YSPaymentEffects::receipt_id( $order_id, 'processing', $detail );
+		$row     = '' !== $receipt ? YSPaymentEffects::receipt( $detail, $receipt ) : [];
+
+		return is_array( $row ) && 'processing' === (string) ( $row['target'] ?? '' )
+			? $receipt
+			: '';
+	}
+
+	/** A follow-up payment may vault a card for the customer without replacing its subscription mandate. */
+	private static function is_subscription_follow_up_order( object $order ): bool {
+		$detail = self::detail_of( $order );
+		foreach ( [ 'source', 'type' ] as $key ) {
+			$value = $detail[ $key ] ?? null;
+			if ( is_string( $value )
+				&& in_array( strtolower( trim( $value ) ), [ 'subscription_renewal', 'subscription_custom' ], true ) ) {
+				return true;
+			}
+		}
+
+		return 'token_charge' === strtolower( trim( (string) ( $detail['ecpay_ecpg_flow'] ?? '' ) ) );
+	}
+
+	/**
 	 * 把 BindCardID 存進核心卡片庫（YSCrypto 加密、擁有者綁定、預設卡）。
 	 *
 	 * 🔴 BindCardID 絕不寫進 payment_detail 或 log；它是日後扣款的唯一憑證。
 	 */
-	private static function vault_card( object $order, array $data, string $source ): string {
+	private static function vault_card( object $order, array $data, string $source, array $transition ): string {
 		$bind_card_id = trim( (string) ( $data['BindCardID'] ?? '' ) );
 		$customer_id  = (int) ( $order->customer_id ?? 0 );
 		if ( '' === $bind_card_id || $customer_id <= 0 ) {
 			return self::VAULT_SKIPPED;
 		}
-		if ( ! class_exists( YSCreditCard::class ) || ! method_exists( YSCreditCard::class, 'create_or_get' ) ) {
+		if ( ! class_exists( YSCreditCard::class )
+			|| ! method_exists( YSCreditCard::class, 'create_or_get' )
+			|| ! class_exists( YSSubscription::class )
+			|| ! method_exists( YSSubscription::class, 'bind_initial_order_card' )
+			|| ! class_exists( YSPaymentEffects::class )
+			|| ! method_exists( YSPaymentEffects::class, 'enroll' )
+			|| ! method_exists( YSPaymentEffects::class, 'run' )
+			|| ! method_exists( YSPaymentEffects::class, 'receipt' ) ) {
 			return self::VAULT_FAILED;
 		}
-		$card_info = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
-		$card_id   = YSCreditCard::create_or_get( [
-			'customer_id' => $customer_id,
-			'user_id'     => (int) ( $order->user_id ?? 0 ),
-			'gateway_id'  => EcpgOrderContext::GATEWAY_ID,
-			'token'       => $bind_card_id,
-			'card_last4'  => preg_replace( '/\D/', '', (string) ( $card_info['Card4No'] ?? '' ) ) ?? '',
-			'card_brand'  => EcpgOrderContext::card_brand( (string) ( $card_info['Card6No'] ?? '' ) ),
-			'expire_date' => EcpgOrderContext::expire_date( $card_info ),
-			'is_default'  => true,
-		] );
-		if ( false === $card_id ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: ECPG 綁卡 BindCardID 無法完整落盤', [
-				'order_id'    => (int) ( $order->id ?? 0 ),
-				'customer_id' => $customer_id,
-				'source'      => $source,
+
+		$order_id  = (int) ( $order->id ?? 0 );
+		$receipt   = is_string( $transition['receipt_id'] ?? null ) ? trim( (string) $transition['receipt_id'] ) : '';
+		$effect    = 'ecpg_card_vault';
+		$follow_up = self::is_subscription_follow_up_order( $order );
+		if ( '' === $receipt || ! YSPaymentEffects::enroll( $order_id, $receipt, $effect ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: ECPG 綁卡副作用無法補登付款收據，要求重送', [
+				'order_id' => $order_id,
+				'source'   => $source,
 			] );
 			return self::VAULT_FAILED;
 		}
-		YSLogger::info( 'ecpay', 'ECPG 綁卡已存入卡片庫', [
-			'order_id'    => (int) ( $order->id ?? 0 ),
-			'customer_id' => $customer_id,
-			'card_id'     => $card_id,
-			'source'      => $source,
+
+		YSPaymentEffects::run( $order_id, $receipt, [
+			$effect => static function ( string $_key ) use ( $order, $data, $source, $bind_card_id, $customer_id, $order_id, $follow_up ): bool {
+				$card_info = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
+				$card_id   = YSCreditCard::create_or_get( [
+					'customer_id' => $customer_id,
+					'user_id'     => (int) ( $order->user_id ?? 0 ),
+					'gateway_id'  => EcpgOrderContext::GATEWAY_ID,
+					'token'       => $bind_card_id,
+					'card_last4'  => preg_replace( '/\D/', '', (string) ( $card_info['Card4No'] ?? '' ) ) ?? '',
+					'card_brand'  => EcpgOrderContext::card_brand( (string) ( $card_info['Card6No'] ?? '' ) ),
+					'expire_date' => EcpgOrderContext::expire_date( $card_info ),
+					'is_default'  => true,
+				] );
+				if ( false === $card_id ) {
+					YSLogger::error( 'ecpay', 'CRITICAL: ECPG 綁卡 BindCardID 無法完整落盤', [
+						'order_id'    => $order_id,
+						'customer_id' => $customer_id,
+						'source'      => $source,
+					] );
+					return false;
+				}
+
+				if ( ! $follow_up && ! YSSubscription::bind_initial_order_card(
+					$order_id,
+					$customer_id,
+					(int) ( $order->user_id ?? 0 ),
+					EcpgOrderContext::GATEWAY_ID,
+					(int) $card_id
+				) ) {
+					YSLogger::error( 'ecpay', 'ECPG 初始訂閱卡片綁定尚未完成，要求重送', [
+						'order_id'    => $order_id,
+						'customer_id' => $customer_id,
+						'card_id'     => (int) $card_id,
+						'source'      => $source,
+					] );
+					return false;
+				}
+
+				YSLogger::info( 'ecpay', $follow_up ? 'ECPG 綁卡已存入卡片庫' : 'ECPG 綁卡已存入卡片庫並綁定初始訂閱', [
+					'order_id'    => $order_id,
+					'customer_id' => $customer_id,
+					'card_id'     => (int) $card_id,
+					'source'      => $source,
+				] );
+				return true;
+			},
 		] );
+
+		$detail = YSPaymentDetailStore::read( $order_id );
+		$receipt_row = is_array( $detail ) ? YSPaymentEffects::receipt( $detail, $receipt ) : [];
+		$effects = is_array( $receipt_row['effects'] ?? null ) ? $receipt_row['effects'] : [];
+		$row = is_array( $effects[ $effect ] ?? null ) ? $effects[ $effect ] : null;
+		if ( null === $row || YSPaymentEffects::STATE_DONE !== (string) ( $row['state'] ?? '' ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: ECPG 綁卡付款收據尚未完成，要求重送', [
+				'order_id' => $order_id,
+				'source'   => $source,
+			] );
+			return self::VAULT_FAILED;
+		}
+
 		return self::VAULT_DONE;
 	}
 

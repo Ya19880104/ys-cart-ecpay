@@ -46,6 +46,7 @@ final class Plugin {
 	 * 同時不因「錯在哪一種形狀」而多洩漏一個判別位元。
 	 */
 	private const CART_SCOPE_ERROR = '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。';
+	private const ECPG_REQUIRES_CORE = '2.66.3';
 
 	/**
 	 * 一次性提領碼的**鑄造格式**——與 `EcpayStoreSelector::generate_result_code()`
@@ -188,6 +189,40 @@ final class Plugin {
 
 		if ( function_exists( 'set_transient' ) ) {
 			set_transient( $cache_key, 'ok', HOUR_IN_SECONDS );
+		}
+
+		return [ 'met' => true, 'reason' => 'ok', 'message' => '' ];
+	}
+
+	/**
+	 * 站內付訂閱綁卡需要 Core 2.66.3 首次提供的 receipt/binder 配對。
+	 *
+	 * 這是 ECPG method 級 gate；AIO 金流與物流仍沿用外掛既有的 Core floor。
+	 *
+	 * @return array{met:bool,reason:string,message:string}
+	 */
+	public static function ecpg_core_requirements(): array {
+		if ( ! defined( 'YS_ECOMMERCE_VERSION' )
+			|| version_compare( (string) YS_ECOMMERCE_VERSION, self::ECPG_REQUIRES_CORE, '<' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'ecpg_core_too_old',
+				'message' => sprintf( '綠界站內付需要 YS CART %s 以上。', self::ECPG_REQUIRES_CORE ),
+			];
+		}
+
+		if ( ! class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentEffects' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentEffects', 'enroll' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentEffects', 'run' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentEffects', 'receipt_id' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentEffects', 'receipt' )
+			|| ! class_exists( YSSubscription::class )
+			|| ! method_exists( YSSubscription::class, 'bind_initial_order_card' ) ) {
+			return [
+				'met'     => false,
+				'reason'  => 'ecpg_core_capability_missing',
+				'message' => '核心缺少付款收據或初始訂閱卡片綁定 API，綠界站內付未註冊。',
+			];
 		}
 
 		return [ 'met' => true, 'reason' => 'ok', 'message' => '' ];
@@ -740,6 +775,10 @@ final class Plugin {
 			if ( ! $this->is_method_enabled( 'payment', (string) $method_id ) ) {
 				continue;
 			}
+			if ( EcpgOrderContext::GATEWAY_ID === (string) $method_id
+				&& ! self::ecpg_core_requirements()['met'] ) {
+				continue;
+			}
 
 			$class = (string) $descriptor['class'];
 			if ( ! class_exists( $class ) ) {
@@ -830,7 +869,8 @@ final class Plugin {
 			EcpayPaymentController::register_routes();
 		}
 		// 站內付 2.0 的六條路只在該方式開著時存在：關掉方式＝付款頁與回呼一起消失。
-		if ( $this->is_method_enabled( 'payment', EcpgOrderContext::GATEWAY_ID ) ) {
+		if ( $this->is_method_enabled( 'payment', EcpgOrderContext::GATEWAY_ID )
+			&& self::ecpg_core_requirements()['met'] ) {
 			EcpgPaymentController::register_routes();
 		}
 

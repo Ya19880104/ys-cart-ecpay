@@ -113,6 +113,14 @@ namespace YangSheep\Ecommerce\Models {
 			return $GLOBALS['ys_authority'] ?? null;
 		}
 	}
+	final class YSSubscription {
+		public static bool $bind_result = true;
+		public static array $bind_calls = [];
+		public static function bind_initial_order_card( int $order_id, int $customer_id, int $user_id, string $gateway_id, int $card_id ): bool {
+			self::$bind_calls[] = func_get_args();
+			return self::$bind_result;
+		}
+	}
 }
 
 namespace YangSheep\Ecommerce\DTOs {
@@ -126,7 +134,7 @@ namespace YangSheep\Ecommerce\DTOs {
 
 namespace YangSheep\Ecommerce\Services\Payment {
 	final class YSPaymentLifecycleService {
-		public static array $paid_result   = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'processing', 'message' => '' ];
+		public static array $paid_result   = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'processing', 'message' => '', 'receipt_id' => 'receipt-42' ];
 		public static array $failed_result = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'failed', 'message' => '' ];
 		public static array $calls = [];
 		public static function mark_paid( int $order_id, object $detail, string $reason = '' ): array {
@@ -139,6 +147,37 @@ namespace YangSheep\Ecommerce\Services\Payment {
 			\ys_mark( 'failed:' . json_encode( [ 'order' => $order_id, 'reason' => $reason, 'code' => $detail->fields['response_code'] ?? null ] ) );
 			return self::$failed_result;
 		}
+	}
+	final class YSPaymentEffects {
+		public const STATE_DONE = 'done';
+		public static bool $enroll_result = true;
+		public static array $enrolled = [];
+		public static array $effects = [];
+		public static int $run_calls = 0;
+		public static function enroll( int $order_id, string $receipt, string $effect ): bool {
+			self::$enrolled[] = [ $order_id, $receipt, $effect ];
+			if ( '' === $receipt || ! self::$enroll_result
+				|| ! isset( YSPaymentDetailStore::$detail['_ys_payment_effects'][ $receipt ] ) ) { return false; }
+			self::$effects[ $effect ] ??= [ 'state' => 'pending' ];
+			YSPaymentDetailStore::$detail['_ys_payment_effects'][ $receipt ]['effects'] = self::$effects;
+			return true;
+		}
+		public static function run( int $order_id, string $receipt, array $runners ): array {
+			++self::$run_calls;
+			foreach ( $runners as $effect => $runner ) {
+				if ( self::STATE_DONE === ( self::$effects[ $effect ]['state'] ?? '' ) ) { continue; }
+				self::$effects[ $effect ] = [ 'state' => true === $runner( 'yspe-' . $receipt . '-' . $effect ) ? self::STATE_DONE : 'failed' ];
+			}
+			YSPaymentDetailStore::$detail['_ys_payment_effects'][ $receipt ]['effects'] = self::$effects;
+			return [];
+		}
+		public static function receipt_id( int $order_id, string $target, array $detail ): string { return 'receipt-42'; }
+		public static function receipt( array $detail, string $receipt ): array { return is_array( $detail['_ys_payment_effects'][ $receipt ] ?? null ) ? $detail['_ys_payment_effects'][ $receipt ] : []; }
+	}
+	final class YSPaymentDetailStore {
+		public static bool $readable = true;
+		public static array $detail = [ '_ys_payment_effects' => [ 'receipt-42' => [ 'target' => 'processing', 'effects' => [] ] ] ];
+		public static function read( int $order_id ): ?array { return self::$readable ? self::$detail : null; }
 	}
 }
 
@@ -204,6 +243,9 @@ namespace {
 
 	use YangSheep\Ecommerce\Models\YSCreditCard;
 	use YangSheep\Ecommerce\Models\YSOrder;
+	use YangSheep\Ecommerce\Models\YSSubscription;
+	use YangSheep\Ecommerce\Services\Payment\YSPaymentDetailStore;
+	use YangSheep\Ecommerce\Services\Payment\YSPaymentEffects;
 	use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 	use YangSheep\Ecommerce\Utils\YSLogger;
 	use YangSheep\YSCartEcpay\Api\EcpgPaymentController;
@@ -269,7 +311,8 @@ namespace {
 				$data = $success_data( [ 'OrderInfo' => [ 'TradeAmt' => 990 ], 'CardInfo' => [ 'Amount' => 990 ] ] );
 				break;
 			case 'already-paid':
-				YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'from' => 'processing', 'to' => 'processing', 'message' => 'not allowed' ];
+				$order->status = 'completed';
+				YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'outcome' => 'rejected', 'from' => 'completed', 'to' => 'processing', 'message' => 'not allowed', 'receipt_id' => '' ];
 				break;
 			case 'lifecycle-retryable':
 				YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => true, 'from' => 'pending', 'to' => 'processing', 'message' => 'db' ];
@@ -379,9 +422,17 @@ namespace {
 		ScalarColumnWriter::$writes  = [];
 		ScalarColumnWriter::$persist = true;
 		YSPaymentLifecycleService::$calls       = [];
-		YSPaymentLifecycleService::$paid_result = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'processing', 'message' => '' ];
+		YSPaymentLifecycleService::$paid_result = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'processing', 'message' => '', 'receipt_id' => 'receipt-42' ];
+		YSPaymentEffects::$enroll_result = true;
+		YSPaymentEffects::$enrolled = [];
+		YSPaymentEffects::$effects = [];
+		YSPaymentEffects::$run_calls = 0;
+		YSPaymentDetailStore::$readable = true;
+		YSPaymentDetailStore::$detail = [ '_ys_payment_effects' => [ 'receipt-42' => [ 'target' => 'processing', 'effects' => [] ] ] ];
 		YSCreditCard::$created       = [];
 		YSCreditCard::$create_result = 77;
+		YSSubscription::$bind_result = true;
+		YSSubscription::$bind_calls = [];
 		YSLogger::$entries = [];
 		Settings::$credentials = [ 'test_mode' => true, 'merchant_id' => '3002607', 'hash_key' => 'pwFHCqoQZGmho4w6', 'hash_iv' => 'EkRm7iFT261dpevs' ];
 	};
@@ -401,12 +452,49 @@ namespace {
 	$card = YSCreditCard::$created[0] ?? [];
 	$assert( 'bindcard0123456789abcdef' === ( $card['token'] ?? null ) && 'ys_ec_ecpay_ecpg_credit' === ( $card['gateway_id'] ?? null ) && 7 === ( $card['customer_id'] ?? null ) && 70 === ( $card['user_id'] ?? null ) && true === ( $card['is_default'] ?? null ), 'A7 vault: BindCardID is the token, owner + gateway bound, set as default' );
 	$assert( '2222' === ( $card['card_last4'] ?? null ) && 'visa' === ( $card['card_brand'] ?? null ) && '12/28' === ( $card['expire_date'] ?? null ), 'A8 vault metadata: last4, brand from BIN, expiry MM/YY' );
+	$assert( [ [ 42, 7, 70, 'ys_ec_ecpay_ecpg_credit', 77 ] ] === YSSubscription::$bind_calls, 'A8b receipt runner binds the exact vaulted card to subscriptions from this initial order' );
+	$assert( [ [ 42, 'receipt-42', 'ecpg_card_vault' ] ] === YSPaymentEffects::$enrolled && 'done' === ( YSPaymentEffects::$effects['ecpg_card_vault']['state'] ?? '' ), 'A8c provider-only card binding is enrolled and completed on the payment receipt' );
 
 	$reset();
 	$order = $make_order();
-	YSPaymentLifecycleService::$paid_result = [ 'success' => true, 'retryable' => false, 'outcome' => 'already_applied', 'from' => 'processing', 'to' => 'processing', 'message' => '' ];
+	YSSubscription::$bind_result = false;
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'paid' === $r['status'] && 'failed' === $r['vault'] && 'failed' === ( YSPaymentEffects::$effects['ecpg_card_vault']['state'] ?? '' ), 'A8d materialization-pending binding remains failed so ReturnURL retry can resume it' );
+	YSSubscription::$bind_result = true;
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'done' === $r['vault'] && 'done' === ( YSPaymentEffects::$effects['ecpg_card_vault']['state'] ?? '' ) && 2 === count( YSSubscription::$bind_calls ), 'A8e replay resumes the same receipt and completes initial subscription binding' );
+	$created_after_done = count( YSCreditCard::$created );
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'done' === $r['vault'] && $created_after_done === count( YSCreditCard::$created ) && 2 === count( YSSubscription::$bind_calls ), 'A8f completed receipt replay does not repeat vault or binding work' );
+
+	$reset();
+	$order = $make_order();
+	$renewal_detail = json_decode( (string) $order->payment_detail, true );
+	$renewal_detail['type'] = 'subscription_renewal';
+	$order->payment_detail = json_encode( $renewal_detail );
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'paid' === $r['status'] && 'done' === $r['vault'] && 1 === count( YSCreditCard::$created ) && [] === YSSubscription::$bind_calls, 'A8g renewal BindCardID is vaulted without replacing or waiting on the initial subscription mandate' );
+
+	$reset();
+	$order = $make_order();
+	$custom_detail = json_decode( (string) $order->payment_detail, true );
+	$custom_detail['source'] = 'subscription_custom';
+	$order->payment_detail = json_encode( $custom_detail );
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'paid' === $r['status'] && 'done' === $r['vault'] && 1 === count( YSCreditCard::$created ) && [] === YSSubscription::$bind_calls, 'A8h custom subscription BindCardID is vaulted without mutating the existing mandate' );
+
+	$reset();
+	$order = $make_order( 7, 'completed' );
+	YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'outcome' => 'rejected', 'from' => 'completed', 'to' => 'processing', 'message' => 'not allowed', 'receipt_id' => '' ];
 	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_result' );
-	$assert( 'paid' === $r['status'] && 'done' === $r['vault'], 'A9 processing duplicate follows real Core idempotent success and vault remains idempotent' );
+	$assert( 'already_paid' === $r['status'] && 'done' === $r['vault'] && [ 42, 'receipt-42', 'ecpg_card_vault' ] === ( YSPaymentEffects::$enrolled[0] ?? [] ), 'A9 fulfilled duplicate resumes the original durable paid receipt when Core rejects processing transition' );
+
+	$reset();
+	$order = $make_order( 7, 'shipping' );
+	YSPaymentLifecycleService::$paid_result = [ 'success' => false, 'retryable' => false, 'outcome' => 'rejected', 'from' => 'shipping', 'to' => 'processing', 'message' => 'not allowed', 'receipt_id' => '' ];
+	YSPaymentDetailStore::$detail = [];
+	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
+	$assert( 'already_paid' === $r['status'] && 'failed' === $r['vault'] && [] === YSCreditCard::$created, 'A9a fulfilled replay without its original receipt fails closed and never fabricates a provider effect receipt' );
 
 	$reset();
 	$order = $make_order();
@@ -509,7 +597,7 @@ namespace {
 	$res = $run( 'amount-mismatch' );
 	$assert( '1|OK' === $res['stdout'] && [ '200' ] === $res['status'] && [] === $res['paid'] && [] === $res['vault'] && 1 === count( $res['errors'] ), 'B6 amount mismatch → rejected but ACKed (retry cannot change it), error logged' );
 	$res = $run( 'already-paid' );
-	$assert( '1|OK' === $res['stdout'] && [ '200' ] === $res['status'] && 1 === count( $res['vault'] ), 'B7 duplicate delivery → ACK, vault idempotently re-applied' );
+	$assert( '1|OK' === $res['stdout'] && [ '200' ] === $res['status'] && 1 === count( $res['vault'] ), 'B7 fulfilled duplicate → recover original receipt, finish vault, ACK' );
 	$res = $run( 'lifecycle-retryable' );
 	$assert( '0|Persist Failed' === $res['stdout'] && [ '500' ] === $res['status'], 'B8 our own persistence failure → 500 so ECPay resends' );
 

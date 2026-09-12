@@ -59,9 +59,10 @@ namespace YangSheep\Ecommerce\Models {
 		public const DEFAULT_LOOKUP_ABSENT = 'absent';
 		public const DEFAULT_LOOKUP_ERROR  = 'error';
 		public static array $default_result = [ 'outcome' => 'absent' ];
+		public static array $default_calls = [];
 		public static ?array $authority = null;
 		public static array $authority_calls = [];
-		public static function get_default_card_result( int $customer_id, ?string $gateway_id = null ): array { return self::$default_result; }
+		public static function get_default_card_result( int $customer_id, ?string $gateway_id = null ): array { self::$default_calls[] = func_get_args(); return self::$default_result; }
 		public static function get_token_charge_authority_for_owner( int $card_id, int $customer_id, int $user_id = 0, string $gateway_id = '' ): ?array {
 			self::$authority_calls[] = func_get_args();
 			return self::$authority;
@@ -280,6 +281,7 @@ namespace {
 		YSPaymentDetailStore::$persisted  = true;
 		YSSavedCardChargePolicy::$allow   = true;
 		YSCreditCard::$default_result     = [ 'outcome' => 'absent' ];
+		YSCreditCard::$default_calls      = [];
 		YSCreditCard::$authority          = null;
 		YSCreditCard::$authority_calls    = [];
 		YSLogger::$entries = [];
@@ -295,7 +297,9 @@ namespace {
 
 	$reset();
 	YSPaymentDispatch::$operation_key = 'op-42-gen1-nonce';
-	$order_of( 42, '1290', true );
+	$order = $order_of( 42, '1290', true );
+	$order->payment_detail = json_encode( [ 'type' => 'subscription_renewal', 'subscription_id' => 9 ] );
+	OrderPaymentDetail::$details[42] = [ 'type' => 'subscription_renewal', 'subscription_id' => 9 ];
 	$r = $gateway->process_payment( 42 );
 	$expected_mtn = 'YS' . strtoupper( substr( hash( 'sha256', 'op-42-gen1-nonce' ), 0, 18 ) );
 	$assert( true === ( $r['success'] ?? false ) && ! isset( $r['form_data'] ), 'C1 process_payment succeeds without any AIO form' );
@@ -303,7 +307,7 @@ namespace {
 	$d = OrderPaymentDetail::$details[42] ?? [];
 	$assert( $expected_mtn === ( $d['mer_trade_no'] ?? null ) && $expected_mtn === ( $d['ecpay_merchant_trade_no'] ?? null ) && 'op-42-gen1-nonce' === ( $d['ecpay_operation_key'] ?? null ), 'C3 stable MerchantTradeNo derived from the operation key is persisted (both keys) with the operation key' );
 	$assert( 1290 === ( $d['ecpay_charged_amount'] ?? null ) && 'ecpay' === ( $d['payment_provider'] ?? null ) && 'ys_ec_ecpay_ecpg_credit' === ( $d['payment_method'] ?? null ) && 'stage' === ( $d['ecpay_environment'] ?? null ) && '3002607' === ( $d['ecpay_merchant_id'] ?? null ), 'C4 charged amount, provider, method, environment and merchant are persisted' );
-	$assert( 'bind' === ( $d['ecpay_ecpg_flow'] ?? null ) && 'YSC7' === ( $d['ecpay_ecpg_member_id'] ?? null ), 'C5 subscription order with a customer → bind flow with member key YSC<customer_id>' );
+	$assert( 'subscription_renewal' === ( $d['type'] ?? null ) && 'bind' === ( $d['ecpay_ecpg_flow'] ?? null ) && 'YSC7' === ( $d['ecpay_ecpg_member_id'] ?? null ), 'C5 manual renewal of a subscription item → CreateBindCard flow retains follow-up identity' );
 	$assert( [ [ 42, [ 'gateway_id' => 'ys_ec_ecpay_ecpg_credit', 'payment_method' => 'ys_ec_ecpay_ecpg_credit' ] ] ] === ScalarColumnWriter::$writes, 'C6 gateway identity columns written' );
 	$assert( [] === $client->calls, 'C7 process_payment never calls ECPay' );
 
@@ -438,13 +442,13 @@ namespace {
 	YSSubscription::$subscription->card_id = 0;
 	YSCreditCard::$default_result = [ 'outcome' => 'found', 'card' => (object) [ 'id' => 31 ] ];
 	$r = $gateway->process_token_charge( 9, 1290.0 );
-	$assert( true === $r['success'] && 31 === YSCreditCard::$authority_calls[0][0], 'D19 no subscription card → default card for this gateway is used' );
+	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ) && 'subscription_card_unbound' === ( $r['code'] ?? '' ) && [] === YSCreditCard::$default_calls && [] === YSCreditCard::$authority_calls && [] === $client->calls, 'D19 unbound subscription is manual-recovery only; mutable customer default is never consulted' );
 
 	$renewal();
 	YSSubscription::$subscription->card_id = 0;
 	YSCreditCard::$default_result = [ 'outcome' => 'conflict' ];
 	$r = $gateway->process_token_charge( 9, 1290.0 );
-	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ) && 'default_card_conflict' === ( $r['code'] ?? '' ) && [] === $client->calls, 'D20 default-card conflict is not collapsed into absence' );
+	$assert( 'subscription_card_unbound' === ( $r['code'] ?? '' ) && [] === YSCreditCard::$default_calls && [] === $client->calls, 'D20 every unbound subscription takes the same explicit manual-recovery path' );
 
 	$renewal();
 	YSCreditCard::$authority = null;

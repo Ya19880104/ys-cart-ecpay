@@ -131,7 +131,7 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 	 * 與 PayUni `process_token_charge()` 逐條對齊（核心 coordinator 的契約）：
 	 *   1. `YSSavedCardChargePolicy::allows_subscription_renewal_charge()` 放行；
 	 *   2. 訂單＝當前 dispatch 的訂單、狀態 pending；
-	 *   3. 卡片＝訂閱指定卡，否則本閘道在該客戶的預設卡（四態，conflict 不得退成 absent）；
+	 *   3. 卡片＝訂閱明確綁定的專屬卡；未綁定的舊資料只允許人工復原，不讀取會員預設卡；
 	 *   4. 解出 raw token（BindCardID）與非機密 token_hash，綁進本次 attempt；
 	 *   5. 金額精確整數且與本期訂單相等；
 	 *   6. 穩定 MerchantTradeNo 先落盤，再送出（client 在送出前把 dispatch 標 submitted）；
@@ -157,23 +157,8 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 		$customer_id = (int) ( $subscription->customer_id ?? 0 );
 		$card_id     = (int) ( $subscription->card_id ?? 0 );
 		if ( ! $card_id ) {
-			$default = YSCreditCard::get_default_card_result( $customer_id, $this->get_id() );
-			$outcome = (string) ( $default['outcome'] ?? YSCreditCard::DEFAULT_LOOKUP_ERROR );
-			if ( YSCreditCard::DEFAULT_LOOKUP_FOUND !== $outcome ) {
-				$rejected = $this->rejected_terminal(
-					YSCreditCard::DEFAULT_LOOKUP_ABSENT === $outcome
-						? '找不到可用的綁定信用卡。'
-						: '預設信用卡權威無法確認，請改用人工付款。'
-				);
-				$rejected['code'] = 'default_card_' . $outcome;
-				return $rejected;
-			}
-			$card    = $default['card'] ?? null;
-			$card_id = is_object( $card ) ? (int) ( $card->id ?? 0 ) : 0;
-		}
-		if ( ! $card_id ) {
-			$rejected         = $this->rejected_terminal( '找不到可用的綁定信用卡。' );
-			$rejected['code'] = 'saved_card_absent';
+			$rejected         = $this->rejected_terminal( '此訂閱尚未綁定專屬信用卡，請改用人工付款完成復原。' );
+			$rejected['code'] = 'subscription_card_unbound';
 			return $rejected;
 		}
 
