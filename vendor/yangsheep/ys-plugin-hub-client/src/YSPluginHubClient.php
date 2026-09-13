@@ -9,7 +9,7 @@
 
 namespace YangSheep\PluginHubClient;
 
-use YangSheep\PluginHubClient\Admin\YSHubAjaxHandler;
+use YangSheep\PluginHubClient\Admin\YSHubRestController;
 use YangSheep\PluginHubClient\Http\YSHubApiClient;
 use YangSheep\PluginHubClient\Marketplace\YSMarketplacePage;
 use YangSheep\PluginHubClient\Updater\YSUpdateChecker;
@@ -55,6 +55,10 @@ final class YSPluginHubClient {
      * @return void
      */
     private function init_hooks(): void {
+        // REST routes must exist for cookie-authenticated requests even when
+        // is_admin() is false. Registration itself performs no Hub request.
+        YSHubRestController::init();
+
         // 更新檢查器（前後台 + Cron 都需要，不限 is_admin）
         YSUpdateChecker::init();
 
@@ -68,9 +72,6 @@ final class YSPluginHubClient {
 
         // 註冊選單（priority 20，比其他 YS 外掛的 21 早，確保 ys-toolbox 首頁由市集控制）
         add_action( 'admin_menu', array( $this, 'register_menu' ), 20 );
-
-        // 初始化 AJAX 處理器
-        YSHubAjaxHandler::init();
 
         // WP admin footer 加入 YANGSHEEP CLOUD
         add_filter( 'admin_footer_text', array( $this, 'admin_footer_text' ) );

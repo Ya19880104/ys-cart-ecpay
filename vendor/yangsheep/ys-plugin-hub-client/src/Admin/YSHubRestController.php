@@ -1,8 +1,9 @@
 <?php
 /**
- * YSHubAjaxHandler - 客戶端 AJAX 處理
+ * YSHubRestController - 客戶端 REST transport
  *
- * 所有後台操作走 wp_ajax_*，禁止 form POST。
+ * 保留既有 marketplace/plugin/settings owners 與 domain envelope，僅把傳輸改為
+ * WordPress REST cookie authentication + wp_rest nonce。
  *
  * @package YangSheep\PluginHubClient\Admin
  */
@@ -16,57 +17,82 @@ use YangSheep\PluginHubClient\Http\YSHubApiClient;
 use YangSheep\PluginHubClient\Marketplace\YSMarketplaceInstaller;
 use YangSheep\PluginHubClient\Registry\YSEndpointRegistry;
 use YangSheep\PluginHubClient\Updater\YSUpdateChecker;
+use WP_Error;
+use WP_REST_Request;
+use WP_REST_Response;
+use WP_REST_Server;
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
 /**
- * 處理所有客戶端 AJAX 請求
+ * 處理完整 Hub Client 的十一條 REST routes。
  */
-final class YSHubAjaxHandler {
+final class YSHubRestController {
+
+    private const NAMESPACE = 'ys-hub-client/v1';
 
     /**
-     * 初始化 AJAX hooks
+     * Attach route registration to the WordPress REST lifecycle.
+     */
+    public static function init(): void {
+        add_action( 'rest_api_init', array( __CLASS__, 'register_routes' ) );
+    }
+
+    /**
+     * 註冊 REST routes。這個方法只描述 routes，不執行 HTTP 或 business action。
      *
      * @return void
      */
-    public static function init(): void {
-        $actions = array(
-            'ys_hub_client_get_marketplace',
-            'ys_hub_client_install_plugin',
-            'ys_hub_client_update_plugin',
-            'ys_hub_client_save_settings',
-            'ys_hub_client_test_connection',
-            'ys_hub_client_generate_site_key',
-            'ys_hub_client_refresh_marketplace',
-            'ys_hub_client_activate_plugin',
-            'ys_hub_client_deactivate_plugin',
-            'ys_hub_client_delete_plugin',
-            'ys_hub_client_clear_logs',
-        );
+    public static function register_routes(): void {
+        self::register_route( '/marketplace', WP_REST_Server::READABLE, 'handle_get_marketplace', 'manage_options' );
+        self::register_route( '/marketplace/refresh', WP_REST_Server::CREATABLE, 'handle_refresh_marketplace', 'manage_options' );
+        self::register_route( '/plugins/install', WP_REST_Server::CREATABLE, 'handle_install_plugin', 'install_plugins' );
+        self::register_route( '/plugins/update', WP_REST_Server::CREATABLE, 'handle_update_plugin', 'update_plugins' );
+        self::register_route( '/plugins/activate', WP_REST_Server::CREATABLE, 'handle_activate_plugin', 'activate_plugins' );
+        self::register_route( '/plugins/deactivate', WP_REST_Server::CREATABLE, 'handle_deactivate_plugin', 'activate_plugins' );
+        self::register_route( '/plugins/delete', WP_REST_Server::CREATABLE, 'handle_delete_plugin', 'delete_plugins' );
+        self::register_route( '/logs/clear', WP_REST_Server::CREATABLE, 'handle_clear_logs', 'manage_options' );
+        self::register_route( '/settings', WP_REST_Server::CREATABLE, 'handle_save_settings', 'manage_options' );
+        self::register_route( '/connection/test', WP_REST_Server::CREATABLE, 'handle_test_connection', 'manage_options' );
+        self::register_route( '/site-key/generate', WP_REST_Server::CREATABLE, 'handle_generate_site_key', 'manage_options' );
+    }
 
-        foreach ( $actions as $action ) {
-            $method = str_replace( 'ys_hub_client_', 'handle_', $action );
-            add_action( "wp_ajax_{$action}", array( __CLASS__, $method ) );
-        }
+    /**
+     * @param string $route      Route path.
+     * @param string $methods    WP REST method constant.
+     * @param string $callback   Controller callback.
+     * @param string $capability Action-specific capability; manage_options is always required.
+     */
+    private static function register_route( string $route, string $methods, string $callback, string $capability ): void {
+        register_rest_route(
+            self::NAMESPACE,
+            $route,
+            array(
+                'methods'             => $methods,
+                'callback'            => array( __CLASS__, $callback ),
+                'permission_callback' => static function () use ( $capability ) {
+                    return self::authorize( $capability );
+                },
+            )
+        );
     }
 
     /**
      * 取得市集外掛列表
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response
      */
-    public static function handle_get_marketplace(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
+    public static function handle_get_marketplace( WP_REST_Request $request ): WP_REST_Response {
         // 讀取本地快取
         $cached = get_site_transient( 'ys_hub_marketplace_data' );
 
         if ( false !== $cached && is_array( $cached ) ) {
             // 快取可能寫自舊版本或已被污染的回應，服務前一律重新正規化。
             $payload = self::normalize_marketplace_payload( $cached );
-            wp_send_json_success( array_merge(
+            return self::success( array_merge(
                 $payload,
                 array(
                     'plugins' => self::merge_local_status( $payload['plugins'] ),
@@ -82,7 +108,7 @@ final class YSHubAjaxHandler {
         $response = $api->get_marketplace_plugins();
 
         if ( is_wp_error( $response ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $response->get_error_message(),
                 'state'   => YSCircuitBreaker::get_state(),
             ) );
@@ -104,7 +130,7 @@ final class YSHubAjaxHandler {
         // 快取 6 小時（包含分類和公告）
         set_site_transient( 'ys_hub_marketplace_data', $payload, 6 * HOUR_IN_SECONDS );
 
-        wp_send_json_success( array_merge(
+        return self::success( array_merge(
             $payload,
             array(
                 'plugins' => self::merge_local_status( $payload['plugins'] ),
@@ -292,37 +318,30 @@ final class YSHubAjaxHandler {
     /**
      * 安裝外掛
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_install_plugin(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        if ( ! current_user_can( 'install_plugins' ) ) {
-            wp_send_json_error( array(
-                'message' => __( '權限不足', 'ys-plugin-hub-client' ),
-            ) );
+    public static function handle_install_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slug = self::required_string_param( $request, 'slug' );
+        if ( is_wp_error( $slug ) ) {
+            return $slug;
         }
-
-        $slug    = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) );
-        $version = sanitize_text_field( wp_unslash( $_POST['version'] ?? '' ) );
-
-        if ( empty( $slug ) || empty( $version ) ) {
-            wp_send_json_error( array(
-                'message' => __( '缺少必要參數', 'ys-plugin-hub-client' ),
-            ) );
+        $version = self::required_string_param( $request, 'version' );
+        if ( is_wp_error( $version ) ) {
+            return $version;
         }
 
         $result = YSMarketplaceInstaller::install( $slug, $version );
 
         if ( is_wp_error( $result ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $result->get_error_message(),
             ) );
         }
 
         $plugin_data = self::get_updated_plugin_data( $slug, $version );
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => sprintf(
                 /* translators: %s: 外掛 slug */
                 __( '外掛 %s 安裝成功', 'ys-plugin-hub-client' ),
@@ -335,30 +354,23 @@ final class YSHubAjaxHandler {
     /**
      * 更新外掛
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_update_plugin(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        if ( ! current_user_can( 'update_plugins' ) ) {
-            wp_send_json_error( array(
-                'message' => __( '權限不足', 'ys-plugin-hub-client' ),
-            ) );
+    public static function handle_update_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slug = self::required_string_param( $request, 'slug' );
+        if ( is_wp_error( $slug ) ) {
+            return $slug;
         }
-
-        $slug    = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) );
-        $version = sanitize_text_field( wp_unslash( $_POST['version'] ?? '' ) );
-
-        if ( empty( $slug ) || empty( $version ) ) {
-            wp_send_json_error( array(
-                'message' => __( '缺少必要參數', 'ys-plugin-hub-client' ),
-            ) );
+        $version = self::required_string_param( $request, 'version' );
+        if ( is_wp_error( $version ) ) {
+            return $version;
         }
 
         $result = YSMarketplaceInstaller::update( $slug, $version );
 
         if ( is_wp_error( $result ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $result->get_error_message(),
             ) );
         }
@@ -366,7 +378,7 @@ final class YSHubAjaxHandler {
         // 回傳更新後的外掛完整狀態（讓 JS 整張卡片重新渲染）
         $plugin_data = self::get_updated_plugin_data( $slug, $version );
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => sprintf(
                 /* translators: %s: 外掛 slug */
                 __( '外掛 %s 更新成功', 'ys-plugin-hub-client' ),
@@ -379,16 +391,25 @@ final class YSHubAjaxHandler {
     /**
      * 儲存連線設定
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_save_settings(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        $site_key   = sanitize_text_field( wp_unslash( $_POST['site_key'] ?? '' ) );
-        $auto_check = sanitize_text_field( wp_unslash( $_POST['auto_check'] ?? 'no' ) );
-
-        // 驗證 auto_check 值
-        $auto_check = in_array( $auto_check, array( 'yes', 'no' ), true ) ? $auto_check : 'no';
+    public static function handle_save_settings( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $site_key = self::string_param( $request, 'site_key', true );
+        if ( is_wp_error( $site_key ) ) {
+            return $site_key;
+        }
+        $auto_check = self::required_string_param( $request, 'auto_check' );
+        if ( is_wp_error( $auto_check ) ) {
+            return $auto_check;
+        }
+        if ( ! in_array( $auto_check, array( 'yes', 'no' ), true ) ) {
+            return new WP_Error(
+                'ys_hub_invalid_auto_check',
+                __( 'auto_check 必須是 yes 或 no', 'ys-plugin-hub-client' ),
+                array( 'status' => 400 )
+            );
+        }
 
         $repo   = YSHubClientSettingsRepo::instance();
         $stored = $repo->set_many( array(
@@ -401,12 +422,12 @@ final class YSHubAjaxHandler {
 
         // 寫入未落地就回報成功，會讓管理者以為設定已生效。必須 fail closed。
         if ( true !== $stored ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => __( '設定未能寫入資料表，請確認 Hub 資料表已建立後再試一次', 'ys-plugin-hub-client' ),
             ) );
         }
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => __( '設定已儲存', 'ys-plugin-hub-client' ),
         ) );
     }
@@ -414,23 +435,22 @@ final class YSHubAjaxHandler {
     /**
      * 測試連線
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response
      */
-    public static function handle_test_connection(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
+    public static function handle_test_connection( WP_REST_Request $request ): WP_REST_Response {
         $api      = YSHubApiClient::instance();
         $response = $api->test_connection();
 
         if ( is_wp_error( $response ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $response->get_error_message(),
                 'state'   => YSCircuitBreaker::get_state(),
                 'label'   => YSCircuitBreaker::get_state_label(),
             ) );
         }
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => __( '連線成功', 'ys-plugin-hub-client' ),
             'state'   => YSCircuitBreaker::get_state(),
             'label'   => YSCircuitBreaker::get_state_label(),
@@ -441,11 +461,10 @@ final class YSHubAjaxHandler {
     /**
      * 產生 Site Key
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response
      */
-    public static function handle_generate_site_key(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
+    public static function handle_generate_site_key( WP_REST_Request $request ): WP_REST_Response {
         $api      = YSHubApiClient::instance();
         $response = $api->post(
             YSEndpointRegistry::GENERATE_SITE_KEY,
@@ -456,14 +475,14 @@ final class YSHubAjaxHandler {
         );
 
         if ( is_wp_error( $response ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $response->get_error_message(),
             ) );
         }
 
         $site_key = $response['site_key'] ?? '';
         if ( ! is_string( $site_key ) || empty( $site_key ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => __( 'Hub 未回傳 Site Key', 'ys-plugin-hub-client' ),
             ) );
         }
@@ -477,12 +496,12 @@ final class YSHubAjaxHandler {
 
         // 未落地的 Site Key 不得回傳：否則畫面顯示的金鑰與實際生效的不一致。
         if ( true !== $stored ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => __( 'Site Key 未能寫入資料表，請確認 Hub 資料表已建立後再試一次', 'ys-plugin-hub-client' ),
             ) );
         }
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message'  => __( 'Site Key 已產生並儲存', 'ys-plugin-hub-client' ),
             'site_key' => $site_key,
         ) );
@@ -491,11 +510,10 @@ final class YSHubAjaxHandler {
     /**
      * 強制刷新市集
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response
      */
-    public static function handle_refresh_marketplace(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
+    public static function handle_refresh_marketplace( WP_REST_Request $request ): WP_REST_Response {
         // 清除市集快取（新舊 key 都清）
         delete_site_transient( 'ys_hub_marketplace_data' );
         delete_site_transient( 'ys_hub_marketplace_plugins' );
@@ -508,7 +526,7 @@ final class YSHubAjaxHandler {
         $response = $api->get_marketplace_plugins();
 
         if ( is_wp_error( $response ) ) {
-            wp_send_json_error( array(
+            return self::failure( array(
                 'message' => $response->get_error_message(),
                 'state'   => YSCircuitBreaker::get_state(),
             ) );
@@ -528,7 +546,7 @@ final class YSHubAjaxHandler {
 
         set_site_transient( 'ys_hub_marketplace_data', $payload, 6 * HOUR_IN_SECONDS );
 
-        wp_send_json_success( array_merge(
+        return self::success( array_merge(
             $payload,
             array(
                 'plugins' => self::merge_local_status( $payload['plugins'] ),
@@ -540,18 +558,13 @@ final class YSHubAjaxHandler {
     /**
      * 啟用外掛
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_activate_plugin(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        if ( ! current_user_can( 'activate_plugins' ) ) {
-            wp_send_json_error( array( 'message' => __( '權限不足', 'ys-plugin-hub-client' ) ) );
-        }
-
-        $slug = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) );
-        if ( empty( $slug ) ) {
-            wp_send_json_error( array( 'message' => __( '缺少外掛 slug', 'ys-plugin-hub-client' ) ) );
+    public static function handle_activate_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slug = self::required_string_param( $request, 'slug' );
+        if ( is_wp_error( $slug ) ) {
+            return $slug;
         }
 
         // 找到外掛主檔案
@@ -568,21 +581,21 @@ final class YSHubAjaxHandler {
         }
 
         if ( empty( $plugin_file ) ) {
-            wp_send_json_error( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
+            return self::failure( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
         }
 
         $result = activate_plugin( $plugin_file );
 
         if ( is_wp_error( $result ) ) {
             YSHubClientLogRepo::error( 'activate', sprintf( '啟用 %s 失敗：%s', $slug, $result->get_error_message() ) );
-            wp_send_json_error( array( 'message' => $result->get_error_message() ) );
+            return self::failure( array( 'message' => $result->get_error_message() ) );
         }
 
         YSHubClientLogRepo::success( 'activate', sprintf( '外掛 %s 已啟用', $slug ) );
 
         $plugin_data = self::get_updated_plugin_data( $slug, '' );
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => sprintf( __( '外掛 %s 已啟用', 'ys-plugin-hub-client' ), $slug ),
             'plugin'  => $plugin_data,
         ) );
@@ -591,18 +604,13 @@ final class YSHubAjaxHandler {
     /**
      * 停用外掛
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_deactivate_plugin(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        if ( ! current_user_can( 'activate_plugins' ) ) {
-            wp_send_json_error( array( 'message' => __( '權限不足', 'ys-plugin-hub-client' ) ) );
-        }
-
-        $slug = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
-        if ( empty( $slug ) ) {
-            wp_send_json_error( array( 'message' => __( '缺少外掛 slug', 'ys-plugin-hub-client' ) ) );
+    public static function handle_deactivate_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slug = self::required_string_param( $request, 'slug' );
+        if ( is_wp_error( $slug ) ) {
+            return $slug;
         }
 
         if ( ! function_exists( 'get_plugins' ) ) {
@@ -618,7 +626,7 @@ final class YSHubAjaxHandler {
         }
 
         if ( empty( $plugin_file ) ) {
-            wp_send_json_error( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
+            return self::failure( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
         }
 
         // 檢查是否為最後一個啟用的 YS 外掛（停用後市集會消失）
@@ -638,7 +646,7 @@ final class YSHubAjaxHandler {
 
         $plugin_data = self::get_updated_plugin_data( $slug, '' );
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message'  => sprintf( __( '外掛 %s 已停用', 'ys-plugin-hub-client' ), $slug ),
             'plugin'   => $plugin_data,
             'is_last'  => $is_last,
@@ -649,18 +657,13 @@ final class YSHubAjaxHandler {
     /**
      * 刪除外掛
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response|WP_Error
      */
-    public static function handle_delete_plugin(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
-        if ( ! current_user_can( 'delete_plugins' ) ) {
-            wp_send_json_error( array( 'message' => __( '權限不足', 'ys-plugin-hub-client' ) ) );
-        }
-
-        $slug = sanitize_text_field( wp_unslash( $_POST['slug'] ?? '' ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
-        if ( empty( $slug ) ) {
-            wp_send_json_error( array( 'message' => __( '缺少外掛 slug', 'ys-plugin-hub-client' ) ) );
+    public static function handle_delete_plugin( WP_REST_Request $request ): WP_REST_Response|WP_Error {
+        $slug = self::required_string_param( $request, 'slug' );
+        if ( is_wp_error( $slug ) ) {
+            return $slug;
         }
 
         if ( ! function_exists( 'get_plugins' ) || ! function_exists( 'delete_plugins' ) ) {
@@ -677,7 +680,7 @@ final class YSHubAjaxHandler {
         }
 
         if ( empty( $plugin_file ) ) {
-            wp_send_json_error( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
+            return self::failure( array( 'message' => sprintf( __( '找不到外掛 %s', 'ys-plugin-hub-client' ), $slug ) ) );
         }
 
         // 先停用
@@ -689,7 +692,7 @@ final class YSHubAjaxHandler {
 
         if ( is_wp_error( $result ) ) {
             YSHubClientLogRepo::error( 'delete', sprintf( '刪除 %s 失敗：%s', $slug, $result->get_error_message() ) );
-            wp_send_json_error( array( 'message' => $result->get_error_message() ) );
+            return self::failure( array( 'message' => $result->get_error_message() ) );
         }
 
         YSHubClientLogRepo::success( 'delete', sprintf( '外掛 %s 已刪除', $slug ) );
@@ -703,7 +706,7 @@ final class YSHubAjaxHandler {
             }
         }
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message'  => sprintf( __( '外掛 %s 已刪除', 'ys-plugin-hub-client' ), $slug ),
             'redirect' => ( 0 === $remaining_ys ) ? admin_url( 'plugins.php' ) : '',
         ) );
@@ -712,15 +715,14 @@ final class YSHubAjaxHandler {
     /**
      * 清除全部日誌
      *
-     * @return void
+     * @param WP_REST_Request $request REST request.
+     * @return WP_REST_Response
      */
-    public static function handle_clear_logs(): void {
-        self::verify_request( 'ys_hub_marketplace_nonce' );
-
+    public static function handle_clear_logs( WP_REST_Request $request ): WP_REST_Response {
         $log_repo = YSHubClientLogRepo::instance();
         $log_repo->clear_all();
 
-        wp_send_json_success( array(
+        return self::success( array(
             'message' => __( '日誌已清除', 'ys-plugin-hub-client' ),
         ) );
     }
@@ -842,24 +844,87 @@ final class YSHubAjaxHandler {
     }
 
     /**
-     * 驗證 AJAX 請求（nonce + 權限）
+     * REST permission boundary: every route requires manage_options and the
+     * action-specific plugin capability where applicable.
      *
-     * @param string $nonce_action Nonce action 名稱
-     * @return void
+     * @param string $capability Action-specific capability.
+     * @return true|WP_Error
      */
-    private static function verify_request( string $nonce_action ): void {
-        // 檢查 nonce
-        if ( ! check_ajax_referer( $nonce_action, 'nonce', false ) ) {
-            wp_send_json_error( array(
-                'message' => __( '安全驗證失敗，請重新整理頁面', 'ys-plugin-hub-client' ),
-            ), 403 );
+    private static function authorize( string $capability ): bool|WP_Error {
+        foreach ( array_unique( array( 'manage_options', $capability ) ) as $required ) {
+            if ( current_user_can( $required ) ) {
+                continue;
+            }
+
+            return new WP_Error(
+                'rest_forbidden',
+                __( '權限不足', 'ys-plugin-hub-client' ),
+                array( 'status' => rest_authorization_required_code() )
+            );
         }
 
-        // 檢查權限
-        if ( ! current_user_can( 'manage_options' ) ) {
-            wp_send_json_error( array(
-                'message' => __( '權限不足', 'ys-plugin-hub-client' ),
-            ), 403 );
+        return true;
+    }
+
+    /**
+     * Read one parsed JSON/query parameter without applying form-style unslash.
+     *
+     * @param WP_REST_Request $request     REST request.
+     * @param string          $name        Parameter name.
+     * @param bool            $allow_empty Whether an empty string is valid.
+     * @return string|WP_Error
+     */
+    private static function string_param( WP_REST_Request $request, string $name, bool $allow_empty = false ): string|WP_Error {
+        if ( ! $request->has_param( $name ) ) {
+            return self::invalid_param( $name, __( '缺少必要參數', 'ys-plugin-hub-client' ) );
         }
+
+        $value = $request->get_param( $name );
+        if ( ! is_string( $value ) ) {
+            return self::invalid_param( $name, __( '參數格式無效', 'ys-plugin-hub-client' ) );
+        }
+
+        $value = sanitize_text_field( $value );
+        if ( ! $allow_empty && '' === trim( $value ) ) {
+            return self::invalid_param( $name, __( '缺少必要參數', 'ys-plugin-hub-client' ) );
+        }
+
+        return $value;
+    }
+
+    /** @return string|WP_Error */
+    private static function required_string_param( WP_REST_Request $request, string $name ): string|WP_Error {
+        return self::string_param( $request, $name, false );
+    }
+
+    private static function invalid_param( string $name, string $message ): WP_Error {
+        return new WP_Error(
+            'rest_invalid_param',
+            $message,
+            array(
+                'status' => 400,
+                'param'  => $name,
+            )
+        );
+    }
+
+    private static function success( array $data, int $status = 200 ): WP_REST_Response {
+        return new WP_REST_Response(
+            array(
+                'success' => true,
+                'data'    => $data,
+            ),
+            $status
+        );
+    }
+
+    private static function failure( array $data, int $status = 200 ): WP_REST_Response {
+        return new WP_REST_Response(
+            array(
+                'success' => false,
+                'data'    => $data,
+            ),
+            $status
+        );
     }
 }

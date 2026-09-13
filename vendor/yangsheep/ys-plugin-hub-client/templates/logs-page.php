@@ -203,6 +203,7 @@ $ys_plugins = \YangSheep\PluginHubClient\YSPluginHubClient::detect_ys_plugins();
 					<span class="dashicons dashicons-trash" style="font-size:14px;width:14px;height:14px;"></span>
 					<?php esc_html_e( '清除全部', 'ys-plugin-hub-client' ); ?>
 				</button>
+				<span id="ys-log-clear-message" role="status" aria-live="polite" style="font-size:12px;color:#c08080;"></span>
 			</div>
 		</div>
 
@@ -273,8 +274,9 @@ $ys_plugins = \YangSheep\PluginHubClient\YSPluginHubClient::detect_ys_plugins();
 <script>
 jQuery(function($){
 	var logConfig = <?php echo wp_json_encode( array(
-		'ajaxUrl' => admin_url( 'admin-ajax.php' ),
-		'nonce'   => wp_create_nonce( 'ys_hub_marketplace_nonce' ),
+		'restUrl'   => esc_url_raw( rest_url( 'ys-hub-client/v1/' ) ),
+		'nonce'     => wp_create_nonce( 'wp_rest' ),
+		'clearError' => __( '清除日誌失敗，請稍後重試。', 'ys-plugin-hub-client' ),
 	) ); ?>;
 	$('#ys-log-filter-btn').on('click', function(){
 		var level = $('#ys-log-level-filter').val();
@@ -287,11 +289,24 @@ jQuery(function($){
 	$('#ys-log-clear-btn').on('click', function(){
 		if(!confirm('<?php echo esc_js( __( '確定要清除所有日誌？', 'ys-plugin-hub-client' ) ); ?>')) return;
 		var btn = $(this);
+		var message = $('#ys-log-clear-message');
+		message.text('');
 		btn.prop('disabled', true);
-		$.post(logConfig.ajaxUrl, {
-			action: 'ys_hub_client_clear_logs',
-			nonce: logConfig.nonce
-		}, function(r){ if(r.success) window.location.reload(); }).always(function(){ btn.prop('disabled', false); });
+		$.ajax({
+			url: logConfig.restUrl + 'logs/clear',
+			type: 'POST',
+			contentType: 'application/json; charset=utf-8',
+			dataType: 'json',
+			processData: false,
+			data: '{}',
+			headers: { 'X-WP-Nonce': logConfig.nonce }
+		}).done(function(r){
+			if(r && r.success === true){ window.location.reload(); return; }
+			message.text((r && r.data && r.data.message) || logConfig.clearError);
+		}).fail(function(xhr){
+			var response = xhr && xhr.responseJSON ? xhr.responseJSON : {};
+			message.text((response.data && response.data.message) || response.message || logConfig.clearError);
+		}).always(function(){ btn.prop('disabled', false); });
 	});
 });
 </script>

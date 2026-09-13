@@ -2,7 +2,7 @@
 /**
  * YSMarketplacePage - 市集頁面渲染
  *
- * 頁面先渲染 skeleton loading，再由前端 JS 發 AJAX 取得外掛列表。
+ * 頁面先渲染 skeleton loading，再由前端 JS 透過 REST 取得外掛列表。
  *
  * @package YangSheep\PluginHubClient\Marketplace
  */
@@ -69,8 +69,8 @@ final class YSMarketplacePage {
         );
 
         wp_localize_script( 'ys-marketplace', 'ysHubClient', array(
-            'ajaxUrl' => admin_url( 'admin-ajax.php' ),
-            'nonce'   => wp_create_nonce( 'ys_hub_marketplace_nonce' ),
+            'restUrl' => esc_url_raw( rest_url( 'ys-hub-client/v1/' ) ),
+            'nonce'   => wp_create_nonce( 'wp_rest' ),
             'hubUrl'  => YS_HUB_CLIENT_HUB_URL,
             'i18n'    => array(
                 'loading'        => __( '載入中...', 'ys-plugin-hub-client' ),

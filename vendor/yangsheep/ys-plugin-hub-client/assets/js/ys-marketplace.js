@@ -1,14 +1,51 @@
 /**
  * YS Plugin Hub Client - 市集頁面前端邏輯
- * v2.0.2
+ * v2.0.7
  *
- * 所有操作走 AJAX，禁止 form POST。
+ * 所有操作走 WordPress REST；POST 使用 JSON body 與 wp_rest nonce。
  */
 (function ($) {
     'use strict';
 
     var config = window.ysHubClient || {};
     var i18n = config.i18n || {};
+
+    /**
+     * Hub page-local REST helper. Standard WordPress REST errors are reduced to
+     * the message/code/status fields already consumed by the existing UI.
+     */
+    function restRequest(method, path, data, handlers) {
+        var options = {
+            url: String(config.restUrl || '') + String(path || '').replace(/^\/+/, ''),
+            type: method,
+            dataType: 'json',
+            headers: {
+                'X-WP-Nonce': config.nonce || ''
+            },
+            success: handlers.success,
+            error: function (xhr) {
+                var body = xhr && xhr.responseJSON && typeof xhr.responseJSON === 'object'
+                    ? xhr.responseJSON
+                    : {};
+                var failure = {
+                    message: typeof body.message === 'string' ? body.message : '',
+                    code: typeof body.code === 'string' ? body.code : '',
+                    status: xhr && typeof xhr.status === 'number' ? xhr.status : 0
+                };
+                if (typeof handlers.error === 'function') {
+                    handlers.error(xhr || {}, failure);
+                }
+            }
+        };
+
+        if (method !== 'GET') {
+            options.contentType = 'application/json; charset=utf-8';
+            options.processData = false;
+            options.data = JSON.stringify(data || {});
+        }
+
+        return $.ajax(options);
+    }
 
     /**
      * 市集模組
@@ -302,7 +339,7 @@
         },
 
         /**
-         * 載入外掛列表（AJAX）
+         * 載入外掛列表（REST）
          */
         loadPlugins: function () {
             var self = this;
@@ -310,13 +347,7 @@
             self.showSkeleton();
             self.setHubStatus('checking', i18n.connecting || '連線中...');
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_get_marketplace',
-                    nonce: config.nonce
-                },
+            restRequest('GET', 'marketplace', null, {
                 success: function (response) {
                     if (response.success && response.data) {
                         // 連線成功
@@ -350,20 +381,20 @@
                         self.showError(msg);
                     }
                 },
-                error: function (xhr) {
-                    var reason = '';
-                    if (xhr.status === 0) {
+                error: function (xhr, failure) {
+                    var reason = failure.message || '';
+                    if (!reason && xhr.status === 0) {
                         reason = i18n.networkError || 'Hub 伺服器無法連線（網路逾時或伺服器關閉）';
-                    } else if (xhr.status >= 500) {
+                    } else if (!reason && xhr.status >= 500) {
                         reason = (i18n.serverError || 'Hub 伺服器錯誤') + ' (HTTP ' + xhr.status + ')';
-                    } else if (xhr.status === 403) {
+                    } else if (!reason && xhr.status === 403) {
                         reason = i18n.blocked || '此站台已被封鎖';
-                    } else {
+                    } else if (!reason) {
                         reason = (i18n.connectionFail || '連線失敗') + ' (HTTP ' + xhr.status + ')';
                     }
 
                     self.setHubStatus('error', i18n.disconnected || '連線異常');
-                    self.showConnectionError(reason, 'http_' + xhr.status);
+                    self.showConnectionError(reason, failure.code || ('http_' + xhr.status));
                     self.showError(reason);
                 }
             });
@@ -809,29 +840,24 @@
             var origText = btn.text();
             btn.prop('disabled', true).html('<span class="ys-spinner"></span> ' + this.escHtml(i18n.installing || '安裝中...'));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_install_plugin',
-                    nonce: config.nonce,
+            restRequest('POST', 'plugins/install', {
                     slug: slug,
                     version: version
-                },
+                }, {
                 success: function (response) {
                     if (response.success) {
-                        Toast.show(response.data.message || i18n.success, 'success');
+                        Toast.show((response.data && response.data.message) || i18n.success, 'success');
                         // 整張卡片用回傳的 plugin data 重新渲染
-                        if (response.data.plugin) {
+                        if (response.data && response.data.plugin) {
                             Marketplace.replaceCard(slug, response.data.plugin);
                         }
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                         btn.prop('disabled', false).text(origText);
                     }
                 },
-                error: function () {
-                    Toast.show(i18n.failed, 'error');
+                error: function (xhr, failure) {
+                    Toast.show(failure.message || i18n.failed, 'error');
                     btn.prop('disabled', false).text(origText);
                 }
             });
@@ -844,28 +870,23 @@
             var origText = btn.text();
             btn.prop('disabled', true).html('<span class="ys-spinner"></span> ' + this.escHtml(i18n.updating));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_update_plugin',
-                    nonce: config.nonce,
+            restRequest('POST', 'plugins/update', {
                     slug: slug,
                     version: version
-                },
+                }, {
                 success: function (response) {
                     if (response.success) {
-                        Toast.show(response.data.message || i18n.success, 'success');
-                        if (response.data.plugin) {
+                        Toast.show((response.data && response.data.message) || i18n.success, 'success');
+                        if (response.data && response.data.plugin) {
                             Marketplace.replaceCard(slug, response.data.plugin);
                         }
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                         btn.prop('disabled', false).text(origText);
                     }
                 },
-                error: function () {
-                    Toast.show(i18n.failed, 'error');
+                error: function (xhr, failure) {
+                    Toast.show(failure.message || i18n.failed, 'error');
                     btn.prop('disabled', false).text(origText);
                 }
             });
@@ -877,27 +898,22 @@
         activatePlugin: function (btn, slug) {
             btn.prop('disabled', true).html('<span class="ys-spinner"></span> ' + (i18n.activating || '啟用中...'));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_activate_plugin',
-                    nonce: config.nonce,
+            restRequest('POST', 'plugins/activate', {
                     slug: slug
-                },
+                }, {
                 success: function (response) {
                     if (response.success) {
-                        Toast.show(response.data.message || (i18n.activated || '已啟用'), 'success');
-                        if (response.data.plugin) {
+                        Toast.show((response.data && response.data.message) || (i18n.activated || '已啟用'), 'success');
+                        if (response.data && response.data.plugin) {
                             Marketplace.replaceCard(slug, response.data.plugin);
                         }
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                         btn.prop('disabled', false).text(i18n.activate || '啟用');
                     }
                 },
-                error: function () {
-                    Toast.show(i18n.failed, 'error');
+                error: function (xhr, failure) {
+                    Toast.show(failure.message || i18n.failed, 'error');
                     btn.prop('disabled', false).text(i18n.activate || '啟用');
                 }
             });
@@ -909,35 +925,30 @@
         deactivatePlugin: function (btn, slug) {
             btn.prop('disabled', true).html('<span class="ys-spinner"></span> ' + (i18n.deactivating || '停用中...'));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_deactivate_plugin',
-                    nonce: config.nonce,
+            restRequest('POST', 'plugins/deactivate', {
                     slug: slug
-                },
+                }, {
                 success: function (response) {
                     if (response.success) {
-                        Toast.show(response.data.message || '已停用', 'success');
+                        Toast.show((response.data && response.data.message) || '已停用', 'success');
                         // 如果是最後一個 YS 外掛 → 跳轉到外掛頁面
-                        if (response.data.is_last && response.data.redirect) {
+                        if (response.data && response.data.is_last && response.data.redirect) {
                             Toast.show(i18n.lastPluginWarning || '最後一個 YS 外掛已停用，即將跳轉到外掛管理頁面...', 'warning');
                             setTimeout(function () {
                                 window.location.href = response.data.redirect;
                             }, 1500);
                             return;
                         }
-                        if (response.data.plugin) {
+                        if (response.data && response.data.plugin) {
                             Marketplace.replaceCard(slug, response.data.plugin);
                         }
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                         btn.prop('disabled', false).text(i18n.deactivate || '停用');
                     }
                 },
-                error: function () {
-                    Toast.show(i18n.failed, 'error');
+                error: function (xhr, failure) {
+                    Toast.show(failure.message || i18n.failed, 'error');
                     btn.prop('disabled', false).text(i18n.deactivate || '停用');
                 }
             });
@@ -949,19 +960,14 @@
         deletePlugin: function (btn, slug) {
             btn.prop('disabled', true).html('<span class="ys-spinner"></span> ' + (i18n.deleting || '刪除中...'));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_delete_plugin',
-                    nonce: config.nonce,
+            restRequest('POST', 'plugins/delete', {
                     slug: slug
-                },
+                }, {
                 success: function (response) {
                     if (response.success) {
-                        Toast.show(response.data.message || '已刪除', 'success');
+                        Toast.show((response.data && response.data.message) || '已刪除', 'success');
                         // 如果沒有剩餘 YS 外掛 → 跳轉
-                        if (response.data.redirect) {
+                        if (response.data && response.data.redirect) {
                             setTimeout(function () {
                                 window.location.href = response.data.redirect;
                             }, 1500);
@@ -980,12 +986,12 @@
                             }
                         }
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                         btn.prop('disabled', false).text(i18n.deletePlugin || '刪除');
                     }
                 },
-                error: function () {
-                    Toast.show(i18n.failed, 'error');
+                error: function (xhr, failure) {
+                    Toast.show(failure.message || i18n.failed, 'error');
                     btn.prop('disabled', false).text(i18n.deletePlugin || '刪除');
                 }
             });
@@ -999,13 +1005,7 @@
             var origText = btn.text();
             btn.prop('disabled', true).html('<span class="ys-spinner ys-spinner-dark"></span> ' + this.escHtml(i18n.refreshing));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_refresh_marketplace',
-                    nonce: config.nonce
-                },
+            restRequest('POST', 'marketplace/refresh', {}, {
                 success: function (response) {
                     btn.prop('disabled', false).text(origText);
                     if (response.success && response.data && response.data.plugins) {
@@ -1029,9 +1029,9 @@
                         Toast.show(msg, 'error');
                     }
                 },
-                error: function () {
+                error: function (xhr, failure) {
                     btn.prop('disabled', false).text(origText);
-                    Toast.show(i18n.failed, 'error');
+                    Toast.show(failure.message || i18n.failed, 'error');
                 }
             });
         },
@@ -1296,26 +1296,21 @@
             var siteKey = $('#ys-site-key').val();
             var autoCheck = $('#ys-auto-check').is(':checked') ? 'yes' : 'no';
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_save_settings',
-                    nonce: config.nonce,
+            restRequest('POST', 'settings', {
                     site_key: siteKey,
                     auto_check: autoCheck
-                },
+                }, {
                 success: function (response) {
                     btn.prop('disabled', false).text(origText);
                     if (response.success) {
                         Toast.show(i18n.saved, 'success');
                     } else {
-                        Toast.show(response.data.message || i18n.failed, 'error');
+                        Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                     }
                 },
-                error: function () {
+                error: function (xhr, failure) {
                     btn.prop('disabled', false).text(origText);
-                    Toast.show(i18n.failed, 'error');
+                    Toast.show(failure.message || i18n.failed, 'error');
                 }
             });
         },
@@ -1327,13 +1322,7 @@
             var origText = btn.text();
             btn.prop('disabled', true).html('<span class="ys-spinner ys-spinner-dark"></span> ' + Marketplace.escHtml(i18n.testingConn));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_test_connection',
-                    nonce: config.nonce
-                },
+            restRequest('POST', 'connection/test', {}, {
                 success: function (response) {
                     btn.prop('disabled', false).text(origText);
                     if (response.success) {
@@ -1348,9 +1337,9 @@
                         }
                     }
                 },
-                error: function () {
+                error: function (xhr, failure) {
                     btn.prop('disabled', false).text(origText);
-                    Toast.show(i18n.connFailed, 'error');
+                    Toast.show(failure.message || i18n.connFailed, 'error');
                 }
             });
         },
@@ -1362,13 +1351,7 @@
             var origText = btn.text();
             btn.prop('disabled', true).html('<span class="ys-spinner ys-spinner-dark"></span> ' + Marketplace.escHtml(i18n.generating));
 
-            $.ajax({
-                url: config.ajaxUrl,
-                type: 'POST',
-                data: {
-                    action: 'ys_hub_client_generate_site_key',
-                    nonce: config.nonce
-                },
+            restRequest('POST', 'site-key/generate', {}, {
                 success: function (response) {
                     btn.prop('disabled', false).text(origText);
                     if (response.success && response.data && response.data.site_key) {
@@ -1378,9 +1361,9 @@
                         Toast.show((response.data && response.data.message) || i18n.failed, 'error');
                     }
                 },
-                error: function () {
+                error: function (xhr, failure) {
                     btn.prop('disabled', false).text(origText);
-                    Toast.show(i18n.failed, 'error');
+                    Toast.show(failure.message || i18n.failed, 'error');
                 }
             });
         },
