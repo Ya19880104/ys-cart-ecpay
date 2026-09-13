@@ -19,9 +19,28 @@
         });
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initializeSources, { once: true });
-    } else {
+    function initializeProvider() {
+        var toggle = document.getElementById('ys-ec-ecpay-enabled');
+        var settings = document.getElementById('ys-ec-ecpay-provider-settings');
+        if (!toggle || !settings) {
+            return;
+        }
+        function syncProvider() {
+            settings.hidden = !toggle.checked;
+            toggle.setAttribute('aria-expanded', toggle.checked ? 'true' : 'false');
+        }
+        toggle.addEventListener('change', syncProvider);
+        syncProvider();
+    }
+
+    function initialize() {
         initializeSources();
+        initializeProvider();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initialize, { once: true });
+    } else {
+        initialize();
     }
 }());

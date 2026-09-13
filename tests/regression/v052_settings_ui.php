@@ -29,11 +29,11 @@ require_once dirname(__DIR__, 2) . '/src/Shipping/Ecpay/EcpayShippingCatalog.php
 require_once dirname(__DIR__, 2) . '/src/Support/Settings.php';
 function wp_unslash(string $value): string { return stripslashes($value); }
 
-function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c', bool $testMode = true): string {
+function render_settings(string $b2c = 'disabled', string $c2c = 'payment', string $tab = 'api', string $error = '', string $family = 'c2c', bool $testMode = true, bool $enabled = true): string {
     $_GET = $error === '' ? [] : ['settings_error' => $error];
     $settings = [
         'tab' => $tab, 'tabs' => ['api' => 'API', 'payment' => '金流', 'shipping' => '物流'],
-        'enabled' => true, 'payment_credit_check_code_is_set' => true,
+        'enabled' => $enabled, 'payment_credit_check_code_is_set' => true,
         'home_credential_family' => $family, 'logistics_reuse_payment' => true,
         'payment_mode' => 'redirect', 'payment_modes_implemented' => ['redirect'],
         'legacy_logistics_credentials_present' => true,
@@ -89,8 +89,8 @@ foreach (['disabled', 'payment', 'separate', 'legacy'] as $mode) {
             $options[$option->getAttribute('value')] = trim($option->textContent);
             if ($option->hasAttribute('selected')) { $selected = $option->getAttribute('value'); }
         }
-        $expectedOptions = ['disabled' => '不使用', 'payment' => '共用上方金流設定', 'separate' => '分開設定'];
-        if ($expected === 'legacy') { $expectedOptions['legacy'] = '保留目前設定（舊版）'; }
+        $expectedOptions = ['disabled' => '不啟用', 'payment' => '共用金流設定', 'separate' => '使用獨立物流設定'];
+        if ($expected === 'legacy') { $expectedOptions['legacy'] = '保留舊版設定'; }
         check($mode . ':' . $group . ':exact compatible choices', $options === $expectedOptions && $selected === $expected);
         $id = $select->getAttribute('id');
         $fieldsetId = $select->getAttribute('aria-controls');
@@ -111,8 +111,8 @@ $html = render_settings('payment', 'legacy');
 $xp = dom($html);
 $text = $xp->document->textContent;
 check('one concise credential warning', substr_count($text, '更換金鑰會造成原本已綁定付款的用戶失效，請小心操作。') === 1 && str_contains($text, '進行中的付款與物流單也可能受影響'));
-check('payment heading and inherited environment explained', first($xp, '//h2[normalize-space(.)="金流設定"]') !== null && str_contains($text, '金流測試模式') && str_contains($text, '共用此組的物流'));
-check('no-JS source rule is explained', str_contains($text, '只有選擇「分開設定」'));
+check('payment heading and inherited environment explained', first($xp, '//h2[normalize-space(.)="API 連線設定"]') !== null && str_contains($text, '金流測試模式') && str_contains($text, '共用此組的物流'));
+check('no-JS source rule is explained', str_contains($text, '選擇「使用獨立物流設定」'));
 check('obsolete global reuse control removed', first($xp, '//input[@name="ys_ec_ecpay_logistics_reuse_payment"]') === null);
 check('no forced-disable instruction', !str_contains($text, '先停用全部'));
 $credit = first($xp, '//details[summary="信用卡退款進階設定（選填）"]//input[@name="ys_ec_ecpay_payment_credit_check_code"]');
@@ -137,10 +137,10 @@ $homeHidden = dom(render_settings('payment', 'disabled', 'api', '', 'b2c_home'))
 check('home family choice hidden when only one group is in use', first($homeHidden, '//select[@name="ys_ec_ecpay_home_credential_family"]') === null && !str_contains($homeHidden->document->textContent, '宅配使用的設定'));
 $homeConflict = dom(render_settings('payment', 'disabled', 'api', '', 'c2c'));
 $conflictDetails = first($homeConflict, '//details[summary="宅配使用的設定"]');
-check('home family shown open with a warning when it points at a disabled group', $conflictDetails !== null && $conflictDetails->hasAttribute('open') && first($homeConflict, '//select[@name="ys_ec_ecpay_home_credential_family"]') !== null && str_contains($homeConflict->document->textContent, '已設為「不使用」'));
+check('home family shown open with a warning when it points at a disabled group', $conflictDetails !== null && $conflictDetails->hasAttribute('open') && first($homeConflict, '//select[@name="ys_ec_ecpay_home_credential_family"]') !== null && str_contains($homeConflict->document->textContent, '已設為「不啟用」'));
 $homeBoth = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home'));
 $bothDetails = first($homeBoth, '//details[summary="宅配使用的設定"]');
-check('home family shown collapsed without warning when both groups are in use', $bothDetails !== null && !$bothDetails->hasAttribute('open') && !str_contains($homeBoth->document->textContent, '已設為「不使用」') && first($homeBoth, '//select[@name="ys_ec_ecpay_home_credential_family"]//option[@value="b2c_home"][@selected]') !== null);
+check('home family shown collapsed without warning when both groups are in use', $bothDetails !== null && !$bothDetails->hasAttribute('open') && !str_contains($homeBoth->document->textContent, '已設為「不啟用」') && first($homeBoth, '//select[@name="ys_ec_ecpay_home_credential_family"]//option[@value="b2c_home"][@selected]') !== null);
 check('obsolete gate error strings are gone', !str_contains(dom(render_settings('disabled', 'disabled', 'api', 'signer_change_active_labels'))->document->textContent, '仍有未結束或升級前的物流單'));
 // ── 交易模式：只有已實作的模式可選，未實作的看得到但存不進 ──
 $partialHtml = render_settings('payment', 'separate');
@@ -151,16 +151,31 @@ check(
     $duplicatePageTitles !== false && $duplicatePageTitles->length === 0
 );
 check(
-    'settings compose the Core Surface, flat Sections, Field, Notice, NavTabs and Button partials',
-    substr_count($partialHtml, 'data-stub-partial="surface"') === 1
-        && substr_count($partialHtml, 'data-stub-partial="section"') === 6
-        && substr_count($partialHtml, 'data-variant="flat"') === 6
+    'settings use the Core page root with compact flat Sections, Field, Notice, NavTabs and Button partials',
+    substr_count($partialHtml, 'data-stub-partial="surface"') === 0
+        && substr_count($partialHtml, 'class="ysca-page-root"') === 1
+        && substr_count($partialHtml, 'data-stub-partial="section"') === 4
+        && substr_count($partialHtml, 'data-variant="flat"') === 4
         && substr_count($partialHtml, 'data-stub-partial="field"') >= 1
         && substr_count($partialHtml, 'data-stub-partial="notice"') === 1
         && substr_count($partialHtml, 'data-stub-partial="nav-tabs"') === 1
         && substr_count($partialHtml, 'data-stub-partial="button"') === 2
         && !str_contains($partialHtml, 'class="ysca-card')
 );
+$logisticsSection = first($modeXp, '//section[.//h2[normalize-space(.)="物流 API 設定"]]');
+check(
+    'B2C and C2C source choices share one compact logistics section',
+    $logisticsSection !== null
+        && (new DOMXPath($modeXp->document))->query('.//select[@name="ys_ec_ecpay_logistics_b2c_home_source"]', $logisticsSection)->length === 1
+        && (new DOMXPath($modeXp->document))->query('.//select[@name="ys_ec_ecpay_logistics_c2c_source"]', $logisticsSection)->length === 1
+);
+$providerPanel = first($modeXp, '//*[@id="ys-ec-ecpay-provider-settings"]');
+check('enabled provider exposes its tab settings', $providerPanel !== null && !$providerPanel->hasAttribute('hidden'));
+$disabledXp = dom(render_settings('payment', 'separate', 'api', '', 'b2c_home', true, false));
+$disabledPanel = first($disabledXp, '//*[@id="ys-ec-ecpay-provider-settings"]');
+check('disabled provider hides its tab settings but keeps the enable control available', $disabledPanel !== null && $disabledPanel->hasAttribute('hidden') && first($disabledXp, '//input[@id="ys-ec-ecpay-enabled"]') !== null);
+$otherModes = first($modeXp, '//details[summary="其他交易模式與開通資訊"]');
+check('unsupported transaction modes are available without expanding the page by default', $otherModes !== null && !$otherModes->hasAttribute('open'));
 $modeInputs = [];
 foreach ($modeXp->query('//input[@name="ys_ec_ecpay_payment_mode"]') as $input) {
     $modeInputs[$input->getAttribute('value')] = [

@@ -610,12 +610,19 @@ final class EcpaySettings {
 
 		$settings     = self::settings_for_render();
 		$nonce_action = self::NONCE_ACTION;
-		if ( 'api' === $settings['tab'] ) {
-			wp_enqueue_script( 'ys-cart-ecpay-admin-settings', YS_CART_ECPAY_URL . 'assets/js/admin-settings.js', [], YS_CART_ECPAY_VERSION, true );
-		}
+		wp_enqueue_script( 'ys-cart-ecpay-admin-settings', YS_CART_ECPAY_URL . 'assets/js/admin-settings.js', [], YS_CART_ECPAY_VERSION, true );
 
 		if ( class_exists( YSAdminApp::class ) ) {
-			YSAdminApp::open( '綠界 ECPay 設定', '金物流 / 綠界' );
+			YSAdminApp::open( '綠界 ECPay 設定', '金物流 / 綠界', [
+				[
+					'label'   => __( '儲存設定', 'ys-cart-ecpay' ),
+					'variant' => 'primary',
+					'element' => 'button',
+					'type'    => 'submit',
+					'form'    => 'ys-cart-ecpay-settings-form',
+					'size'    => 'sm',
+				],
+			] );
 		}
 
 		$template = YS_CART_ECPAY_DIR . 'templates/admin/ecpay-settings.php';

@@ -29,9 +29,23 @@ if (fs.existsSync(scriptPath)) {
             const selected = [...m[2].matchAll(/<option\b([^>]*)>/g)].find((option) => /\bselected=/.test(option[1]));
             return { attributes, value: attrs(selected[1]).value, dataset: {}, listeners: {}, getAttribute: (key) => attributes[key], addEventListener(type, callback) { this.listeners[type] = callback; } };
         });
+    const providerTag = rendered.stdout.match(/<input\b([^>]*\bid="ys-ec-ecpay-enabled"[^>]*)>/);
+    const panelTag = rendered.stdout.match(/<div\b([^>]*\bid="ys-ec-ecpay-provider-settings"[^>]*)>/);
+    const provider = providerTag ? {
+        checked: /\bchecked=/.test(providerTag[1]),
+        listeners: {}, attributes: {},
+        addEventListener(type, callback) { this.listeners[type] = callback; },
+        setAttribute(key, value) { this.attributes[key] = String(value); },
+    } : null;
+    const providerPanel = panelTag ? { hidden: /\bhidden(?:\s|=|$)/.test(panelTag[1]) } : null;
     check('real HTML exposes exactly two independent groups', selects.length === 2 && fieldsets.size === 2);
-    if (selects.length === 2 && fieldsets.size === 2) {
-        const document = { readyState: 'complete', querySelectorAll: () => selects, getElementById: (id) => fieldsets.get(id) };
+    check('real HTML exposes provider visibility controls', provider !== null && providerPanel !== null);
+    if (selects.length === 2 && fieldsets.size === 2 && provider && providerPanel) {
+        const document = {
+            readyState: 'complete',
+            querySelectorAll: () => selects,
+            getElementById: (id) => id === 'ys-ec-ecpay-enabled' ? provider : (id === 'ys-ec-ecpay-provider-settings' ? providerPanel : fieldsets.get(id)),
+        };
         vm.runInNewContext(fs.readFileSync(scriptPath, 'utf8'), { document }, { filename: scriptPath });
         const [b2c, c2c] = selects;
         const b2cFields = fieldsets.get(b2c.attributes['aria-controls']);
@@ -51,6 +65,11 @@ if (fs.existsSync(scriptPath)) {
         check('mode switches retain entered values and clear checkbox state', JSON.stringify(values) === JSON.stringify(b2cFields.controls.map((control) => [control.value, control.checked])));
         c2c.value = 'disabled'; c2c.listeners.change();
         check('second selector changes independently', c2cFields.hidden && c2cFields.controls.every((control) => control.disabled) && !b2cFields.hidden && b2cFields.controls.every((control) => !control.disabled));
+        check('enabled provider content is initially visible', !providerPanel.hidden && provider.attributes['aria-expanded'] === 'true');
+        provider.checked = false; provider.listeners.change();
+        check('turning provider off hides the settings without changing source controls', providerPanel.hidden && !b2cFields.hidden && b2cFields.controls.every((control) => !control.disabled));
+        provider.checked = true; provider.listeners.change();
+        check('turning provider on reveals the settings again', !providerPanel.hidden && provider.attributes['aria-expanded'] === 'true');
     }
 }
 const fail = checks.filter((entry) => !entry.pass).length;
