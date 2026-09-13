@@ -82,24 +82,29 @@ class YSUpdateChecker {
         $cached = get_site_transient( self::CACHE_KEY );
 
         if ( false === $cached || ! is_array( $cached ) ) {
-            // 快取不存在或過期 → 嘗試同步取得（帶超時保護）
-            // 不再依賴 WP Cron 單次事件（WP-CLI cron 環境下 autoloader 可能不完整）
-            $cached = self::sync_update_check();
-            if ( false === $cached || ! is_array( $cached ) ) {
-                return $transient;
-            }
+            // 快取不存在或過期 → 只排程背景工作，filter 路徑永遠不做 HTTP。
+            self::schedule_background_check();
+            return $transient;
         }
 
         // 有快取 → 注入更新資訊
         $ys_plugins = YSPluginHubClient::detect_ys_plugins();
 
         foreach ( $cached as $slug => $update_data ) {
-            if ( ! isset( $ys_plugins[ $slug ] ) ) {
+            // map key 決定安裝目標（plugin file / 本地版本），非字串 key 不可能對應已安裝外掛。
+            if ( ! is_string( $slug ) || ! isset( $ys_plugins[ $slug ] ) ) {
+                continue;
+            }
+
+            // 防禦性再驗：快取可能來自舊版本或已被污染。row 自己的 slug 必須等於 map key，
+            // 否則同一筆更新會有兩個互相矛盾的身分權威——安裝目標取自 key，顯示身分取自 row。
+            $update_data = YSPluginInfo::canonicalize_row( $update_data, $slug );
+            if ( null === $update_data ) {
                 continue;
             }
 
             $local_version  = $ys_plugins[ $slug ]['version'];
-            $remote_version = $update_data['version'] ?? '0.0.0';
+            $remote_version = $update_data['version'];
             $plugin_file    = $ys_plugins[ $slug ]['file'];
 
             if ( version_compare( $remote_version, $local_version, '>' ) ) {
@@ -128,7 +133,8 @@ class YSUpdateChecker {
         }
 
         $slug = $args->slug ?? '';
-        if ( empty( $slug ) ) {
+        // 此 filter 對每個 plugins_api 呼叫者都會執行；非字串 slug 不得進入字串函式。
+        if ( ! is_string( $slug ) || '' === $slug ) {
             return $result;
         }
 
@@ -143,66 +149,87 @@ class YSUpdateChecker {
             return $result;
         }
 
-        return YSPluginInfo::from_hub_response( $cached[ $slug ] );
+        // 防禦性再驗：非正規 row 不得進入型別化對應，且回傳的資訊必須確實描述
+        // 呼叫端指名的那個外掛（row slug 必須等於 requested slug）。
+        $plugin_data = YSPluginInfo::canonicalize_row( $cached[ $slug ], $slug );
+        if ( null === $plugin_data ) {
+            return $result;
+        }
+
+        return YSPluginInfo::from_hub_response( $plugin_data );
     }
 
     /**
-     * 同步更新檢查（帶超時保護和快取鎖）
+     * 將 Hub 回應正規化成可信任的 row map
      *
-     * 當快取為空時直接呼叫 Hub API（不依賴 WP Cron），
-     * 使用 5 分鐘鎖避免短時間內重複請求。
+     * Hub 是外部輸入：任何 row 都必須先證明形狀，才可以進入快取。這裡同時把
+     * map key 綁回 row 自己的 slug，避免 list 形狀在 array_merge 重編號後
+     * 失去 slug 對應。
      *
-     * @return array|false 成功回傳快取陣列，失敗回傳 false
+     * @param mixed $response Hub 回應
+     * @return array<string,array> slug => 正規化 row
      */
-    private static function sync_update_check() {
-        // 5 分鐘內不重複請求
-        if ( get_site_transient( self::BG_LOCK_KEY ) ) {
-            return false;
-        }
-        set_site_transient( self::BG_LOCK_KEY, 1, 300 );
-
-        // Circuit Breaker 檢查
-        if ( ! YSCircuitBreaker::is_available() ) {
-            return false;
+    private static function canonicalize_response( $response ): array {
+        if ( ! is_array( $response ) ) {
+            return array();
         }
 
-        // 收集已安裝外掛
-        $ys_plugins = YSPluginHubClient::detect_ys_plugins();
-        if ( empty( $ys_plugins ) ) {
-            return false;
+        $sources = array();
+        foreach ( array( 'updates', 'no_updates' ) as $section ) {
+            if ( isset( $response[ $section ] ) && is_array( $response[ $section ] ) ) {
+                $sources[] = $response[ $section ];
+            }
         }
 
-        $plugins_data = array();
-        foreach ( $ys_plugins as $slug => $info ) {
-            $plugins_data[ $slug ] = $info['version'];
+        // Fallback: 如果 Hub 回傳的格式不同
+        if ( array() === $sources && isset( $response['plugins'] ) && is_array( $response['plugins'] ) ) {
+            $sources[] = $response['plugins'];
         }
 
-        // 呼叫 Hub（ApiClient 已有超時保護 + Circuit Breaker）
-        $api      = YSHubApiClient::instance();
-        $response = $api->check_updates( $plugins_data );
+        $canonical = array();
+        foreach ( $sources as $rows ) {
+            foreach ( $rows as $key => $row ) {
+                // JSON 物件的 key "0" 會解碼成 PHP 的 int 0，與陣列元素無法區分，因此
+                // list / associative 必須逐項依 key 型別判斷，不能對整個 section 做
+                // array_is_list()。字串 key 是 Hub 對該列的宣告身分，必須與 row 自己的
+                // slug 完全一致；整數 key 只是位置，身分由 row slug 決定。
+                $expected_slug = is_string( $key ) ? $key : null;
 
-        if ( is_wp_error( $response ) ) {
-            return false;
+                $canonical_row = YSPluginInfo::canonicalize_row( $row, $expected_slug );
+                if ( null === $canonical_row ) {
+                    continue; // 逐筆略過不合規 row，不讓單筆污染整批。
+                }
+
+                if ( isset( $canonical[ $canonical_row['slug'] ] ) ) {
+                    // 先到者為準：updates 早於 no_updates，因此真實更新不會被
+                    // 同 slug 的 no_updates 列靜默覆寫，重複列也不會改寫已驗證資料。
+                    continue;
+                }
+
+                $canonical[ $canonical_row['slug'] ] = $canonical_row;
+            }
         }
 
-        // 合併 updates + no_updates
-        $all_plugins = array();
-        if ( isset( $response['updates'] ) && is_array( $response['updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['updates'] );
+        return $canonical;
+    }
+
+    /**
+     * 排程一次背景更新檢查
+     *
+     * @return void
+     */
+    private static function schedule_background_check(): void {
+        if ( false !== get_site_transient( self::BG_LOCK_KEY ) ) {
+            return;
         }
-        if ( isset( $response['no_updates'] ) && is_array( $response['no_updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['no_updates'] );
-        }
-        if ( empty( $all_plugins ) && isset( $response['plugins'] ) ) {
-            $all_plugins = $response['plugins'];
+        if ( false !== wp_next_scheduled( 'ys_hub_bg_check' ) ) {
+            return;
         }
 
-        if ( ! empty( $all_plugins ) ) {
-            set_site_transient( self::CACHE_KEY, $all_plugins, self::CACHE_TTL );
-            return $all_plugins;
+        $scheduled = wp_schedule_single_event( time(), 'ys_hub_bg_check', array() );
+        if ( true === $scheduled ) {
+            set_site_transient( self::BG_LOCK_KEY, 1, 300 );
         }
-
-        return false;
     }
 
     /**
@@ -213,52 +240,45 @@ class YSUpdateChecker {
      * @return void
      */
     public static function background_check(): void {
-        // 清除排程鎖
-        delete_site_transient( self::BG_LOCK_KEY );
+        // HTTP 執行期間保留短期鎖；所有 return/exception 路徑都會釋放。
+        set_site_transient( self::BG_LOCK_KEY, 1, 300 );
+        try {
+            // 熔斷器檢查
+            if ( ! YSCircuitBreaker::is_available() ) {
+                return; // 熔斷中 → 跳過，繼續使用過期快取
+            }
 
-        // 熔斷器檢查
-        if ( ! YSCircuitBreaker::is_available() ) {
-            return; // 熔斷中 → 跳過，繼續使用過期快取
-        }
+            // 收集已安裝的 YS 外掛資訊
+            $ys_plugins = YSPluginHubClient::detect_ys_plugins();
+            if ( empty( $ys_plugins ) ) {
+                return;
+            }
 
-        // 收集已安裝的 YS 外掛資訊
-        $ys_plugins = YSPluginHubClient::detect_ys_plugins();
-        if ( empty( $ys_plugins ) ) {
-            return;
-        }
+            // 組裝傳送資料
+            $plugins_data = array();
+            foreach ( $ys_plugins as $slug => $info ) {
+                $plugins_data[ $slug ] = $info['version'];
+            }
 
-        // 組裝傳送資料
-        $plugins_data = array();
-        foreach ( $ys_plugins as $slug => $info ) {
-            $plugins_data[ $slug ] = $info['version'];
-        }
+            // 呼叫 Hub
+            $api      = YSHubApiClient::instance();
+            $response = $api->check_updates( $plugins_data );
 
-        // 呼叫 Hub
-        $api      = YSHubApiClient::instance();
-        $response = $api->check_updates( $plugins_data );
+            if ( is_wp_error( $response ) ) {
+                // 失敗（CircuitBreaker 已在 ApiClient 中處理）
+                return;
+            }
 
-        if ( is_wp_error( $response ) ) {
-            // 失敗（CircuitBreaker 已在 ApiClient 中處理）
-            return;
-        }
+            // 成功 → 更新快取
+            // Hub /update-check 回傳 {success, count, updates: {slug: {...}}, no_updates: {slug: {...}}}
+            // 只有通過形狀驗證的 row 才可以進入快取。
+            $all_plugins = self::canonicalize_response( $response );
 
-        // 成功 → 更新快取
-        // Hub /update-check 回傳 {success, count, updates: {slug: {...}}, no_updates: {slug: {...}}}
-        // 合併 updates + no_updates 存入快取
-        $all_plugins = array();
-        if ( isset( $response['updates'] ) && is_array( $response['updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['updates'] );
-        }
-        if ( isset( $response['no_updates'] ) && is_array( $response['no_updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['no_updates'] );
-        }
-        // Fallback: 如果 Hub 回傳的格式不同
-        if ( empty( $all_plugins ) && isset( $response['plugins'] ) ) {
-            $all_plugins = $response['plugins'];
-        }
-
-        if ( ! empty( $all_plugins ) ) {
-            set_site_transient( self::CACHE_KEY, $all_plugins, self::CACHE_TTL );
+            if ( ! empty( $all_plugins ) ) {
+                set_site_transient( self::CACHE_KEY, $all_plugins, self::CACHE_TTL );
+            }
+        } finally {
+            delete_site_transient( self::BG_LOCK_KEY );
         }
     }
 
@@ -290,16 +310,8 @@ class YSUpdateChecker {
             return false;
         }
 
-        $all_plugins = array();
-        if ( isset( $response['updates'] ) && is_array( $response['updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['updates'] );
-        }
-        if ( isset( $response['no_updates'] ) && is_array( $response['no_updates'] ) ) {
-            $all_plugins = array_merge( $all_plugins, $response['no_updates'] );
-        }
-        if ( empty( $all_plugins ) && isset( $response['plugins'] ) ) {
-            $all_plugins = $response['plugins'];
-        }
+        // 手動刷新走同一條 ingress 驗證，避免兩條路徑對快取有不同信任度。
+        $all_plugins = self::canonicalize_response( $response );
 
         if ( ! empty( $all_plugins ) ) {
             set_site_transient( self::CACHE_KEY, $all_plugins, self::CACHE_TTL );

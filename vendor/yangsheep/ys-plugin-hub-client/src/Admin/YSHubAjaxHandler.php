@@ -64,12 +64,14 @@ final class YSHubAjaxHandler {
         $cached = get_site_transient( 'ys_hub_marketplace_data' );
 
         if ( false !== $cached && is_array( $cached ) ) {
-            wp_send_json_success( array(
-                'plugins'       => self::merge_local_status( $cached['plugins'] ?? array() ),
-                'platforms'     => $cached['platforms'] ?? array(),
-                'categories'    => $cached['categories'] ?? array(),
-                'announcements' => $cached['announcements'] ?? array(),
-                'source'        => 'cache',
+            // 快取可能寫自舊版本或已被污染的回應，服務前一律重新正規化。
+            $payload = self::normalize_marketplace_payload( $cached );
+            wp_send_json_success( array_merge(
+                $payload,
+                array(
+                    'plugins' => self::merge_local_status( $payload['plugins'] ),
+                    'source'  => 'cache',
+                )
             ) );
         }
 
@@ -86,48 +88,205 @@ final class YSHubAjaxHandler {
             ) );
         }
 
-        // 提取外掛陣列（Hub 回傳 {success, count, plugins}）
-        $plugins = $response;
-        if ( isset( $response['plugins'] ) && is_array( $response['plugins'] ) ) {
-            $plugins = $response['plugins'];
-        }
+        // 取得分類與公告列表
+        $cat_response = $api->get( YSEndpointRegistry::CATEGORIES );
+        $ann_response = $api->get( YSEndpointRegistry::ANNOUNCEMENTS );
 
-        $platforms = array();
-        if ( isset( $response['platforms'] ) && is_array( $response['platforms'] ) ) {
-            $platforms = $response['platforms'];
-        }
-
-        // 取得分類列表
-        $categories      = array();
-        $cat_response    = $api->get( YSEndpointRegistry::CATEGORIES );
-        if ( ! is_wp_error( $cat_response ) && isset( $cat_response['categories'] ) ) {
-            $categories = $cat_response['categories'];
-        }
-
-        // 取得公告列表
-        $announcements   = array();
-        $ann_response    = $api->get( YSEndpointRegistry::ANNOUNCEMENTS );
-        if ( ! is_wp_error( $ann_response ) && isset( $ann_response['announcements'] ) ) {
-            $announcements = $ann_response['announcements'];
-        }
-
-        if ( is_array( $plugins ) ) {
-            // 快取 6 小時（包含分類和公告）
-            set_site_transient( 'ys_hub_marketplace_data', array(
-                'plugins'       => $plugins,
-                'platforms'     => $platforms,
-                'categories'    => $categories,
-                'announcements' => $announcements,
-            ), 6 * HOUR_IN_SECONDS );
-        }
-
-        wp_send_json_success( array(
-            'plugins'       => self::merge_local_status( $plugins ),
-            'platforms'     => $platforms,
-            'categories'    => $categories,
-            'announcements' => $announcements,
-            'source'        => 'remote',
+        // Hub 是外部輸入：必須在寫入快取「之前」正規化。只在輸出端正規化並不足夠——
+        // 被污染的回應會在快取裡存活 6 小時，之後由防護最少的快取分支反覆送出。
+        $payload = self::normalize_marketplace_payload( array(
+            'plugins'       => ( isset( $response['plugins'] ) && is_array( $response['plugins'] ) ) ? $response['plugins'] : $response,
+            'platforms'     => $response['platforms'] ?? null,
+            'categories'    => is_array( $cat_response ) ? ( $cat_response['categories'] ?? null ) : null,
+            'announcements' => is_array( $ann_response ) ? ( $ann_response['announcements'] ?? null ) : null,
         ) );
+
+        // 快取 6 小時（包含分類和公告）
+        set_site_transient( 'ys_hub_marketplace_data', $payload, 6 * HOUR_IN_SECONDS );
+
+        wp_send_json_success( array_merge(
+            $payload,
+            array(
+                'plugins' => self::merge_local_status( $payload['plugins'] ),
+                'source'  => 'remote',
+            )
+        ) );
+    }
+
+    /**
+     * 把 Hub 市集回應正規化成顯式 schema
+     *
+     * 任何非預期的 row/欄位形狀一律安全拒絕或降級為明確的安全預設值，
+     * 不得產生診斷訊息、未捕捉例外，也不得以型別強轉掩蓋。
+     *
+     * @param array $raw 原始（或快取中的）市集資料。
+     * @return array{plugins:array,platforms:array,categories:array,announcements:array}
+     */
+    private static function normalize_marketplace_payload( array $raw ): array {
+        return array(
+            'plugins'       => self::normalize_plugin_rows( $raw['plugins'] ?? null ),
+            'platforms'     => self::normalize_taxonomy_rows( $raw['platforms'] ?? null ),
+            'categories'    => self::normalize_taxonomy_rows( $raw['categories'] ?? null ),
+            'announcements' => self::normalize_announcement_rows( $raw['announcements'] ?? null ),
+        );
+    }
+
+    /**
+     * 字串欄位：非字串一律退回預設值（拒絕該值，不做型別強轉）。
+     *
+     * @param mixed  $value   原始值。
+     * @param string $default 預設值。
+     * @return string
+     */
+    private static function normalize_string( $value, string $default = '' ): string {
+        return is_string( $value ) ? $value : $default;
+    }
+
+    /**
+     * class token：以允許字元集決定，HTML escaping 不是 token 的正確約束。
+     *
+     * @param mixed  $value   原始值。
+     * @param string $default 預設值。
+     * @return string
+     */
+    private static function normalize_token( $value, string $default = '' ): string {
+        return ( is_string( $value ) && 1 === preg_match( '/^[A-Za-z0-9_-]{1,64}$/D', $value ) ) ? $value : $default;
+    }
+
+    /**
+     * 封閉域欄位：不在允許集合內一律退回預設值。
+     *
+     * @param mixed             $value   原始值。
+     * @param array<int,string> $allowed 允許集合。
+     * @param string            $default 預設值。
+     * @return string
+     */
+    private static function normalize_enum( $value, array $allowed, string $default ): string {
+        return ( is_string( $value ) && in_array( $value, $allowed, true ) ) ? $value : $default;
+    }
+
+    /**
+     * 絕對 https 連結；其餘一律拒絕為空字串。
+     *
+     * @param mixed $value 原始值。
+     * @return string
+     */
+    private static function normalize_https_url( $value ): string {
+        if ( ! is_string( $value ) || '' === $value || strlen( $value ) > 2048 ) {
+            return '';
+        }
+        $parts  = parse_url( $value );
+        $scheme = is_array( $parts ) && is_string( $parts['scheme'] ?? null ) ? strtolower( $parts['scheme'] ) : '';
+        $host   = is_array( $parts ) && is_string( $parts['host'] ?? null ) ? $parts['host'] : '';
+
+        return ( 'https' === $scheme && '' !== $host ) ? $value : '';
+    }
+
+    /**
+     * 外掛 row 正規化。回傳一定是 list，且每列欄位型別固定。
+     *
+     * @param mixed $rows 原始 rows。
+     * @return array<int,array<string,mixed>>
+     */
+    private static function normalize_plugin_rows( $rows ): array {
+        if ( ! is_array( $rows ) ) {
+            return array();
+        }
+
+        $normalized = array();
+        foreach ( $rows as $row ) {
+            if ( ! is_array( $row ) ) {
+                continue; // 非陣列 row 無法描述一個外掛。
+            }
+            // 身分用 '' !== trim() 判斷，不用 empty()：slug '0' 是合法識別字。
+            $slug = self::normalize_string( $row['slug'] ?? null );
+            if ( '' === trim( $slug ) ) {
+                continue;
+            }
+
+            $normalized[] = array(
+                'slug'             => $slug,
+                'name'             => self::normalize_string( $row['name'] ?? null, $slug ),
+                'version'          => self::normalize_string( $row['version'] ?? null ),
+                'description'      => self::normalize_string( $row['description'] ?? null ),
+                'icon'             => self::normalize_token( $row['icon'] ?? null, 'dashicons-admin-plugins' ),
+                'category'         => self::normalize_string( $row['category'] ?? null ),
+                'category_label'   => self::normalize_string( $row['category_label'] ?? null ),
+                'platform'         => self::normalize_string( $row['platform'] ?? null ),
+                'platform_label'   => self::normalize_string( $row['platform_label'] ?? null ),
+                'price_type'       => self::normalize_enum( $row['price_type'] ?? null, array( 'free', 'paid' ), 'free' ),
+                'price_amount'     => self::normalize_string( $row['price_amount'] ?? null ),
+                'external_url'     => self::normalize_https_url( $row['external_url'] ?? null ),
+                'info_url'         => self::normalize_https_url( $row['info_url'] ?? null ),
+                'status'           => self::normalize_enum( $row['status'] ?? null, array( 'active', 'installed', 'not_installed' ), 'not_installed' ),
+                'local_version'    => self::normalize_string( $row['local_version'] ?? null ),
+                'update_available' => ! empty( $row['update_available'] ),
+            );
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * 平台／分類 row 正規化。
+     *
+     * @param mixed $rows 原始 rows。
+     * @return array<int,array<string,string>>
+     */
+    private static function normalize_taxonomy_rows( $rows ): array {
+        if ( ! is_array( $rows ) ) {
+            return array();
+        }
+
+        $normalized = array();
+        foreach ( $rows as $row ) {
+            if ( ! is_array( $row ) ) {
+                continue;
+            }
+            $slug = self::normalize_string( $row['slug'] ?? null );
+            if ( '' === trim( $slug ) ) {
+                continue;
+            }
+            $normalized[] = array(
+                'slug' => $slug,
+                'name' => self::normalize_string( $row['name'] ?? null, $slug ),
+                'icon' => self::normalize_token( $row['icon'] ?? null ),
+            );
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * 公告 row 正規化；type 是封閉域，直接決定前端的 class 與圖示。
+     *
+     * @param mixed $rows 原始 rows。
+     * @return array<int,array<string,mixed>>
+     */
+    private static function normalize_announcement_rows( $rows ): array {
+        if ( ! is_array( $rows ) ) {
+            return array();
+        }
+
+        $normalized = array();
+        foreach ( $rows as $row ) {
+            if ( ! is_array( $row ) ) {
+                continue;
+            }
+            $id = $row['id'] ?? null;
+            if ( ! is_string( $id ) && ! is_int( $id ) ) {
+                continue; // 沒有可辨識的 id 就無法被關閉，等同無效公告。
+            }
+            $normalized[] = array(
+                'id'        => (string) $id,
+                'type'      => self::normalize_enum( $row['type'] ?? null, array( 'info', 'warning', 'success', 'danger' ), 'info' ),
+                'title'     => self::normalize_string( $row['title'] ?? null ),
+                'content'   => self::normalize_string( $row['content'] ?? null ),
+                'is_pinned' => ! empty( $row['is_pinned'] ),
+            );
+        }
+
+        return $normalized;
     }
 
     /**
@@ -231,14 +390,21 @@ final class YSHubAjaxHandler {
         // 驗證 auto_check 值
         $auto_check = in_array( $auto_check, array( 'yes', 'no' ), true ) ? $auto_check : 'no';
 
-        $repo = YSHubClientSettingsRepo::instance();
-        $repo->set_many( array(
+        $repo   = YSHubClientSettingsRepo::instance();
+        $stored = $repo->set_many( array(
             'ys_hub_site_key'   => $site_key,
             'ys_hub_auto_check' => $auto_check,
         ) );
 
         // 重置 ApiClient 單例（site_key 可能已變更）
         YSHubApiClient::reset_instance();
+
+        // 寫入未落地就回報成功，會讓管理者以為設定已生效。必須 fail closed。
+        if ( true !== $stored ) {
+            wp_send_json_error( array(
+                'message' => __( '設定未能寫入資料表，請確認 Hub 資料表已建立後再試一次', 'ys-plugin-hub-client' ),
+            ) );
+        }
 
         wp_send_json_success( array(
             'message' => __( '設定已儲存', 'ys-plugin-hub-client' ),
@@ -296,18 +462,25 @@ final class YSHubAjaxHandler {
         }
 
         $site_key = $response['site_key'] ?? '';
-        if ( empty( $site_key ) ) {
+        if ( ! is_string( $site_key ) || empty( $site_key ) ) {
             wp_send_json_error( array(
                 'message' => __( 'Hub 未回傳 Site Key', 'ys-plugin-hub-client' ),
             ) );
         }
 
         // 儲存到自訂資料表
-        $repo = YSHubClientSettingsRepo::instance();
-        $repo->set( 'ys_hub_site_key', $site_key );
+        $repo   = YSHubClientSettingsRepo::instance();
+        $stored = $repo->set( 'ys_hub_site_key', $site_key );
 
         // 重置 ApiClient 單例
         YSHubApiClient::reset_instance();
+
+        // 未落地的 Site Key 不得回傳：否則畫面顯示的金鑰與實際生效的不一致。
+        if ( true !== $stored ) {
+            wp_send_json_error( array(
+                'message' => __( 'Site Key 未能寫入資料表，請確認 Hub 資料表已建立後再試一次', 'ys-plugin-hub-client' ),
+            ) );
+        }
 
         wp_send_json_success( array(
             'message'  => __( 'Site Key 已產生並儲存', 'ys-plugin-hub-client' ),
@@ -341,41 +514,26 @@ final class YSHubAjaxHandler {
             ) );
         }
 
-        $plugins = $response['plugins'] ?? $response;
-        $platforms = array();
-        if ( isset( $response['platforms'] ) && is_array( $response['platforms'] ) ) {
-            $platforms = $response['platforms'];
-        }
+        // 取得分類與公告列表
+        $cat_response = $api->get( YSEndpointRegistry::CATEGORIES );
+        $ann_response = $api->get( YSEndpointRegistry::ANNOUNCEMENTS );
 
-        // 取得分類列表
-        $categories      = array();
-        $cat_response    = $api->get( YSEndpointRegistry::CATEGORIES );
-        if ( ! is_wp_error( $cat_response ) && isset( $cat_response['categories'] ) ) {
-            $categories = $cat_response['categories'];
-        }
+        // 與 handle_get_marketplace 走同一條 ingress，兩條路徑不得對「合法回應」有不同定義。
+        $payload = self::normalize_marketplace_payload( array(
+            'plugins'       => ( isset( $response['plugins'] ) && is_array( $response['plugins'] ) ) ? $response['plugins'] : $response,
+            'platforms'     => $response['platforms'] ?? null,
+            'categories'    => is_array( $cat_response ) ? ( $cat_response['categories'] ?? null ) : null,
+            'announcements' => is_array( $ann_response ) ? ( $ann_response['announcements'] ?? null ) : null,
+        ) );
 
-        // 取得公告列表
-        $announcements   = array();
-        $ann_response    = $api->get( YSEndpointRegistry::ANNOUNCEMENTS );
-        if ( ! is_wp_error( $ann_response ) && isset( $ann_response['announcements'] ) ) {
-            $announcements = $ann_response['announcements'];
-        }
+        set_site_transient( 'ys_hub_marketplace_data', $payload, 6 * HOUR_IN_SECONDS );
 
-        if ( is_array( $plugins ) ) {
-            set_site_transient( 'ys_hub_marketplace_data', array(
-                'plugins'       => $plugins,
-                'platforms'     => $platforms,
-                'categories'    => $categories,
-                'announcements' => $announcements,
-            ), 6 * HOUR_IN_SECONDS );
-        }
-
-        wp_send_json_success( array(
-            'plugins'       => self::merge_local_status( $plugins ),
-            'platforms'     => $platforms,
-            'categories'    => $categories,
-            'announcements' => $announcements,
-            'message'       => __( '市集資料已刷新', 'ys-plugin-hub-client' ),
+        wp_send_json_success( array_merge(
+            $payload,
+            array(
+                'plugins' => self::merge_local_status( $payload['plugins'] ),
+                'message' => __( '市集資料已刷新', 'ys-plugin-hub-client' ),
+            )
         ) );
     }
 
@@ -594,36 +752,42 @@ final class YSHubAjaxHandler {
 
         foreach ( $all_plugins as $file => $data ) {
             if ( dirname( $file ) === $slug ) {
-                $local_version = $data['Version'] ?? '0.0.0';
-                $is_active     = in_array( $file, $active_plugins, true );
-                $plugin_name   = $data['Name'] ?? $slug;
+                $local_version = self::normalize_string( is_array( $data ) ? ( $data['Version'] ?? null ) : null, '0.0.0' );
+                $is_active     = is_array( $active_plugins ) && in_array( $file, $active_plugins, true );
+                $plugin_name   = self::normalize_string( is_array( $data ) ? ( $data['Name'] ?? null ) : null, $slug );
                 break;
             }
         }
 
-        // 從 Hub 快取取得遠端版本（如果有的話）
+        // 從 Hub 快取取得遠端版本（如果有的話）。快取內容一律先正規化，因為這裡的
+        // 回應會直接被前端當成一張卡片重繪。
         $remote_version = $version;
-        $cached = get_site_transient( 'ys_hub_marketplace_data' );
-        if ( is_array( $cached ) && isset( $cached['plugins'] ) ) {
-            foreach ( $cached['plugins'] as $p ) {
-                if ( ( $p['slug'] ?? '' ) === $slug ) {
-                    if ( empty( $remote_version ) ) {
-                        $remote_version = $p['version'] ?? '';
-                    }
-                    // 合併遠端資料
-                    return array_merge( $p, array(
-                        'status'           => $is_active ? 'active' : 'installed',
-                        'local_version'    => $local_version,
-                        'update_available' => version_compare( $p['version'] ?? '0', $local_version, '>' ),
-                    ) );
-                }
+        $cached         = get_site_transient( 'ys_hub_marketplace_data' );
+        $cached_rows    = is_array( $cached ) ? self::normalize_plugin_rows( $cached['plugins'] ?? null ) : array();
+
+        foreach ( $cached_rows as $row ) {
+            if ( $row['slug'] !== $slug ) {
+                continue;
             }
+            if ( '' === $remote_version ) {
+                $remote_version = $row['version'];
+            }
+
+            // 只投射正規化後的已知欄位，不把整列未驗證的遠端資料合併進回應。
+            return array_merge(
+                $row,
+                array(
+                    'status'           => $is_active ? 'active' : 'installed',
+                    'local_version'    => $local_version,
+                    'update_available' => version_compare( $row['version'], $local_version, '>' ),
+                )
+            );
         }
 
         return array(
             'slug'             => $slug,
             'name'             => $plugin_name,
-            'version'          => $remote_version ?: $local_version,
+            'version'          => '' !== $remote_version ? $remote_version : $local_version,
             'status'           => $is_active ? 'active' : 'installed',
             'local_version'    => $local_version,
             'update_available' => false,
@@ -648,26 +812,24 @@ final class YSHubAjaxHandler {
             }
             $local_map[ $slug ] = array(
                 'file'    => $file,
-                'version' => $data['Version'] ?? '0.0.0',
-                'active'  => in_array( $file, $active_plugins, true ),
+                'version' => self::normalize_string( $data['Version'] ?? null, '0.0.0' ),
+                'active'  => is_array( $active_plugins ) && in_array( $file, $active_plugins, true ),
             );
         }
 
+        // 先正規化再合併：這個方法也可能拿到快取中的舊形狀，rows 未經證明時
+        // 一個非字串 slug 會讓 isset() 丟 TypeError，非字串 version 會讓
+        // version_compare() 丟 TypeError，而數值 version 會被靜默強轉。
+        $plugins = self::normalize_plugin_rows( $plugins );
+
         foreach ( $plugins as &$plugin ) {
-            $slug = $plugin['slug'] ?? '';
-            if ( empty( $slug ) ) {
-                continue;
-            }
+            $slug = $plugin['slug'];
 
             if ( isset( $local_map[ $slug ] ) ) {
-                $local                    = $local_map[ $slug ];
-                $plugin['status']         = $local['active'] ? 'active' : 'installed';
-                $plugin['local_version']  = $local['version'];
-                $plugin['update_available'] = version_compare(
-                    $plugin['version'] ?? '0',
-                    $local['version'],
-                    '>'
-                );
+                $local                      = $local_map[ $slug ];
+                $plugin['status']           = $local['active'] ? 'active' : 'installed';
+                $plugin['local_version']    = $local['version'];
+                $plugin['update_available'] = version_compare( $plugin['version'], $local['version'], '>' );
             } else {
                 $plugin['status']           = 'not_installed';
                 $plugin['local_version']    = '';

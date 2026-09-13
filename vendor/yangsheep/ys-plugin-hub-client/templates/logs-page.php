@@ -272,6 +272,10 @@ $ys_plugins = \YangSheep\PluginHubClient\YSPluginHubClient::detect_ys_plugins();
 
 <script>
 jQuery(function($){
+	var logConfig = <?php echo wp_json_encode( array(
+		'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+		'nonce'   => wp_create_nonce( 'ys_hub_marketplace_nonce' ),
+	) ); ?>;
 	$('#ys-log-filter-btn').on('click', function(){
 		var level = $('#ys-log-level-filter').val();
 		var action = $('#ys-log-action-filter').val();
@@ -284,9 +288,9 @@ jQuery(function($){
 		if(!confirm('<?php echo esc_js( __( '確定要清除所有日誌？', 'ys-plugin-hub-client' ) ); ?>')) return;
 		var btn = $(this);
 		btn.prop('disabled', true);
-		$.post(ysHubClient.ajaxUrl, {
+		$.post(logConfig.ajaxUrl, {
 			action: 'ys_hub_client_clear_logs',
-			nonce: ysHubClient.nonce
+			nonce: logConfig.nonce
 		}, function(r){ if(r.success) window.location.reload(); }).always(function(){ btn.prop('disabled', false); });
 	});
 });

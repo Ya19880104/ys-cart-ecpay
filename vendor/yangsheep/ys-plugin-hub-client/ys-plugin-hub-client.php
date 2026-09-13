@@ -3,13 +3,13 @@
  * Plugin Name: YS Plugin Hub Client
  * Plugin URI:  https://yangsheep.com.tw
  * Description: YANGSHEEP DESIGN 外掛市集客戶端 — 連接 Hub 取得更新和市集資訊。
- * Version:     2.0.2
+ * Version:     2.0.6
  * Author:      YANGSHEEP DESIGN
  * Author URI:  https://yangsheep.com.tw
  * License:     GPL-2.0-or-later
  * Text Domain: ys-plugin-hub-client
  * Domain Path: /languages
- * Requires PHP: 7.4
+ * Requires PHP: 8.2
  * Requires at least: 5.8
  *
  * @package YangSheep\PluginHubClient
@@ -17,6 +17,22 @@
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
+}
+
+/*
+ * This compatibility layer must run even when an older vendored client loaded
+ * first. It only normalizes the shared WordPress admin menu; it does not boot a
+ * second updater client.
+ */
+$ys_hub_client_menu_normalizer = __DIR__ . '/src/Admin/YSToolboxMenuNormalizer.php';
+if (
+    ! class_exists( '\YangSheep\PluginHubClient\Admin\YSToolboxMenuNormalizer', false )
+    && file_exists( $ys_hub_client_menu_normalizer )
+) {
+    require_once $ys_hub_client_menu_normalizer;
+}
+if ( class_exists( '\YangSheep\PluginHubClient\Admin\YSToolboxMenuNormalizer', false ) ) {
+    \YangSheep\PluginHubClient\Admin\YSToolboxMenuNormalizer::register();
 }
 
 /* ──────────────────────────────────────────────
@@ -30,7 +46,7 @@ if ( defined( 'YS_HUB_CLIENT_VERSION' ) || did_action( 'ys_hub_client_loaded' ) 
 /* ──────────────────────────────────────────────
  * 常數定義（放在防重複之後，確保只定義一次）
  * ────────────────────────────────────────────── */
-define( 'YS_HUB_CLIENT_VERSION', '2.0.2' );
+define( 'YS_HUB_CLIENT_VERSION', '2.0.6' );
 define( 'YS_HUB_CLIENT_FILE', __FILE__ );
 define( 'YS_HUB_CLIENT_DIR', plugin_dir_path( __FILE__ ) );
 define( 'YS_HUB_CLIENT_URL', plugin_dir_url( __FILE__ ) );

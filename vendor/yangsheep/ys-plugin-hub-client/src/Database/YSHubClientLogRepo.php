@@ -18,6 +18,10 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class YSHubClientLogRepo {
 
+    private const REDACTED = '[REDACTED]';
+
+    private const MAX_REDACTION_DEPTH = 8;
+
     /**
      * 單例實例
      *
@@ -81,14 +85,19 @@ final class YSHubClientLogRepo {
         }
 
         global $wpdb;
+        $safe_message = self::redact_text( $message );
+        $safe_context = self::redact_value( $context, null, 0 );
+        if ( ! is_array( $safe_context ) ) {
+            $safe_context = array();
+        }
         // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
         $wpdb->insert(
             $instance->table(),
             array(
                 'level'      => sanitize_key( $level ),
                 'action'     => sanitize_text_field( $action ),
-                'message'    => sanitize_text_field( $message ),
-                'context'    => ! empty( $context ) ? wp_json_encode( $context ) : null,
+                'message'    => sanitize_text_field( $safe_message ),
+                'context'    => ! empty( $safe_context ) ? wp_json_encode( $safe_context ) : null,
                 'created_at' => current_time( 'mysql' ),
             ),
             array( '%s', '%s', '%s', '%s', '%s' )
@@ -96,6 +105,106 @@ final class YSHubClientLogRepo {
 
         // 自動清理超過 30 天的日誌
         self::auto_cleanup();
+    }
+
+    /**
+     * Redact credentials from nested context values before persistence.
+     *
+     * @param mixed       $value Current value.
+     * @param string|null $key   Parent key, when present.
+     * @param int         $depth Current recursion depth.
+     * @return mixed
+     */
+    private static function redact_value( $value, ?string $key, int $depth ) {
+        if ( null !== $key && self::is_sensitive_key( $key ) ) {
+            return self::REDACTED;
+        }
+        if ( $depth > self::MAX_REDACTION_DEPTH ) {
+            return self::REDACTED;
+        }
+        if ( is_array( $value ) ) {
+            $safe = array();
+            foreach ( $value as $item_key => $item_value ) {
+                $safe[ $item_key ] = self::redact_value( $item_value, (string) $item_key, $depth + 1 );
+            }
+            return $safe;
+        }
+        if ( is_string( $value ) ) {
+            return self::redact_text( $value );
+        }
+        if ( is_object( $value ) || is_resource( $value ) ) {
+            return self::REDACTED;
+        }
+        return $value;
+    }
+
+    /**
+     * Redact sensitive query parameters in every HTTP(S) URL in a string.
+     */
+    private static function redact_text( string $value ): string {
+        $safe = preg_replace_callback(
+            '~https?://[^\s<>"\'\)\]\}\x{FF09}]+~iu',
+            static fn ( array $match ): string => self::redact_url( $match[0] ),
+            $value
+        );
+        return is_string( $safe ) ? $safe : self::REDACTED;
+    }
+
+    /**
+     * Preserve URL shape while redacting all sensitive query values.
+     */
+    private static function redact_url( string $url ): string {
+        $question = strpos( $url, '?' );
+        if ( false === $question ) {
+            return $url;
+        }
+
+        $prefix    = substr( $url, 0, $question + 1 );
+        $remainder = substr( $url, $question + 1 );
+        $fragment  = '';
+        $hash      = strpos( $remainder, '#' );
+        if ( false !== $hash ) {
+            $fragment  = substr( $remainder, $hash );
+            $remainder = substr( $remainder, 0, $hash );
+        }
+
+        $pairs = explode( '&', $remainder );
+        foreach ( $pairs as &$pair ) {
+            $separator = strpos( $pair, '=' );
+            $raw_key   = false === $separator ? $pair : substr( $pair, 0, $separator );
+            if ( self::is_sensitive_key( $raw_key ) ) {
+                $pair = $raw_key . '=' . rawurlencode( self::REDACTED );
+            }
+        }
+        unset( $pair );
+
+        return $prefix . implode( '&', $pairs ) . $fragment;
+    }
+
+    private static function is_sensitive_key( string $key ): bool {
+        $segments = preg_split( '/[\[\]]+/', urldecode( $key ), -1, PREG_SPLIT_NO_EMPTY );
+        if ( ! is_array( $segments ) || empty( $segments ) ) {
+            $segments = array( $key );
+        }
+        $sensitive = array(
+            'site_key',
+            'x_site_key',
+            'authorization',
+            'api_key',
+            'access_token',
+            'refresh_token',
+            'token',
+            'license_key',
+            'secret',
+            'password',
+        );
+        foreach ( $segments as $segment ) {
+            $normalized = strtolower( trim( preg_replace( '/[-\s]+/', '_', $segment ) ?? '' ) );
+            if ( in_array( $normalized, $sensitive, true ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

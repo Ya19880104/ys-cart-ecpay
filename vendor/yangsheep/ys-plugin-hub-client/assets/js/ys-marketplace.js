@@ -42,33 +42,74 @@
             this.loadPlugins();
         },
 
+        /**
+         * 字串欄位：非字串一律退回預設值（拒絕該值，不做型別強轉）。
+         */
+        safeString: function (value, fallback) {
+            return typeof value === 'string' ? value : (fallback || '');
+        },
+
+        /**
+         * class token 只接受允許字元集。HTML escaping 不是 token 的正確約束：
+         * 它不處理空白，遠端值就能夾帶額外的 class。
+         */
+        safeClassToken: function (raw, fallback) {
+            return (typeof raw === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(raw)) ? raw : (fallback || '');
+        },
+
+        /**
+         * 封閉域：不在允許集合內一律退回預設值。
+         */
+        safeEnum: function (value, allowed, fallback) {
+            return (typeof value === 'string' && allowed.indexOf(value) !== -1) ? value : fallback;
+        },
+
+        /**
+         * 以精確屬性值標記／移除節點，永遠不把資料內插進選擇器。
+         *
+         * 讀寫兩側必須用同一個表示法：寫入端經 HTML 解析後屬性存的是「解碼後」的值，
+         * 而選擇器不做 HTML 解碼，因此把 HTML 逃逸字串放進選擇器會少一次解碼而永不相符；
+         * 逃逸也不涵蓋 CSS 元字元，反斜線或換行會讓 jQuery 直接丟出語法錯誤。
+         */
+        attrFilter: function ($scope, selector, attribute, value) {
+            var needle = String(value);
+            return $scope.find(selector).filter(function () {
+                return this.getAttribute(attribute) === needle;
+            });
+        },
+
         normalizePlatforms: function (platforms, plugins) {
+            var self = this;
             var defaults = [
                 {slug: 'ys-cart', name: 'YS CART'},
                 {slug: 'woocommerce', name: 'WooCommerce'},
                 {slug: 'wordpress', name: 'WordPress'}
             ];
-            var source = Array.isArray(platforms) && platforms.length ? platforms : defaults;
-            var seen = {};
+            var declared = Array.isArray(platforms) ? platforms : [];
+            var source = declared.length ? declared : defaults;
+            // 以無原型物件作為 seen：一般 {} 會讓 'constructor' 這類鍵看起來已存在
+            // （於是被靜默丟棄），而 '__proto__' 則永遠寫不進去（於是重複渲染）。
+            var seen = Object.create(null);
             var result = [];
 
             $.each(source, function (i, platform) {
-                var slug = platform.slug || '';
+                if (!platform || typeof platform !== 'object') return;
+                var slug = self.safeString(platform.slug);
                 if (!slug || seen[slug]) return;
                 seen[slug] = true;
                 result.push({
                     slug: slug,
-                    name: platform.name || slug
+                    name: self.safeString(platform.name, slug)
                 });
             });
 
-            $.each(plugins || [], function (i, plugin) {
+            $.each(Array.isArray(plugins) ? plugins : [], function (i, plugin) {
                 var slug = Marketplace.getPluginPlatform(plugin);
                 if (!slug || seen[slug]) return;
                 seen[slug] = true;
                 result.push({
                     slug: slug,
-                    name: plugin.platform_label || slug
+                    name: self.safeString(plugin && plugin.platform_label, slug)
                 });
             });
 
@@ -76,36 +117,42 @@
         },
 
         getPluginPlatform: function (plugin) {
-            if (plugin.platform) return plugin.platform;
+            if (!plugin || typeof plugin !== 'object') return '';
+            var platform = this.safeString(plugin.platform);
+            if (platform) return platform;
             if (plugin.slug === 'ys-cart') return 'ys-cart';
             if (plugin.category === 'payment' || plugin.category === 'shipping' || plugin.category === 'checkout' || plugin.category === 'cart') {
                 return 'woocommerce';
             }
-            if ((plugin.name || '').toLowerCase().indexOf('woocommerce') !== -1) return 'woocommerce';
+            if (this.safeString(plugin.name).toLowerCase().indexOf('woocommerce') !== -1) return 'woocommerce';
             return 'wordpress';
         },
 
         findCategoryLabel: function (category) {
-            if (!category) return '';
+            var slug = this.safeString(category);
+            if (!slug) return '';
             for (var i = 0; i < this.categoriesData.length; i++) {
-                if (this.categoriesData[i].slug === category) {
-                    return this.categoriesData[i].name || category;
+                var row = this.categoriesData[i];
+                if (row && typeof row === 'object' && row.slug === slug) {
+                    return this.safeString(row.name, slug);
                 }
             }
-            return category;
+            return slug;
         },
 
         findPlatformLabel: function (platform) {
-            if (!platform) return '';
+            var slug = this.safeString(platform);
+            if (!slug) return '';
             for (var i = 0; i < this.platformsData.length; i++) {
-                if (this.platformsData[i].slug === platform) {
-                    return this.platformsData[i].name || platform;
+                var row = this.platformsData[i];
+                if (row && typeof row === 'object' && row.slug === slug) {
+                    return this.safeString(row.name, slug);
                 }
             }
-            if (platform === 'ys-cart') return 'YS CART';
-            if (platform === 'woocommerce') return 'WooCommerce';
-            if (platform === 'wordpress') return 'WordPress';
-            return platform;
+            if (slug === 'ys-cart') return 'YS CART';
+            if (slug === 'woocommerce') return 'WooCommerce';
+            if (slug === 'wordpress') return 'WordPress';
+            return slug;
         },
 
         renderPlatformTabs: function () {
@@ -113,16 +160,20 @@
             var $tabs = $('#ys-platform-tabs');
             if (!$tabs.length) return;
 
-            $tabs.find('.ys-platform-tab[data-platform!="all"]').remove();
+            $tabs.find('.ys-platform-tab').filter(function () {
+                return this.getAttribute('data-platform') !== 'all';
+            }).remove();
 
             $.each(self.platformsData, function (i, platform) {
-                var $tab = $('<button type="button" class="ys-filter-tab ys-platform-tab" data-platform="' + self.escAttr(platform.slug) + '">' +
-                    self.escHtml(platform.name) + '</button>');
-                $tabs.append($tab);
+                $tabs.append(self.renderDescriptor(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-filter-tab ys-platform-tab',
+                    'data-platform': platform.slug
+                }, platform.name)));
             });
 
             $tabs.find('.ys-platform-tab').removeClass('active');
-            $tabs.find('.ys-platform-tab[data-platform="' + self.escAttr(self.currentPlatform) + '"]').addClass('active');
+            self.attrFilter($tabs, '.ys-platform-tab', 'data-platform', self.currentPlatform).addClass('active');
         },
 
         /**
@@ -133,7 +184,7 @@
 
             $(document).on('click', '.ys-platform-tab', function (e) {
                 e.preventDefault();
-                self.currentPlatform = $(this).data('platform') || 'all';
+                self.currentPlatform = $(this).attr('data-platform') || 'all';
                 self.currentCategory = 'all';
                 $('.ys-platform-tab').removeClass('active');
                 $(this).addClass('active');
@@ -144,7 +195,7 @@
             // 分類篩選
             $(document).on('click', '.ys-filter-tab:not(.ys-platform-tab)', function (e) {
                 e.preventDefault();
-                var category = $(this).data('category');
+                var category = $(this).attr('data-category') || 'all';
                 self.currentCategory = category;
                 $('.ys-filter-tabs .ys-filter-tab').removeClass('active');
                 $(this).addClass('active');
@@ -157,13 +208,22 @@
                 self.renderPlugins();
             });
 
+            // 外部連結（付費外掛）：不使用行內事件處理器，點擊時再次套用封閉政策
+            $(document).on('click', '.ys-external-btn', function (e) {
+                e.preventDefault();
+                var url = self.safeExternalUrl($(this).attr('data-external-url'));
+                if (url) {
+                    window.open(url, '_blank', 'noopener');
+                }
+            });
+
             // 安裝外掛
             $(document).on('click', '.ys-install-btn', function (e) {
                 e.preventDefault();
                 if (!confirm(i18n.confirmInstall)) return;
                 var btn = $(this);
-                var slug = btn.data('slug');
-                var version = btn.data('version');
+                var slug = btn.attr('data-slug') || '';
+                var version = btn.attr('data-version') || '';
                 self.installPlugin(btn, slug, version);
             });
 
@@ -172,8 +232,8 @@
                 e.preventDefault();
                 if (!confirm(i18n.confirmUpdate)) return;
                 var btn = $(this);
-                var slug = btn.data('slug');
-                var version = btn.data('version');
+                var slug = btn.attr('data-slug') || '';
+                var version = btn.attr('data-version') || '';
                 self.updatePlugin(btn, slug, version);
             });
 
@@ -181,7 +241,7 @@
             $(document).on('click', '.ys-activate-btn', function (e) {
                 e.preventDefault();
                 var btn = $(this);
-                var slug = btn.data('slug');
+                var slug = btn.attr('data-slug') || '';
                 self.activatePlugin(btn, slug);
             });
 
@@ -189,7 +249,7 @@
             $(document).on('click', '.ys-deactivate-btn', function (e) {
                 e.preventDefault();
                 var btn = $(this);
-                var slug = btn.data('slug');
+                var slug = btn.attr('data-slug') || '';
                 self.deactivatePlugin(btn, slug);
             });
 
@@ -197,7 +257,7 @@
             $(document).on('click', '.ys-delete-btn', function (e) {
                 e.preventDefault();
                 var btn = $(this);
-                var slug = btn.data('slug');
+                var slug = btn.attr('data-slug') || '';
                 if (confirm(i18n.confirmDelete || '確定要刪除此外掛？此操作無法復原。')) {
                     self.deletePlugin(btn, slug);
                 }
@@ -229,7 +289,7 @@
             // 關閉公告
             $(document).on('click', '.ys-announcement-close', function () {
                 var $ann = $(this).closest('.ys-announcement');
-                var id = $ann.data('id');
+                var id = $ann.attr('data-id') || '';
                 self.dismissAnnouncement(id);
                 $ann.slideUp(200, function () {
                     $(this).remove();
@@ -263,31 +323,19 @@
                         self.setHubStatus('ok', i18n.connected || '已連線');
 
                         // 處理兩種格式：直接陣列或 {plugins: [...]} 物件
-                        var plugins = response.data.plugins || [];
-                        if (plugins.plugins && Array.isArray(plugins.plugins)) {
-                            plugins = plugins.plugins;
-                        }
-                        if (!Array.isArray(plugins)) {
-                            plugins = [];
-                        }
+                        var plugins = self.normalizePlugins(response.data.plugins);
                         self.pluginsData = plugins;
 
-                        self.platformsData = self.normalizePlatforms(response.data.platforms || [], plugins);
+                        self.platformsData = self.normalizePlatforms(self.normalizeTaxonomy(response.data.platforms), plugins);
                         self.renderPlatformTabs();
 
                         // 處理分類資料
-                        var categories = response.data.categories || [];
-                        if (Array.isArray(categories)) {
-                            self.categoriesData = categories;
-                            self.renderCategoryTabs();
-                        }
+                        self.categoriesData = self.normalizeTaxonomy(response.data.categories);
+                        self.renderCategoryTabs();
 
                         // 處理公告資料
-                        var announcements = response.data.announcements || [];
-                        if (Array.isArray(announcements)) {
-                            self.announcementsData = announcements;
-                            self.renderAnnouncements();
-                        }
+                        self.announcementsData = self.normalizeAnnouncements(response.data.announcements);
+                        self.renderAnnouncements();
 
                         self.renderPlugins();
                     } else {
@@ -328,11 +376,14 @@
          * @param {string} text    狀態文字
          */
         setHubStatus: function (status, text) {
+            // 封閉狀態集合同時決定要移除與要加入的 token，兩者不會各自漂移。
+            var STATES = ['checking', 'ok', 'error', 'breaker'];
+            var state = this.safeEnum(status, STATES, 'error');
             var $el = $('#ys-hub-status');
-            $el.removeClass('ys-hub-status-checking ys-hub-status-ok ys-hub-status-error ys-hub-status-breaker')
-               .addClass('ys-hub-status-' + status);
-            $el.find('.ys-hub-status-text').text(text);
-            $el.attr('title', text);
+            $el.removeClass($.map(STATES, function (s) { return 'ys-hub-status-' + s; }).join(' '))
+               .addClass('ys-hub-status-' + state);
+            $el.find('.ys-hub-status-text').text(this.safeString(text));
+            $el.attr('title', this.safeString(text));
         },
 
         /**
@@ -396,7 +447,7 @@
          */
         filterPlugins: function () {
             var self = this;
-            var result = self.pluginsData;
+            var result = Array.isArray(self.pluginsData) ? self.pluginsData : [];
 
             if (self.currentPlatform !== 'all') {
                 result = $.grep(result, function (p) {
@@ -407,7 +458,7 @@
             // 分類篩選
             if (self.currentCategory !== 'all') {
                 result = $.grep(result, function (p) {
-                    return p.category === self.currentCategory;
+                    return !!p && typeof p === 'object' && p.category === self.currentCategory;
                 });
             }
 
@@ -415,9 +466,12 @@
             if (self.searchKeyword) {
                 var kw = self.searchKeyword;
                 result = $.grep(result, function (p) {
-                    var name = (p.name || '').toLowerCase();
-                    var desc = (p.description || '').toLowerCase();
-                    var slug = (p.slug || '').toLowerCase();
+                    if (!p || typeof p !== 'object') return false;
+                    // `(p.name || '')` 只擋得住 falsy 值：非字串的真值會讓
+                    // toLowerCase() 直接丟 TypeError，一列壞資料就毀掉整個搜尋。
+                    var name = self.safeString(p.name).toLowerCase();
+                    var desc = self.safeString(p.description).toLowerCase();
+                    var slug = self.safeString(p.slug).toLowerCase();
                     return name.indexOf(kw) !== -1
                         || desc.indexOf(kw) !== -1
                         || slug.indexOf(kw) !== -1;
@@ -428,128 +482,323 @@
         },
 
         /**
-         * 建構外掛卡片 HTML
+         * 外掛列表 ingress：非陣列、非物件列、無 slug 的列一律安全丟棄。
+         *
+         * 前端與 PHP 端各自正規化是刻意的縱深防禦：快取或第三方過濾器都可能讓
+         * 未正規化的資料抵達瀏覽器。
          */
-        buildCard: function (plugin) {
-            var slug = this.escAttr(plugin.slug || '');
-            var name = this.escHtml(plugin.name || slug);
-            var version = this.escHtml(plugin.version || '');
-            var description = this.escHtml(plugin.description || '');
-            var icon = plugin.icon || 'dashicons-admin-plugins';
-            var status = plugin.status || plugin.local_status || 'not_installed';
-            var localVersion = plugin.local_version || '';
-            var priceType = plugin.price_type || 'free';
-            var priceAmount = plugin.price_amount || '';
-            var externalUrl = plugin.external_url || '';
-            var infoUrl = plugin.info_url || '';
-            var platformSlug = this.getPluginPlatform(plugin);
-            var platformLabel = plugin.platform_label || this.findPlatformLabel(platformSlug);
-            var categoryLabel = plugin.category_label || this.findCategoryLabel(plugin.category || '');
+        normalizePlugins: function (plugins) {
+            var self = this;
+            var source = plugins;
+            if (source && typeof source === 'object' && !Array.isArray(source) && Array.isArray(source.plugins)) {
+                source = source.plugins;
+            }
+            if (!Array.isArray(source)) return [];
 
-            // 價格徽章
-            var priceBadgeHtml = '';
-            if (priceType === 'paid') {
-                priceBadgeHtml = '<span class="ys-price-badge-paid">' +
-                    this.escHtml(priceAmount || '付費') + '</span>';
-            } else {
-                priceBadgeHtml = '<span class="ys-price-badge-free">' +
-                    this.escHtml(i18n.free || '免費') + '</span>';
+            return $.grep($.map(source, function (row) {
+                if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+                if (!self.safeString(row.slug)) return null;
+                return row;
+            }), function (row) {
+                return row !== null;
+            });
+        },
+
+        /** 分類／平台 ingress：只保留具字串 slug 的物件列。 */
+        normalizeTaxonomy: function (rows) {
+            var self = this;
+            if (!Array.isArray(rows)) return [];
+            return $.grep($.map(rows, function (row) {
+                if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+                var slug = self.safeString(row.slug);
+                if (!slug) return null;
+                return {slug: slug, name: self.safeString(row.name, slug), icon: self.safeClassToken(row.icon, '')};
+            }), function (row) {
+                return row !== null;
+            });
+        },
+
+        /** 公告 ingress：只保留具可辨識 id 的物件列。 */
+        normalizeAnnouncements: function (rows) {
+            var self = this;
+            if (!Array.isArray(rows)) return [];
+            return $.grep($.map(rows, function (row) {
+                if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+                if (!self.announcementId(row)) return null;
+                return row;
+            }), function (row) {
+                return row !== null;
+            });
+        },
+
+        /**
+         * 外部連結政策（封閉式）
+         *
+         * 只接受絕對 https: 連結；其餘（http:、相對路徑、其他 scheme、非字串、
+         * 空值）一律拒絕並回傳空字串，呼叫端據此決定不渲染該連結。
+         *
+         * @param {*} raw Hub 提供的原始連結
+         * @return {string} 通過政策的連結，否則空字串
+         */
+        safeExternalUrl: function (raw) {
+            if (typeof raw !== 'string' || raw === '') {
+                return '';
             }
 
-            // 狀態徽章 + 操作按鈕
-            var badgeHtml = '';
-            var actionHtml = '';
+            var parsed;
+            try {
+                parsed = new URL(raw);
+            } catch (e) {
+                return '';
+            }
+
+            return parsed.protocol === 'https:' ? parsed.href : '';
+        },
+
+        /**
+         * dashicons class 只接受單一 token，避免 Hub 值污染 class 屬性
+         *
+         * @param {*}      raw      Hub 提供的圖示名稱
+         * @param {string} fallback 不合法時採用的預設圖示
+         * @return {string}
+         */
+        safeIconClass: function (raw, fallback) {
+            return (typeof raw === 'string' && /^[A-Za-z0-9_-]+$/.test(raw)) ? raw : fallback;
+        },
+
+        /**
+         * 建立節點描述
+         *
+         * 描述是純資料：文字放 `text`、屬性放 `attrs`，永遠不含 HTML 字串。
+         * 因此遠端值不會經過任何字串拼接進入可執行內容。
+         *
+         * @param {string}                 tag      標籤名稱
+         * @param {Object}                 attrs    屬性（原始值，渲染時以 setAttribute 套用）
+         * @param {string|Array|undefined} children 文字內容或子節點描述陣列
+         * @return {Object}
+         */
+        node: function (tag, attrs, children) {
+            var descriptor = {tag: tag, attrs: attrs || {}};
+            if (typeof children === 'string') {
+                descriptor.text = children;
+            } else {
+                descriptor.children = children || [];
+            }
+            return descriptor;
+        },
+
+        /**
+         * 建構外掛卡片的結構描述（不產生 HTML 字串）
+         *
+         * @param {Object} plugin Hub 提供的外掛資料
+         * @return {Object} 卡片節點描述
+         */
+        describeCard: function (plugin) {
+            var self = this;
+            var slug = typeof plugin.slug === 'string' ? plugin.slug : '';
+            var name = (typeof plugin.name === 'string' && plugin.name !== '') ? plugin.name : slug;
+            var version = typeof plugin.version === 'string' ? plugin.version : '';
+            var description = typeof plugin.description === 'string' ? plugin.description : '';
+            var iconClass = self.safeIconClass(plugin.icon, 'dashicons-admin-plugins');
+            var status = plugin.status || plugin.local_status || 'not_installed';
+            var localVersion = typeof plugin.local_version === 'string' ? plugin.local_version : '';
+            var priceType = plugin.price_type || 'free';
+            var priceAmount = typeof plugin.price_amount === 'string' ? plugin.price_amount : '';
+            var externalUrl = self.safeExternalUrl(plugin.external_url);
+            var infoUrl = self.safeExternalUrl(plugin.info_url);
+            var platformSlug = self.getPluginPlatform(plugin);
+            var platformLabel = plugin.platform_label || self.findPlatformLabel(platformSlug);
+            var categoryLabel = plugin.category_label || self.findCategoryLabel(plugin.category || '');
+
+            // 價格徽章
+            var priceBadge = priceType === 'paid'
+                ? self.node('span', {'class': 'ys-price-badge-paid'}, String(priceAmount || '付費'))
+                : self.node('span', {'class': 'ys-price-badge-free'}, String(i18n.free || '免費'));
+
+            var badges = [];
+            var actions = [];
 
             // 付費外掛不顯示安裝/更新按鈕，改顯示「查看外掛」
             if (priceType === 'paid') {
-                badgeHtml = priceBadgeHtml;
+                badges.push(priceBadge);
                 if (externalUrl) {
-                    actionHtml = '<button type="button" class="ys-btn ys-btn-external ys-btn-sm" ' +
-                        'onclick="window.open(\'' + this.escAttr(externalUrl) + '\', \'_blank\')">' +
-                        '<span class="dashicons dashicons-external" style="font-size:14px;width:14px;height:14px;"></span> ' +
-                        this.escHtml(i18n.viewPlugin || '查看外掛') + '</button>';
+                    actions.push(self.node('button', {
+                        'type': 'button',
+                        'class': 'ys-btn ys-btn-external ys-btn-sm ys-external-btn',
+                        'data-external-url': externalUrl
+                    }, [
+                        self.node('span', {
+                            'class': 'dashicons dashicons-external',
+                            'style': 'font-size:14px;width:14px;height:14px;'
+                        }, []),
+                        self.node('span', {'class': 'ys-btn-label'}, ' ' + String(i18n.viewPlugin || '查看外掛'))
+                    ]));
                 }
             } else if (status === 'active') {
                 // 已啟用
-                badgeHtml = priceBadgeHtml +
-                    '<span class="ys-badge ys-badge-active">' + this.escHtml(i18n.active || '已啟用') + '</span>';
+                badges.push(priceBadge);
+                badges.push(self.node('span', {'class': 'ys-badge ys-badge-active'}, String(i18n.active || '已啟用')));
                 if (plugin.update_available) {
                     // 已啟用且有更新
-                    actionHtml = '<button type="button" class="ys-btn ys-btn-primary ys-btn-sm ys-update-btn" ' +
-                        'data-slug="' + slug + '" data-version="' + version + '">' +
-                        this.escHtml(i18n.update || '更新') + ' v' + version + '</button>';
+                    actions.push(self.node('button', {
+                        'type': 'button',
+                        'class': 'ys-btn ys-btn-primary ys-btn-sm ys-update-btn',
+                        'data-slug': slug,
+                        'data-version': version
+                    }, String(i18n.update || '更新') + ' v' + version));
                 } else {
                     // 已啟用無更新 → 停用按鈕
-                    actionHtml = '<button type="button" class="ys-btn ys-btn-muted ys-btn-sm ys-deactivate-btn" ' +
-                        'data-slug="' + slug + '">' +
-                        this.escHtml(i18n.deactivate || '停用') + '</button>';
+                    actions.push(self.node('button', {
+                        'type': 'button',
+                        'class': 'ys-btn ys-btn-muted ys-btn-sm ys-deactivate-btn',
+                        'data-slug': slug
+                    }, String(i18n.deactivate || '停用')));
                 }
             } else if (status === 'installed' && plugin.update_available) {
                 // 已安裝但有更新（未啟用）
-                badgeHtml = priceBadgeHtml +
-                    '<span class="ys-badge ys-badge-installed">' + this.escHtml(i18n.installed || '已安裝') + '</span>';
-                actionHtml = '<button type="button" class="ys-btn ys-btn-primary ys-btn-sm ys-update-btn" ' +
-                    'data-slug="' + slug + '" data-version="' + version + '">' +
-                    this.escHtml(i18n.update || '更新') + ' v' + version + '</button>';
+                badges.push(priceBadge);
+                badges.push(self.node('span', {'class': 'ys-badge ys-badge-installed'}, String(i18n.installed || '已安裝')));
+                actions.push(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-btn ys-btn-primary ys-btn-sm ys-update-btn',
+                    'data-slug': slug,
+                    'data-version': version
+                }, String(i18n.update || '更新') + ' v' + version));
             } else if (status === 'installed') {
                 // 已安裝未啟用 → 啟用 + 刪除按鈕
-                badgeHtml = priceBadgeHtml +
-                    '<span class="ys-badge ys-badge-installed">' + this.escHtml(i18n.installed || '已安裝') + '</span>';
-                actionHtml = '<button type="button" class="ys-btn ys-btn-success ys-btn-sm ys-activate-btn" ' +
-                    'data-slug="' + slug + '">' +
-                    (i18n.activate || '啟用') + '</button>' +
-                    ' <button type="button" class="ys-btn ys-btn-danger-text ys-btn-sm ys-delete-btn" ' +
-                    'data-slug="' + slug + '">' +
-                    this.escHtml(i18n.deletePlugin || '刪除') + '</button>';
+                badges.push(priceBadge);
+                badges.push(self.node('span', {'class': 'ys-badge ys-badge-installed'}, String(i18n.installed || '已安裝')));
+                actions.push(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-btn ys-btn-success ys-btn-sm ys-activate-btn',
+                    'data-slug': slug
+                }, String(i18n.activate || '啟用')));
+                actions.push(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-btn ys-btn-danger-text ys-btn-sm ys-delete-btn',
+                    'data-slug': slug
+                }, String(i18n.deletePlugin || '刪除')));
             } else {
                 // 未安裝
-                badgeHtml = priceBadgeHtml;
-                actionHtml = '<button type="button" class="ys-btn ys-btn-outline ys-btn-sm ys-install-btn" ' +
-                    'data-slug="' + slug + '" data-version="' + version + '">' +
-                    this.escHtml(i18n.install || '安裝') + '</button>';
+                badges.push(priceBadge);
+                actions.push(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-btn ys-btn-outline ys-btn-sm ys-install-btn',
+                    'data-slug': slug,
+                    'data-version': version
+                }, String(i18n.install || '安裝')));
             }
 
-            var versionLabel = localVersion
-                ? 'v' + this.escHtml(localVersion)
-                : 'v' + version;
+            var versionText = 'v' + (localVersion !== '' ? localVersion : version);
             var taxonomyBadges = [];
             if (platformLabel) {
                 taxonomyBadges.push(
-                    '<span class="ys-plugin-taxonomy-badge ys-plugin-platform-badge">' + this.escHtml(platformLabel) + '</span>'
+                    self.node('span', {'class': 'ys-plugin-taxonomy-badge ys-plugin-platform-badge'}, String(platformLabel))
                 );
             }
-            if (categoryLabel && (!platformLabel || categoryLabel.toLowerCase() !== platformLabel.toLowerCase())) {
+            if (categoryLabel && (!platformLabel || String(categoryLabel).toLowerCase() !== String(platformLabel).toLowerCase())) {
                 taxonomyBadges.push(
-                    '<span class="ys-plugin-taxonomy-badge ys-plugin-category-badge">' + this.escHtml(categoryLabel) + '</span>'
+                    self.node('span', {'class': 'ys-plugin-taxonomy-badge ys-plugin-category-badge'}, String(categoryLabel))
                 );
             }
-            if (taxonomyBadges.length) {
-                versionLabel = '<span class="ys-plugin-taxonomy-tags">' + taxonomyBadges.join('') + '</span>' +
-                    '<span class="ys-plugin-version-number">' + versionLabel + '</span>';
+            var versionNode = taxonomyBadges.length
+                ? self.node('span', {'class': 'ys-plugin-version'}, [
+                    self.node('span', {'class': 'ys-plugin-taxonomy-tags'}, taxonomyBadges),
+                    self.node('span', {'class': 'ys-plugin-version-number'}, versionText)
+                ])
+                : self.node('span', {'class': 'ys-plugin-version'}, versionText);
+
+            // 連結未通過封閉政策時，名稱只以純文字呈現，不輸出 href。
+            var nameNode = infoUrl
+                ? self.node('h3', {'class': 'ys-plugin-name'}, [
+                    self.node('a', {'href': infoUrl, 'target': '_blank', 'rel': 'noopener noreferrer'}, name)
+                ])
+                : self.node('h3', {'class': 'ys-plugin-name'}, name);
+
+            return self.node('div', {'class': 'ys-plugin-card', 'data-slug': slug}, [
+                self.node('div', {'class': 'ys-plugin-card-header'}, [
+                    self.node('div', {'class': 'ys-plugin-icon'}, [
+                        self.node('span', {'class': 'dashicons ' + iconClass}, [])
+                    ]),
+                    self.node('div', {'class': 'ys-plugin-meta'}, [nameNode, versionNode])
+                ]),
+                self.node('div', {'class': 'ys-plugin-description'}, description),
+                self.node('div', {'class': 'ys-plugin-card-footer'}, [
+                    self.node('div', {'class': 'ys-card-footer-left'}, badges),
+                    self.node('div', {'class': 'ys-card-footer-right'}, actions)
+                ])
+            ]);
+        },
+
+        /**
+         * 以 DOM API 渲染節點描述
+         *
+         * 文字一律走 textContent、屬性一律走 setAttribute，且封閉地拒絕任何
+         * 事件處理器屬性，因此描述內容不可能被當成腳本執行。
+         *
+         * @param {Object} descriptor 節點描述
+         * @return {Element}
+         */
+        renderDescriptor: function (descriptor) {
+            if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.tag !== 'string') {
+                throw new Error('Invalid marketplace card descriptor');
             }
 
-            return '<div class="ys-plugin-card" data-slug="' + slug + '">' +
-                '<div class="ys-plugin-card-header">' +
-                '<div class="ys-plugin-icon"><span class="dashicons ' + this.escAttr(icon) + '"></span></div>' +
-                '<div class="ys-plugin-meta">' +
-                '<h3 class="ys-plugin-name">' + (infoUrl ? '<a href="' + this.escAttr(infoUrl) + '" target="_blank" rel="noopener noreferrer">' + name + '</a>' : name) + '</h3>' +
-                '<span class="ys-plugin-version">' + versionLabel + '</span>' +
-                '</div></div>' +
-                '<div class="ys-plugin-description">' + description + '</div>' +
-                '<div class="ys-plugin-card-footer">' +
-                '<div class="ys-card-footer-left">' + badgeHtml + '</div>' +
-                '<div class="ys-card-footer-right">' + actionHtml + '</div>' +
-                '</div></div>';
+            var element = document.createElement(descriptor.tag);
+            var attrs = descriptor.attrs || {};
+
+            for (var name in attrs) {
+                if (!Object.prototype.hasOwnProperty.call(attrs, name)) {
+                    continue;
+                }
+                if (/^on/i.test(name)) {
+                    throw new Error('Event handler attributes are not renderable');
+                }
+                element.setAttribute(name, String(attrs[name]));
+            }
+
+            if (typeof descriptor.text === 'string') {
+                element.textContent = descriptor.text;
+                return element;
+            }
+
+            var children = descriptor.children || [];
+            for (var i = 0; i < children.length; i++) {
+                element.appendChild(Marketplace.renderDescriptor(children[i]));
+            }
+
+            return element;
+        },
+
+        /**
+         * 建構外掛卡片節點
+         *
+         * @param {Object} plugin Hub 提供的外掛資料
+         * @return {Element}
+         */
+        buildCard: function (plugin) {
+            return Marketplace.renderDescriptor(Marketplace.describeCard(plugin));
+        },
+
+        /**
+         * 以精確屬性值尋找卡片，避免把 slug 當成選擇器語法解析
+         *
+         * @param {string} slug 外掛 slug
+         * @return {Object} jQuery 集合
+         */
+        findCardElement: function (slug) {
+            return $('.ys-plugin-card').filter(function () {
+                return this.getAttribute('data-slug') === slug;
+            });
         },
 
         /**
          * 整張卡片重新渲染（安裝/更新/啟用後使用）
          */
         replaceCard: function (slug, pluginData) {
-            var $oldCard = $('.ys-plugin-card[data-slug="' + Marketplace.escAttr(slug) + '"]');
+            var $oldCard = Marketplace.findCardElement(slug);
             if ($oldCard.length && pluginData) {
-                var newCardHtml = Marketplace.buildCard(pluginData);
-                $oldCard.replaceWith(newCardHtml);
+                $oldCard.replaceWith(Marketplace.buildCard(pluginData));
             }
         },
 
@@ -719,7 +968,6 @@
                             return;
                         }
                         // 從市集重新載入（刪除後卡片回到「安裝」狀態）
-                        var $card = $('.ys-plugin-card[data-slug="' + Marketplace.escAttr(slug) + '"]');
                         // 更新本地資料中的狀態
                         for (var i = 0; i < Marketplace.pluginsData.length; i++) {
                             if (Marketplace.pluginsData[i].slug === slug) {
@@ -761,21 +1009,18 @@
                 success: function (response) {
                     btn.prop('disabled', false).text(origText);
                     if (response.success && response.data && response.data.plugins) {
-                        self.pluginsData = response.data.plugins;
-                        self.platformsData = self.normalizePlatforms(response.data.platforms || [], self.pluginsData);
+                        // 與 loadPlugins 走同一條 ingress：兩條路徑不得對「合法回應」有不同定義。
+                        self.pluginsData = self.normalizePlugins(response.data.plugins);
+                        self.platformsData = self.normalizePlatforms(self.normalizeTaxonomy(response.data.platforms), self.pluginsData);
                         self.renderPlatformTabs();
 
                         // 更新分類
-                        if (response.data.categories && Array.isArray(response.data.categories)) {
-                            self.categoriesData = response.data.categories;
-                            self.renderCategoryTabs();
-                        }
+                        self.categoriesData = self.normalizeTaxonomy(response.data.categories);
+                        self.renderCategoryTabs();
 
                         // 更新公告
-                        if (response.data.announcements && Array.isArray(response.data.announcements)) {
-                            self.announcementsData = response.data.announcements;
-                            self.renderAnnouncements();
-                        }
+                        self.announcementsData = self.normalizeAnnouncements(response.data.announcements);
+                        self.renderAnnouncements();
 
                         self.renderPlugins();
                         Toast.show(response.data.message || i18n.success, 'success');
@@ -839,40 +1084,63 @@
             var self = this;
             var $tabs = $('#ys-filter-tabs');
             if (!$tabs.length) return;
-            var visibleCategories = {};
+            // 兩個 map 都必須無原型：普通 {} 對 '__proto__' 的寫入是靜默 no-op（分類
+            // 從畫面上消失而無任何錯誤），對 'constructor' 的讀取會撞到繼承屬性。
+            var visibleCategories = Object.create(null);
+            var renderedCategories = Object.create(null);
             var categoryStillVisible = self.currentCategory === 'all';
 
             $.each(self.pluginsData, function (i, plugin) {
                 if (self.currentPlatform !== 'all' && self.getPluginPlatform(plugin) !== self.currentPlatform) {
                     return;
                 }
-                if (plugin.category) {
-                    visibleCategories[plugin.category] = true;
+                var category = self.safeString(plugin && plugin.category);
+                if (category) {
+                    visibleCategories[category] = true;
                 }
             });
 
             // 保留「全部」按鈕，移除其他動態 tab
-            $tabs.find('.ys-filter-tab[data-category!="all"]').remove();
+            $tabs.find('.ys-filter-tab').filter(function () {
+                return this.getAttribute('data-category') !== 'all';
+            }).remove();
 
             $.each(self.categoriesData, function (i, cat) {
-                if (!visibleCategories[cat.slug]) return;
-                if (cat.slug === self.currentCategory) {
+                if (!cat || typeof cat !== 'object') return;
+                var slug = self.safeString(cat.slug);
+                // null-prototype map：直接查找即 own-property 語意。
+                if (!slug || !visibleCategories[slug]) return;
+                // 重複宣告的分類只渲染第一筆（Hub 資料是外部輸入，不保證唯一）。
+                if (renderedCategories[slug]) return;
+                renderedCategories[slug] = true;
+                if (slug === self.currentCategory) {
                     categoryStillVisible = true;
                 }
-                var icon = cat.icon ? '<span class="dashicons ' + self.escAttr(cat.icon) + '" style="font-size:14px;width:14px;height:14px;margin-right:4px;"></span>' : '';
-                var $tab = $('<button type="button" class="ys-filter-tab" data-category="' + self.escAttr(cat.slug) + '">' +
-                    icon + self.escHtml(cat.name) + '</button>');
-                $tabs.append($tab);
+
+                var children = [];
+                var iconToken = self.safeClassToken(cat.icon, '');
+                if (iconToken) {
+                    children.push(self.node('span', {
+                        'class': 'dashicons ' + iconToken,
+                        'style': 'font-size:14px;width:14px;height:14px;margin-right:4px;'
+                    }, []));
+                }
+                children.push(self.node('span', {'class': 'ys-filter-tab-label'}, self.safeString(cat.name, slug)));
+
+                $tabs.append(self.renderDescriptor(self.node('button', {
+                    'type': 'button',
+                    'class': 'ys-filter-tab',
+                    'data-category': slug
+                }, children)));
             });
 
             // 重新標記 active 狀態
-            $tabs.find('.ys-filter-tab').removeClass('active');
             if (!categoryStillVisible) {
                 self.currentCategory = 'all';
             }
 
             $tabs.find('.ys-filter-tab').removeClass('active');
-            $tabs.find('.ys-filter-tab[data-category="' + self.escAttr(self.currentCategory) + '"]').addClass('active');
+            self.attrFilter($tabs, '.ys-filter-tab', 'data-category', self.currentCategory).addClass('active');
         },
 
         /**
@@ -890,7 +1158,7 @@
 
             // 過濾掉已關閉的公告
             var visibleAnns = $.grep(self.announcementsData, function (ann) {
-                return dismissedIds.indexOf(String(ann.id)) === -1;
+                return dismissedIds.indexOf(self.announcementId(ann)) === -1;
             });
 
             if (visibleAnns.length === 0) {
@@ -898,15 +1166,16 @@
                 return;
             }
 
-            // 公告類型對應 CSS class
+            // 公告類型是封閉域。用普通物件查表時，'constructor' 這類鍵會取回繼承的
+            // 函式而不是 undefined，`|| 預設值` 於是永遠不會生效，遠端值就決定了
+            // 元素的 class。因此先把 type 收斂到允許集合，再對映固定常數。
+            var ANNOUNCEMENT_TYPES = ['info', 'warning', 'success', 'danger'];
             var typeClasses = {
                 info: 'ys-announcement-info',
                 warning: 'ys-announcement-warning',
                 success: 'ys-announcement-success',
                 danger: 'ys-announcement-danger'
             };
-
-            // 公告類型對應圖示
             var typeIcons = {
                 info: 'dashicons-info',
                 warning: 'dashicons-warning',
@@ -915,27 +1184,42 @@
             };
 
             $.each(visibleAnns, function (i, ann) {
-                var typeClass = typeClasses[ann.type] || typeClasses.info;
-                var typeIcon = typeIcons[ann.type] || typeIcons.info;
-                var pinnedClass = ann.is_pinned ? ' ys-announcement-pinned' : '';
+                if (!ann || typeof ann !== 'object') return;
+                var type = self.safeEnum(ann.type, ANNOUNCEMENT_TYPES, 'info');
+                var classes = 'ys-announcement ' + typeClasses[type] + (ann.is_pinned ? ' ys-announcement-pinned' : '');
 
-                var html = '<div class="ys-announcement ' + typeClass + pinnedClass + '" data-id="' + self.escAttr(String(ann.id)) + '">' +
-                    '<span class="dashicons ' + self.escAttr(typeIcon) + '" style="flex-shrink:0;margin-top:1px;"></span>' +
-                    '<div class="ys-announcement-body">' +
-                    '<div class="ys-announcement-title">' + self.escHtml(ann.title) + '</div>';
-
-                if (ann.content) {
-                    html += '<div class="ys-announcement-content">' + self.escHtml(ann.content) + '</div>';
+                var body = [self.node('div', {'class': 'ys-announcement-title'}, self.safeString(ann.title))];
+                var content = self.safeString(ann.content);
+                if (content) {
+                    body.push(self.node('div', {'class': 'ys-announcement-content'}, content));
                 }
 
-                html += '</div>' +
-                    '<span class="ys-announcement-close dashicons dashicons-no-alt" title="' + self.escAttr(i18n.dismiss || '關閉') + '"></span>' +
-                    '</div>';
-
-                $wrap.append(html);
+                $wrap.append(self.renderDescriptor(self.node('div', {
+                    'class': classes,
+                    'data-id': self.announcementId(ann)
+                }, [
+                    self.node('span', {
+                        'class': 'dashicons ' + typeIcons[type],
+                        'style': 'flex-shrink:0;margin-top:1px;'
+                    }, []),
+                    self.node('div', {'class': 'ys-announcement-body'}, body),
+                    self.node('span', {
+                        'class': 'ys-announcement-close dashicons dashicons-no-alt',
+                        'title': self.safeString(i18n.dismiss, '關閉')
+                    }, [])
+                ])));
             });
 
             $wrap.show();
+        },
+
+        /**
+         * 公告識別字：只接受字串或數字，其餘視為無識別字。
+         */
+        announcementId: function (ann) {
+            if (!ann || typeof ann !== 'object') return '';
+            if (typeof ann.id === 'string') return ann.id;
+            return typeof ann.id === 'number' && isFinite(ann.id) ? String(ann.id) : '';
         },
 
         /**
@@ -945,7 +1229,13 @@
             try {
                 var stored = localStorage.getItem('ys_hub_dismissed_announcements');
                 if (stored) {
-                    return JSON.parse(stored);
+                    var parsed = JSON.parse(stored);
+                    // 儲存內容可能被使用者或其他腳本改寫；只接受字串陣列。
+                    if (Array.isArray(parsed)) {
+                        return $.grep(parsed, function (id) {
+                            return typeof id === 'string';
+                        });
+                    }
                 }
             } catch (e) {
                 // ignore
@@ -1099,10 +1389,15 @@
          * 更新連線狀態顯示
          */
         updateStatusDisplay: function (state, label) {
+            // 封閉集合；未知狀態退到最保守的 'open'（降級中），不產生未知 token。
+            // HTML escaping 不是 class token 的正確約束：這裡沒有任何 HTML 解析，
+            // 逃逸後的字元參照會原樣變成 class 名稱。
+            var STATES = ['closed', 'open', 'half_open'];
+            var safeState = Marketplace.safeEnum(state, STATES, 'open');
             var $status = $('#ys-connection-status');
-            $status.removeClass('ys-status-closed ys-status-open ys-status-half_open')
-                .addClass('ys-status-' + Marketplace.escAttr(state));
-            $status.find('.ys-status-label').text(label);
+            $status.removeClass($.map(STATES, function (s) { return 'ys-status-' + s; }).join(' '))
+                .addClass('ys-status-' + safeState);
+            $status.find('.ys-status-label').text(Marketplace.safeString(label));
         }
     };
 
@@ -1118,9 +1413,10 @@
                 $existing.remove();
             }
 
-            type = type || 'info';
-            var $toast = $('<div class="ys-toast ys-toast-' + Marketplace.escAttr(type) + '">' +
-                Marketplace.escHtml(message) + '</div>');
+            var safeType = Marketplace.safeEnum(type, ['info', 'success', 'error', 'warning'], 'info');
+            var $toast = $(Marketplace.renderDescriptor(Marketplace.node('div', {
+                'class': 'ys-toast ys-toast-' + safeType
+            }, Marketplace.safeString(message))));
 
             $('body').append($toast);
 
@@ -1148,5 +1444,16 @@
             Marketplace.init();
         }
     });
+
+    // 測試接縫：瀏覽器沒有 CommonJS `module`，此區塊在正式環境不會執行。
+    // 匯出的是「活的」單例本身而非包裝函式，離線契約因此驅動的是瀏覽器所驅動的
+    // 同一組物件，不可能被一份重新實作的副本蒙混過去。
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = {
+            Marketplace: Marketplace,
+            Settings: Settings,
+            Toast: Toast
+        };
+    }
 
 })(jQuery);

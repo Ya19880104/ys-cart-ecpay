@@ -69,7 +69,8 @@ final class YSHubApiClient {
         $this->base_url = rtrim( YS_HUB_CLIENT_HUB_URL, '/' );
 
         $repo           = YSHubClientSettingsRepo::instance();
-        $this->site_key = $repo->get( 'ys_hub_site_key', '' );
+        $site_key       = $repo->get( 'ys_hub_site_key', '' );
+        $this->site_key = is_string( $site_key ) ? $site_key : '';
     }
 
     /**

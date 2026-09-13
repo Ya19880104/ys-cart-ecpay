@@ -2,6 +2,8 @@
 
 Standalone ECPay provider plugin for YS CART.
 
+Current version: **0.5.7**
+
 ## Features
 
 - ECPay AIO redirect payment methods, declared in one place
@@ -67,7 +69,7 @@ Standalone ECPay provider plugin for YS CART.
 ## Requirements
 
 - WordPress 6.2+
-- PHP 8.1+
+- PHP 8.2+
 - PHP `mbstring` is recommended but not required; the provider includes a UTF-8-safe
   fallback for ECPay field-length limits.
 - **YS CART 2.61.7+** (global AIO and logistics requirement; on top of the 2.56.12 set — typed
