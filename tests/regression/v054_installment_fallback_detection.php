@@ -123,6 +123,15 @@ namespace YangSheep\YSCartEcpay\Payment {
 		public const ACTION_SUCCESS = 'success';
 		public const ACTION_FAILURE = 'failure';
 		public const ACTION_PAYMENT_INFO = 'payment_info';
+		public const LATE_CALLBACK_NOT_LATE = 'not_late';
+		public const LATE_CALLBACK_REJECTED = 'rejected';
+		public const LATE_CALLBACK_PERSISTED = 'persisted';
+		public const LATE_CALLBACK_RETRY = 'retry';
+		public static function record_historical_callback(object $order, array $params, string $merchant_id, string $environment, string $action): string
+		{
+			unset($order, $params, $merchant_id, $environment, $action);
+			return self::LATE_CALLBACK_NOT_LATE;
+		}
 		public static function identity_is_discoverable(array $detail, string $mtn): bool
 		{
 			return ($detail['mer_trade_no'] ?? $detail['ecpay_merchant_trade_no'] ?? '') === $mtn;

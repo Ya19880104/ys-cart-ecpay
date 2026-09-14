@@ -23,6 +23,7 @@ namespace {
 				'payment_method'   => 'ys_ec_ecpay_credit',
 				'gateway_trade_no' => '',
 				'total'            => '100',
+				'currency'         => 'TWD',
 			];
 		}
 
@@ -36,7 +37,7 @@ namespace {
 				&& $status[1] !== (string) ( $this->columns['status'] ?? '' ) ) {
 				return 0;
 			}
-			foreach ( [ 'gateway_id', 'payment_method', 'gateway_trade_no' ] as $column ) {
+			foreach ( [ 'gateway_id', 'payment_method', 'gateway_trade_no', 'currency' ] as $column ) {
 				$current = $this->columns[ $column ] ?? null;
 				if ( str_contains( $sql, "{$column} IS NULL" ) ) {
 					if ( null !== $current ) { return 0; }
@@ -47,10 +48,17 @@ namespace {
 					return 0;
 				}
 			}
+			$current_total = $this->columns['total'] ?? null;
+			if ( str_contains( $sql, 'total IS NULL' ) ) {
+				if ( null !== $current_total ) { return 0; }
+			} elseif ( preg_match( "/AND total = '((?:''|[^'])*)'/", $sql, $match )
+				&& str_replace( "''", "'", $match[1] ) !== (string) $current_total ) {
+				return 0;
+			}
 
 			$result = parent::query( $sql );
 			if ( 1 !== $result ) { return $result; }
-			foreach ( [ 'gateway_id', 'payment_method', 'gateway_trade_no' ] as $column ) {
+			foreach ( [ 'gateway_id', 'payment_method', 'gateway_trade_no', 'currency' ] as $column ) {
 				if ( preg_match( "/(?:SET|,) {$column} = '((?:''|[^'])*)'(?:,| WHERE)/s", $sql, $match ) ) {
 					$this->columns[ $column ] = str_replace( "''", "'", $match[1] );
 				}
@@ -74,6 +82,7 @@ namespace YangSheep\Ecommerce\Models {
 				'payment_method'   => $wpdb->columns['payment_method'] ?? null,
 				'gateway_trade_no' => $wpdb->columns['gateway_trade_no'] ?? null,
 				'total'            => $wpdb->columns['total'] ?? null,
+				'currency'         => $wpdb->columns['currency'] ?? null,
 				'payment_detail'   => $wpdb->value,
 			];
 		}
@@ -115,6 +124,7 @@ namespace {
 	require_once $core . '/src/Services/Payment/YSPaymentDetailStore.php';
 	require_once $provider . '/src/Support/DetailWriteOutcome.php';
 	require_once $provider . '/src/Support/OrderPaymentDetail.php';
+	require_once $provider . '/src/Payment/EcpayPaymentCatalog.php';
 	require_once $provider . '/src/Payment/EcpayPaymentAttempt.php';
 
 	use YangSheep\Ecommerce\Services\Payment\YSPaymentAttempt as Attempt;
@@ -171,7 +181,10 @@ namespace {
 		return [ $detail, $made ];
 	};
 	$order = static function () use ( $gateway ): object {
-		return (object) [ 'id' => 7, 'status' => 'pending', 'gateway_id' => $gateway, 'payment_method' => $gateway, 'total' => '100' ];
+		return (object) [
+			'id' => 7, 'status' => 'pending', 'gateway_id' => $gateway,
+			'payment_method' => $gateway, 'total' => '100', 'currency' => 'TWD',
+		];
 	};
 
 	// Real helper must bind at RESERVED, before provider I/O and submitted_at.
@@ -262,6 +275,28 @@ namespace {
 			&& 1 === $db->updates,
 		'R1c attempt rotation before the gateway bind CAS preserves the successor byte-exact'
 	);
+
+	foreach ( [ 'total' => '101', 'currency' => 'USD' ] as $drift_column => $drift_value ) {
+		$db = $seed( $reserved );
+		$db->columns['gateway_id'] = null;
+		$db->before_write = static function ( AttemptSeamWpdb $store, string $sql ) use ( $drift_column, $drift_value ): void {
+			unset( $sql );
+			$store->columns[ $drift_column ] = $drift_value;
+		};
+		$drifted_bind = Dispatch::with_context(
+			$made['token'], 7, $made['operation_key'],
+			static fn () => EcpayAttempt::bind_payment_identity( 7, $gateway, $mtn1, 100, 'stage', $merchant )
+		);
+		$after_drift = json_decode( (string) $db->value, true );
+		$check(
+			! $drifted_bind->is_persisted()
+				&& $drift_value === ( $db->columns[ $drift_column ] ?? null )
+				&& ! array_key_exists( 'ecpay_charged_amount', $after_drift )
+				&& null === ( $db->columns['gateway_id'] ?? null )
+				&& 0 === $db->updates,
+			'R1d ' . $drift_column . ' drift at the bind CAS cannot persist or expose a stale signed amount'
+		);
+	}
 
 	$malformed = $reserved;
 	unset( $malformed[ Dispatch::KEY ]['expires_at'] );
@@ -433,6 +468,48 @@ namespace {
 		&& $mtn2 === ( $migrated_next[ Attempt::KEY ]['id'] ?? null ),
 		'R10 submitted migrated payment binds its empty attempt id exactly once'
 	);
+	$hosted_gateway = 'ys_ec_ecpay_ecpg_credit';
+	$hosted_legacy = Attempt::begin( [], 'ecpay', $hosted_gateway, [], '' );
+	$hosted_legacy_made = Dispatch::make( 7, Attempt::current( $hosted_legacy ), $hosted_gateway );
+	$hosted_legacy_record = $hosted_legacy_made['record'];
+	$hosted_legacy_record['state'] = Dispatch::STATE_SUBMITTED;
+	$hosted_legacy_record['submitted_at'] = 1770000000;
+	$hosted_legacy[ Dispatch::KEY ] = $hosted_legacy_record;
+	$hosted_legacy += [
+		'mer_trade_no' => $mtn2,
+		'ecpay_merchant_trade_no' => $mtn2,
+		'ecpay_operation_key' => $hosted_legacy_made['operation_key'],
+		'ecpay_charged_amount' => 100,
+		'ecpay_environment' => 'stage',
+		'ecpay_merchant_id' => $merchant,
+		'payment_provider' => 'ecpay',
+		'payment_method' => $hosted_gateway,
+		'ecpay_ecpg_flow' => 'pay',
+	];
+	$db = $seed( $hosted_legacy, $hosted_gateway );
+	$hosted_migration = EcpayAttempt::migrate_hosted_identity( 7, $hosted_gateway );
+	$hosted_migrated_detail = json_decode( (string) $db->value, true );
+	$check(
+		$mtn2 === ( $hosted_migration['merchant_trade_no'] ?? null )
+			&& 1 === preg_match( '/^[a-f0-9]{32}$/D', (string) ( $hosted_migration['fingerprint'] ?? '' ) )
+			&& $mtn2 === ( $hosted_migrated_detail[ Attempt::KEY ]['id'] ?? null ),
+		'R10a 0.5.9 hosted identity migration remains available for an exact unchanged TWD order'
+	);
+	foreach ( [ 'total' => '101', 'currency' => 'USD' ] as $drift_column => $drift_value ) {
+		$db = $seed( $hosted_legacy, $hosted_gateway );
+		$db->before_write = static function ( AttemptSeamWpdb $store, string $sql ) use ( $drift_column, $drift_value ): void {
+			unset( $sql );
+			$store->columns[ $drift_column ] = $drift_value;
+		};
+		$blocked_migration = EcpayAttempt::migrate_hosted_identity( 7, $hosted_gateway );
+		$blocked_migration_detail = json_decode( (string) $db->value, true );
+		$check(
+			null === $blocked_migration
+				&& '' === ( $blocked_migration_detail[ Attempt::KEY ]['id'] ?? null )
+				&& 0 === $db->updates,
+			'R10b hosted migration loses a concurrent ' . $drift_column . ' change without granting page authority'
+		);
+	}
 
 	$legacy_detail = [ 'mer_trade_no' => 'YS7TLEGACY', 'payment_provider' => 'ecpay', 'payment_method' => $gateway ];
 	$legacy_order = (object) [ 'id' => 7, 'status' => 'pending', 'gateway_id' => null, 'payment_method' => $gateway, 'total' => '100' ];
@@ -504,6 +581,27 @@ namespace {
 		&& 2 === $db->updates,
 		'R14a browser authorization is reserved and promoted to durable sent intent through exact Store CAS'
 	);
+	$hosted_db = $db;
+	foreach ( [ 'total' => '101', 'currency' => 'USD' ] as $drift_column => $drift_value ) {
+		$db = $seed( $claimed );
+		$db->before_write = static function ( AttemptSeamWpdb $store, string $sql ) use ( $drift_column, $drift_value ): void {
+			unset( $sql );
+			$store->columns[ $drift_column ] = $drift_value;
+		};
+		$blocked_send = EcpayAttempt::authorize_browser_send( 7, $gateway, $mtn2, $fingerprint, $claim_nonce );
+		$blocked_detail = json_decode( (string) $db->value, true );
+		$released = EcpayAttempt::release_browser_authorization( 7, $gateway, $mtn2, $fingerprint, $claim_nonce );
+		$released_detail = json_decode( (string) $db->value, true );
+		$check(
+			! $blocked_send
+				&& 'reserved' === ( $blocked_detail[ Dispatch::KEY ]['ecpay_browser_authorization']['state'] ?? null )
+				&& $released
+				&& ! array_key_exists( 'ecpay_browser_authorization', $released_detail[ Dispatch::KEY ] ?? [] ),
+			'R14b hosted ' . $drift_column . ' drift loses the pre-I/O CAS while its unsent reservation remains releasable'
+		);
+	}
+	$db = $hosted_db;
+	$wpdb = $hosted_db;
 	$handoff = EcpayAttempt::claim_browser_result_handoff(
 		7, $gateway, $mtn2, $fingerprint, $claim_nonce, $merchant, 'stage', $merchant, $mtn2, 100
 	);
@@ -593,6 +691,365 @@ namespace {
 		&& 1 === $db->updates
 		&& $terminal_bytes === $db->value,
 		'R18 callback terminalization between hosted check and write wins; no stale handoff survives CAS'
+	);
+
+	// A current, already-issued ECPay ATM/CVS instruction is the only submitted
+	// attempt that may rotate. The provider receipt and successor are committed
+	// together; callbacks can then update only the bounded predecessor ledger.
+	$offline_make = static function ( string $offline_gateway, string $payment_type, string $rtn_code, string $pay_no ) use ( $merchant ): array {
+		$mtn = 'YS7T' . strtoupper( substr( hash( 'sha256', $offline_gateway ), 0, 12 ) );
+		$detail = Attempt::begin( [], 'ecpay', $offline_gateway, [], $mtn );
+		$made = Dispatch::make( 7, Attempt::current( $detail ), $offline_gateway );
+		$record = $made['record'];
+		$record['state'] = Dispatch::STATE_SUBMITTED;
+		$record['submitted_at'] = 1770000000;
+		$record['payable_handoff'] = [
+			'kind'          => 'provider',
+			'operation_key' => $made['operation_key'],
+			'nonce'         => str_repeat( 'c', 32 ),
+			'claimed_at'    => 1770000001,
+		];
+		$detail[ Dispatch::KEY ] = $record;
+		$detail += [
+			'mer_trade_no'            => $mtn,
+			'ecpay_merchant_trade_no' => $mtn,
+			'ecpay_operation_key'     => $made['operation_key'],
+			'ecpay_charged_amount'    => 100,
+			'ecpay_environment'       => 'stage',
+			'ecpay_merchant_id'       => $merchant,
+			'payment_provider'        => 'ecpay',
+			'payment_method'          => $offline_gateway,
+			'payment_type'            => $payment_type,
+			'trade_status'            => $rtn_code,
+			'pay_no'                  => $pay_no,
+			'expire_date'             => '2026/09/30 23:59:59',
+		];
+		if ( 'ys_ec_ecpay_atm' === $offline_gateway ) {
+			$detail['bank_type'] = '812';
+		}
+		$order = (object) [
+			'id'             => 7,
+			'status'         => 'offline_payment',
+			'gateway_id'     => $offline_gateway,
+			'payment_method' => $offline_gateway,
+			'gateway_trade_no' => '',
+			'total'          => '100',
+			'currency'       => 'TWD',
+		];
+		return [ $order, $detail, $mtn ];
+	};
+	$rotate_offline = static function ( array $old_detail, array $candidate, string $old_gateway ): ?array {
+		$successor_gateway = 'ys_ec_payuni_credit';
+		$history_keys = EcpayAttempt::contribute_history_keys( [], $old_gateway, $successor_gateway, 7 );
+		$next = Attempt::begin( $old_detail, 'payuni', $successor_gateway, $history_keys );
+		$made = Dispatch::make( 7, Attempt::current( $next ), $successor_gateway );
+		$next[ Dispatch::KEY ] = $made['record'];
+		return EcpayAttempt::append_for_rotation(
+			$next,
+			$candidate,
+			Attempt::current( $next ),
+			$made['record'],
+			$successor_gateway
+		);
+	};
+
+	$offline_cases = [
+		'ATM' => [ 'ys_ec_ecpay_atm', 'ATM_TAISHIN', '2', '0012345678901234' ],
+		'CVS' => [ 'ys_ec_ecpay_cvs', 'CVS_CVS', '10100073', '009988776655' ],
+	];
+	$offline_rotations = [];
+	foreach ( $offline_cases as $label => [ $offline_gateway, $payment_type, $rtn_code, $pay_no ] ) {
+		[ $offline_order, $offline_detail, $offline_mtn ] = $offline_make( $offline_gateway, $payment_type, $rtn_code, $pay_no );
+		$gate = EcpayAttempt::repay_gate( $offline_order, $offline_detail, 'ys_ec_payuni_credit' );
+		$candidate = is_array( $gate['candidate'] ?? null ) ? $gate['candidate'] : [];
+		$rotated = [] !== $candidate ? $rotate_offline( $offline_detail, $candidate, $offline_gateway ) : null;
+		$offline_rotations[ $label ] = [ $offline_order, $offline_detail, $offline_mtn, $candidate, $rotated ];
+		$check(
+			true === ( $gate['recognized'] ?? null )
+				&& true === ( $gate['actionable'] ?? null )
+				&& is_array( $rotated )
+				&& isset( $rotated[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'] )
+				&& 'payuni' === ( $rotated[ Attempt::KEY ]['provider'] ?? null ),
+			'R19 ' . $label . ' exact issued instruction rotates only with a same-CAS predecessor receipt'
+		);
+	}
+
+	[ $atm_order, $atm_detail, $atm_mtn, $atm_candidate, $atm_rotated ] = $offline_rotations['ATM'];
+	$blocked_by_open = EcpayAttempt::repay_gate(
+		(object) [
+			'id' => 7, 'status' => 'pending', 'gateway_id' => 'ys_ec_payuni_credit',
+			'payment_method' => 'ys_ec_payuni_credit', 'total' => '100', 'currency' => 'TWD',
+		],
+		$atm_rotated,
+		'ys_ec_payuni_credit'
+	);
+	$check(
+		false === ( $blocked_by_open['recognized'] ?? null )
+			&& false === ( $blocked_by_open['actionable'] ?? null )
+			&& str_contains( (string) ( $blocked_by_open['warning'] ?? '' ), '避免重複繳款' ),
+		'R20 a non-ECPay successor remains under Core dispatch policy and is not permanently refused by one open receipt'
+	);
+	foreach ( [
+		'ECPay CVS'       => 'ys_ec_ecpay_cvs',
+		'ECPay barcode'   => 'ys_ec_ecpay_barcode',
+		'PayUni ATM'      => 'ys_ec_payuni_atm',
+		'unknown gateway' => 'ys_ec_future_delayed',
+	] as $target_label => $target_gateway ) {
+		$blocked_target_offline = EcpayAttempt::repay_gate(
+			(object) [
+				'id' => 7, 'status' => 'pending', 'gateway_id' => 'ys_ec_payuni_credit',
+				'payment_method' => 'ys_ec_payuni_credit', 'total' => '100', 'currency' => 'TWD',
+			],
+			$atm_rotated,
+			$target_gateway
+		);
+		$check(
+			true === ( $blocked_target_offline['recognized'] ?? null )
+				&& false === ( $blocked_target_offline['actionable'] ?? null )
+				&& 'ecpay_predecessor_unresolved' === ( $blocked_target_offline['reason'] ?? null ),
+			'R20b OPEN predecessor blocks delayed/unknown target: ' . $target_label
+		);
+	}
+	$second_offline = clone $atm_order;
+	$second_offline->gateway_id = 'ys_ec_ecpay_cvs';
+	$second_offline->payment_method = 'ys_ec_ecpay_cvs';
+	$blocked_second_offline = EcpayAttempt::repay_gate( $second_offline, $atm_rotated, 'ys_ec_ecpay_cvs' );
+	$check(
+		true === ( $blocked_second_offline['recognized'] ?? null )
+			&& false === ( $blocked_second_offline['actionable'] ?? null )
+			&& 'ecpay_predecessor_unresolved' === ( $blocked_second_offline['reason'] ?? null ),
+		'R20a one open predecessor still blocks archiving a second issued ECPay offline instrument'
+	);
+
+	$db = $seed( $atm_rotated, 'ys_ec_payuni_credit' );
+	$db->columns['status'] = 'pending';
+	$db->columns['payment_method'] = 'ys_ec_payuni_credit';
+	$payment_info = [
+		'MerchantID'      => $merchant,
+		'MerchantTradeNo' => $atm_mtn,
+		'TradeAmt'        => '100',
+		'RtnCode'         => '2',
+		'PaymentType'     => 'ATM_TAISHIN',
+		'vAccount'        => '0012345678901234',
+		'ExpireDate'      => '2026/09/30 23:59:59',
+		'BankCode'        => '812',
+	];
+	$info_result = EcpayAttempt::record_historical_callback(
+		(object) [ 'id' => 7 ], $payment_info, $merchant, 'stage', EcpayAttempt::ACTION_PAYMENT_INFO
+	);
+	$after_info = json_decode( (string) $db->value, true );
+	$late_key = hash( 'sha256', 'ecpay|7|' . $atm_mtn );
+	$check(
+		EcpayAttempt::LATE_CALLBACK_PERSISTED === $info_result
+			&& EcpayAttempt::LATE_STATE_OPEN === ( $after_info[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ]['state'] ?? null )
+			&& EcpayAttempt::ACTION_PAYMENT_INFO === ( $after_info[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ]['last_action'] ?? null )
+			&& 'payuni' === ( $after_info[ Attempt::KEY ]['provider'] ?? null ),
+		'R21 late ATM payment-info updates only the predecessor receipt and preserves the successor attempt'
+	);
+
+	$paid = [
+		'MerchantID'      => $merchant,
+		'MerchantTradeNo' => $atm_mtn,
+		'TradeAmt'        => '100',
+		'RtnCode'         => '1',
+		'PaymentType'     => 'ATM_TAISHIN',
+		'TradeNo'         => '2609150000000001',
+	];
+	$paid_result = EcpayAttempt::record_historical_callback(
+		(object) [ 'id' => 7 ], $paid, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+	);
+	$after_paid = json_decode( (string) $db->value, true );
+	$updates_after_paid = $db->updates;
+	$replay_result = EcpayAttempt::record_historical_callback(
+		(object) [ 'id' => 7 ], $paid, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+	);
+	$after_replay = (string) $db->value;
+	$check(
+		EcpayAttempt::LATE_CALLBACK_PERSISTED === $paid_result
+			&& EcpayAttempt::LATE_STATE_PAID_MANUAL === ( $after_paid[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ]['state'] ?? null )
+			&& '2609150000000001' === ( $after_paid[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ]['last_trade_no'] ?? null )
+			&& '' === (string) ( $db->columns['gateway_trade_no'] ?? '' )
+			&& EcpayAttempt::LATE_CALLBACK_PERSISTED === $replay_result
+			&& $updates_after_paid === $db->updates
+			&& wp_json_encode( $after_paid ) === $after_replay,
+		'R22 late success becomes manual-paid exactly once and replay cannot settle or rewrite the successor'
+	);
+	$receipt_only = $after_paid;
+	unset( $receipt_only[ Attempt::HISTORY_KEY ] );
+	$check(
+		EcpayAttempt::identity_is_discoverable( $receipt_only, $atm_mtn, 7 )
+			&& ! EcpayAttempt::identity_is_discoverable( $receipt_only, $atm_mtn ),
+		'R22a exact durable receipt keeps historical lookup discoverable after bounded generic history eviction'
+	);
+	$check(
+		EcpayAttempt::successor_dispatch_allows( $atm_rotated, 7 )
+			&& ! EcpayAttempt::successor_dispatch_allows( $after_paid, 7 ),
+		'R22b an open receipt permits its successor, while durable late-paid evidence closes every further form or provider send'
+	);
+
+	$failure_after_paid = $paid;
+	$failure_after_paid['RtnCode'] = '10200095';
+	unset( $failure_after_paid['TradeNo'] );
+	$paid_entry_before_anomaly = $after_paid[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ] ?? [];
+	$check(
+		'anomaly_persisted' === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $failure_after_paid, $merchant, 'stage', EcpayAttempt::ACTION_FAILURE
+		),
+		'R23a divergent callback is ACK-eligible only after a durable anomaly receipt'
+	);
+	$after_paid_anomaly = json_decode( (string) $db->value, true );
+	$paid_entry_after_anomaly = $after_paid_anomaly[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ] ?? [];
+	$paid_anomalies = is_array( $paid_entry_after_anomaly['anomalies'] ?? null ) ? $paid_entry_after_anomaly['anomalies'] : [];
+	$first_paid_anomaly = [] === $paid_anomalies ? null : reset( $paid_anomalies );
+	$check(
+		EcpayAttempt::LATE_STATE_PAID_MANUAL === ( $paid_entry_after_anomaly['state'] ?? null )
+			&& ( $paid_entry_before_anomaly['last_callback_evidence_digest'] ?? null ) === ( $paid_entry_after_anomaly['last_callback_evidence_digest'] ?? null )
+			&& '2609150000000001' === ( $paid_entry_after_anomaly['last_trade_no'] ?? null )
+			&& 1 === count( $paid_anomalies )
+			&& 'divergent_after_paid' === ( is_array( $first_paid_anomaly ) ? ( $first_paid_anomaly['reason'] ?? null ) : null ),
+		'R23 success remains authoritative while divergent evidence is retained separately'
+	);
+
+	$db = $seed( $atm_rotated, 'ys_ec_payuni_credit' );
+	$db->columns['status'] = 'pending';
+	$db->columns['payment_method'] = 'ys_ec_payuni_credit';
+	$missing_trade_no = $paid;
+	unset( $missing_trade_no['TradeNo'] );
+	$check(
+		'anomaly_persisted' === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $missing_trade_no, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+		),
+		'R23b signed late-paid callback missing TradeNo is ACK-eligible only after durable anomaly evidence'
+	);
+	$after_missing_trade = json_decode( (string) $db->value, true );
+	$missing_entry = $after_missing_trade[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ] ?? [];
+	$missing_anomalies = is_array( $missing_entry['anomalies'] ?? null ) ? $missing_entry['anomalies'] : [];
+	$first_missing_anomaly = [] === $missing_anomalies ? null : reset( $missing_anomalies );
+	$check(
+		EcpayAttempt::LATE_STATE_OPEN === ( $missing_entry['state'] ?? null )
+			&& 1 === count( $missing_anomalies )
+			&& 'trade_no_missing' === ( is_array( $first_missing_anomaly ) ? ( $first_missing_anomaly['reason'] ?? null ) : null )
+			&& ! EcpayAttempt::successor_dispatch_allows( $after_missing_trade, 7 )
+			&& false === ( EcpayAttempt::repay_gate(
+				(object) [
+					'id' => 7,
+					'gateway_id' => 'ys_ec_payuni_credit',
+					'payment_method' => 'ys_ec_payuni_credit',
+					'status' => 'pending',
+				],
+				$after_missing_trade,
+				'ys_ec_payuni_credit'
+			)['actionable'] ?? null ),
+		'R23c missing transaction identity cannot promote the predecessor but holds every successor for review'
+	);
+	foreach ( [ 'paid_manual' => $after_paid, 'success_anomaly' => $after_missing_trade ] as $late_state => $late_source ) {
+		$blocked_browser = $current;
+		$blocked_browser[ EcpayAttempt::LATE_SETTLEMENT_KEY ] = $late_source[ EcpayAttempt::LATE_SETTLEMENT_KEY ];
+		$blocked_fingerprint = EcpayAttempt::browser_fingerprint( $blocked_browser );
+		$db = $seed( $blocked_browser );
+		$blocked_bytes = (string) $db->value;
+		$blocked_nonce = EcpayAttempt::claim_browser_authorization(
+			7, $gateway, $mtn2, $blocked_fingerprint, 'confirm'
+		);
+		$check(
+			! EcpayAttempt::browser_owner_matches(
+				$blocked_browser, 7, $gateway, $mtn2, $blocked_fingerprint, $order()
+			)
+				&& '' === $blocked_nonce
+				&& 0 === $db->updates
+				&& $blocked_bytes === (string) $db->value,
+			'R23d durable ' . $late_state . ' predecessor evidence blocks hosted-page and browser-send authority byte-exact'
+		);
+	}
+
+	[ $cvs_order, $cvs_detail, $cvs_mtn, $cvs_candidate, $cvs_rotated ] = $offline_rotations['CVS'];
+	$db = $seed( $cvs_rotated, 'ys_ec_payuni_credit' );
+	$db->columns['status'] = 'pending';
+	$db->columns['payment_method'] = 'ys_ec_payuni_credit';
+	$cvs_failure = [
+		'MerchantID'      => $merchant,
+		'MerchantTradeNo' => $cvs_mtn,
+		'TradeAmt'        => '100',
+		'RtnCode'         => '10200095',
+		'PaymentType'     => 'CVS_CVS',
+	];
+	$terminal_result = EcpayAttempt::record_historical_callback(
+		(object) [ 'id' => 7 ], $cvs_failure, $merchant, 'stage', EcpayAttempt::ACTION_FAILURE
+	);
+	$after_terminal = json_decode( (string) $db->value, true );
+	$cvs_key = hash( 'sha256', 'ecpay|7|' . $cvs_mtn );
+	$check(
+		EcpayAttempt::LATE_CALLBACK_PERSISTED === $terminal_result
+			&& EcpayAttempt::LATE_STATE_PROVIDER_TERMINAL === ( $after_terminal[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $cvs_key ]['state'] ?? null ),
+		'R24 a signed terminal predecessor failure reopens the contemporary repay policy without touching current payment state'
+	);
+
+	$wrong_amount = $cvs_failure;
+	$wrong_amount['RtnCode'] = '1';
+	$wrong_amount['TradeNo'] = '2609150000000002';
+	$wrong_amount['TradeAmt'] = '101';
+	$check(
+		'anomaly_persisted' === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $wrong_amount, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+		),
+		'R25a wrong amount is ACK-eligible only after a durable anomaly receipt'
+	);
+	$after_wrong_amount = json_decode( (string) $db->value, true );
+	$wrong_entry = $after_wrong_amount[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $cvs_key ] ?? [];
+	$wrong_anomalies = is_array( $wrong_entry['anomalies'] ?? null ) ? $wrong_entry['anomalies'] : [];
+	$first_wrong_anomaly = [] === $wrong_anomalies ? null : reset( $wrong_anomalies );
+	$check(
+		EcpayAttempt::LATE_STATE_PROVIDER_TERMINAL === ( $wrong_entry['state'] ?? null )
+			&& 1 === count( $wrong_anomalies )
+			&& 'receipt_mismatch' === ( is_array( $first_wrong_anomaly ) ? ( $first_wrong_anomaly['reason'] ?? null ) : null )
+			&& 101 === ( is_array( $first_wrong_anomaly ) ? ( $first_wrong_anomaly['amount'] ?? null ) : null )
+			&& ! EcpayAttempt::successor_dispatch_allows( $after_wrong_amount, 7 ),
+		'R25b wrong identity or amount cannot change predecessor state and signed success remains manual-hold'
+	);
+
+	$bad_gate_detail = $atm_detail;
+	$bad_gate_detail['pay_no'] = 'DIFFERENT';
+	$bad_candidate = $atm_candidate;
+	$bad_candidate['predecessor_generation'] = 999;
+	$bad_gate = EcpayAttempt::repay_gate( $atm_order, $bad_gate_detail, 'ys_ec_payuni_credit' );
+	$check(
+		true === ( $bad_gate['actionable'] ?? null )
+			&& ! hash_equals( (string) $atm_candidate['pay_no_digest'], (string) $bad_gate['candidate']['pay_no_digest'] )
+			&& null === $rotate_offline( $atm_detail, $bad_candidate, 'ys_ec_ecpay_atm' ),
+		'R26 candidate and archived attempt must match exactly at append; a stale candidate cannot create a receipt'
+	);
+
+	$malformed_ledger = $atm_rotated;
+	$malformed_ledger[ EcpayAttempt::LATE_SETTLEMENT_KEY ]['entries'][ $late_key ]['claim_digest'] = str_repeat( '0', 64 );
+	$db = $seed( $malformed_ledger, 'ys_ec_payuni_credit' );
+	$db->columns['status'] = 'pending';
+	$db->columns['payment_method'] = 'ys_ec_payuni_credit';
+	$check(
+		EcpayAttempt::LATE_CALLBACK_RETRY === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $paid, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+		)
+			&& true === ( EcpayAttempt::repay_gate( $atm_order, $malformed_ledger, 'ys_ec_payuni_credit' )['recognized'] ?? null )
+			&& false === ( EcpayAttempt::repay_gate( $atm_order, $malformed_ledger, 'ys_ec_payuni_credit' )['actionable'] ?? null )
+			&& ! EcpayAttempt::successor_dispatch_allows( $malformed_ledger, 7 ),
+		'R27 malformed durable ledger is retryable for callbacks and fail-closed for every new repay'
+	);
+
+	$db = $seed( $next );
+	$check(
+		EcpayAttempt::LATE_CALLBACK_NOT_LATE === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $paid, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+		),
+		'R28 legacy generic history remains discovery-only and zero-write when no new receipt exists'
+	);
+	$malformed_current = $paid;
+	$malformed_current['TradeAmt'] = '0';
+	$db = $seed( $next );
+	$check(
+		EcpayAttempt::LATE_CALLBACK_NOT_LATE === EcpayAttempt::record_historical_callback(
+			(object) [ 'id' => 7 ], $malformed_current, $merchant, 'stage', EcpayAttempt::ACTION_SUCCESS
+		)
+			&& 0 === $db->updates,
+		'R28a malformed current callbacks stay under ordinary controller validation and cannot be swallowed by the late interceptor'
 	);
 
 	echo "\nattempt callback seam pair: {$pass} PASS / {$fail} FAIL\n";

@@ -98,6 +98,10 @@ namespace YangSheep\Ecommerce\Services\Payment {
 			}
 			$patch = $options['detail_patch'] ?? null;
 			$next  = is_callable($patch) ? $patch($current) : $current;
+			if (str_starts_with((string) ($GLOBALS['ys_ecpay_scenario'] ?? ''), 'race-')) {
+				file_put_contents((string) $GLOBALS['ys_ecpay_marker_path'], 'stale-' . $kind . '|', FILE_APPEND);
+				return ['success' => false, 'retryable' => false, 'outcome' => 'stale'];
+			}
 			file_put_contents(
 				(string) $GLOBALS['ys_ecpay_marker_path'],
 				'atomic-' . $kind . ':' . json_encode(['detail' => $next, 'columns' => $options['columns'] ?? []]) . '|',
@@ -135,6 +139,32 @@ namespace YangSheep\YSCartEcpay\Payment {
 		public const ACTION_SUCCESS = 'success';
 		public const ACTION_FAILURE = 'failure';
 		public const ACTION_PAYMENT_INFO = 'payment_info';
+		public const LATE_CALLBACK_NOT_LATE = 'not_late';
+		public const LATE_CALLBACK_REJECTED = 'rejected';
+		public const LATE_CALLBACK_PERSISTED = 'persisted';
+		public const LATE_CALLBACK_ANOMALY_PERSISTED = 'anomaly_persisted';
+		public const LATE_CALLBACK_RETRY = 'retry';
+		public static function record_historical_callback(object $order, array $params, string $merchant_id, string $environment, string $action): string
+		{
+			unset($order, $params, $merchant_id, $environment, $action);
+			++$GLOBALS['ys_ecpay_late_calls'];
+			file_put_contents((string) $GLOBALS['ys_ecpay_marker_path'], 'late-probe|', FILE_APPEND);
+			if ('late-success' === ($GLOBALS['ys_ecpay_scenario'] ?? '')) {
+				return self::LATE_CALLBACK_PERSISTED;
+			}
+			if ('late-retry' === ($GLOBALS['ys_ecpay_scenario'] ?? '')) {
+				return self::LATE_CALLBACK_RETRY;
+			}
+			if ('race-late' === ($GLOBALS['ys_ecpay_scenario'] ?? '')
+				&& 2 <= (int) ($GLOBALS['ys_ecpay_late_calls'] ?? 0)) {
+				return self::LATE_CALLBACK_PERSISTED;
+			}
+			if ('race-rejected' === ($GLOBALS['ys_ecpay_scenario'] ?? '')
+				&& 2 <= (int) ($GLOBALS['ys_ecpay_late_calls'] ?? 0)) {
+				return self::LATE_CALLBACK_REJECTED;
+			}
+			return self::LATE_CALLBACK_NOT_LATE;
+		}
 		public static function identity_is_discoverable(array $detail, string $mtn): bool
 		{
 			return ($detail['mer_trade_no'] ?? $detail['ecpay_merchant_trade_no'] ?? '') === $mtn;
@@ -279,11 +309,12 @@ namespace {
 		$scenario = (string) ($argv[2] ?? '');
 		$GLOBALS['ys_ecpay_scenario'] = $scenario;
 		$GLOBALS['ys_ecpay_marker_path'] = (string) ($argv[3] ?? '');
+		$GLOBALS['ys_ecpay_late_calls'] = 0;
 
 		$params = [
 			'MerchantID'      => 'LOCAL-MERCHANT',
 			'MerchantTradeNo' => 'YS7TLOCAL',
-			'TradeAmt'        => '100',
+			'TradeAmt'        => 'malformed-current' === $scenario ? '0' : '100',
 			'RtnCode'         => 'notify-failed' === $scenario ? '0' : ('payment-info' === $scenario ? '2' : '1'),
 			'RtnMsg'          => 'signed-raw-bytes' === $scenario ? '  Path C:\\Temp %2F  ' : 'Succeeded',
 			'TradeNo'         => 'LOCAL-TRADE-1',
@@ -358,6 +389,12 @@ namespace {
 	$persist_fail     = $run('persist-fail');
 	$notify_failed    = $run('notify-failed');
 	$payment_info     = $run('payment-info');
+	$late_success     = $run('late-success');
+	$late_retry       = $run('late-retry');
+	$race_late        = $run('race-late');
+	$race_not_late    = $run('race-not-late');
+	$race_rejected    = $run('race-rejected');
+	$malformed_current = $run('malformed-current');
 
 	$assert(
 		'' === $simulated['event'],
@@ -419,6 +456,43 @@ namespace {
 		&& '' === $payment_info['stderr']
 		&& 0 === $payment_info['exit'],
 		'ATM payment-info result transitions to pending-offline and ACKs exactly once'
+	);
+	$assert(
+		'late-probe|' === $late_success['event']
+		&& '1|OK' === $late_success['stdout']
+		&& 0 === $late_success['exit'],
+		'A durably recorded late-paid callback ACKs before current lifecycle writes'
+	);
+	$assert(
+		'late-probe|' === $late_retry['event']
+		&& '0|Persist Failed' === $late_retry['stdout']
+		&& 0 === $late_retry['exit'],
+		'Late-callback ledger persistence failure returns HTTP-failure body and never ACKs'
+	);
+	$assert(
+		'late-probe|stale-paid|late-probe|' === $race_late['event']
+		&& '1|OK' === $race_late['stdout']
+		&& 0 === $race_late['exit'],
+		'Current-read then rotation-before-lifecycle stale result is reclassified and durably recorded before ACK'
+	);
+	$assert(
+		'late-probe|stale-paid|late-probe|' === $race_not_late['event']
+		&& '0|Persist Failed' === $race_not_late['stdout']
+		&& 0 === $race_not_late['exit'],
+		'Stale current callback with no durable late owner is never acknowledged'
+	);
+	$assert(
+		'late-probe|stale-paid|late-probe|' === $race_rejected['event']
+		&& '0|Persist Failed' === $race_rejected['stdout']
+		&& 0 === $race_rejected['exit'],
+		'Stale current callback with an unpersisted rejection is never acknowledged'
+	);
+	$assert(
+		'late-probe|' === $malformed_current['event']
+		&& '0|Amount Mismatch' === $malformed_current['stdout']
+		&& '' === $malformed_current['stderr']
+		&& 0 === $malformed_current['exit'],
+		'Malformed current amount remains under ordinary validation after the late interceptor declines ownership'
 	);
 
 	echo "\nsimulated payment notify: {$pass} PASS / {$fail} FAIL\n";

@@ -102,6 +102,19 @@ final class EcpayPaymentController {
 		$action            = '1' === (string) ( $params['RtnCode'] ?? '' )
 			? EcpayPaymentAttempt::ACTION_SUCCESS
 			: EcpayPaymentAttempt::ACTION_FAILURE;
+
+		// ECPay's backend simulation is signed and reports RtnCode=1, but no
+		// funds were captured. It must stay zero-write even when the named
+		// MerchantTradeNo has since moved into the late-settlement ledger.
+		if ( '1' === (string) ( $params['SimulatePaid'] ?? '' ) ) {
+			YSLogger::warning( 'ecpay', '收到綠界模擬付款通知；已 ACK，但未變更訂單付款狀態', [
+				'order_id' => (int) $order->id,
+			] );
+			$this->respond_text( '1|OK' );
+			return;
+		}
+
+		$this->intercept_late_callback( $order, $params, $merchant_id, $environment, $action );
 		if ( EcpayPaymentAttempt::historical_callback_matches(
 			$order,
 			$detail_now,
@@ -136,17 +149,6 @@ final class EcpayPaymentController {
 				'order_id' => (int) $order->id,
 			] );
 			$this->respond_text( '1|OK' );
-		}
-
-		// ECPay's backend simulation is signed and reports RtnCode=1, but no funds
-		// were captured.  ACK it so ECPay does not retry, while returning before
-		// any real-payment identity or lifecycle state is persisted.
-		if ( '1' === (string) ( $params['SimulatePaid'] ?? '' ) ) {
-			YSLogger::warning( 'ecpay', '收到綠界模擬付款通知；已 ACK，但未變更訂單付款狀態', [
-				'order_id' => (int) $order->id,
-			] );
-			$this->respond_text( '1|OK' );
-			return;
 		}
 
 		$detail = $this->detail_from_payload( $params, (string) ( $callback_claim['gateway_id'] ?? '' ) );
@@ -245,6 +247,14 @@ final class EcpayPaymentController {
 
 		// v0.3.0：生命週期推進失敗（含 payment_detail CAS 失敗）同樣不得 ACK——
 		// 訂單狀態沒有落盤卻告訴綠界「收到了」，這筆付款就再也不會被通知。
+		if ( is_array( $transition )
+			&& empty( $transition['success'] )
+			&& 'stale' === (string) ( $transition['outcome'] ?? '' ) ) {
+			// The current callback may have lost its lifecycle CAS to a repay
+			// rotation. Re-read and record it against the newly durable predecessor
+			// receipt; never ACK a late paid callback based only on the stale read.
+			$this->intercept_late_callback( $order, $params, $merchant_id, $environment, $action, true );
+		}
 		if ( ! $this->transition_persisted( $transition, (int) $order->id, 'notify' ) ) {
 			$this->respond_text( '0|Persist Failed', 500 );
 			return;
@@ -280,6 +290,13 @@ final class EcpayPaymentController {
 		$merchant_trade_no = (string) ( $params['MerchantTradeNo'] ?? '' );
 		$merchant_id       = (string) $verified_identity['merchant_id'];
 		$environment       = (string) $verified_identity['environment'];
+		$this->intercept_late_callback(
+			$order,
+			$params,
+			$merchant_id,
+			$environment,
+			EcpayPaymentAttempt::ACTION_PAYMENT_INFO
+		);
 		if ( EcpayPaymentAttempt::historical_callback_matches(
 			$order,
 			$detail_now,
@@ -326,6 +343,18 @@ final class EcpayPaymentController {
 			// v0.3.0：取號資訊（繳費代碼、虛擬帳號、繳費期限）沒落盤就**不得** ACK。
 			// 這是消費者拿去繳費的唯一憑據；回 1|OK 會讓綠界停止重送，訂單頁上就
 			// 永遠沒有繳費代碼可顯示。
+			if ( is_array( $transition )
+				&& empty( $transition['success'] )
+				&& 'stale' === (string) ( $transition['outcome'] ?? '' ) ) {
+				$this->intercept_late_callback(
+					$order,
+					$params,
+					$merchant_id,
+					$environment,
+					EcpayPaymentAttempt::ACTION_PAYMENT_INFO,
+					true
+				);
+			}
 			if ( ! $this->transition_persisted( $transition, (int) $order->id, 'payment_info' ) ) {
 				$this->respond_text( '0|Persist Failed', 500 );
 				return;
@@ -483,7 +512,8 @@ final class EcpayPaymentController {
 		if ( $include_history ) {
 			$sql .= " OR JSON_SEARCH(payment_detail, 'one', %s, NULL,
 				'$.ys_payment_attempt_history[*].fields.mer_trade_no',
-				'$.ys_payment_attempt_history[*].fields.ecpay_merchant_trade_no') IS NOT NULL";
+				'$.ys_payment_attempt_history[*].fields.ecpay_merchant_trade_no',
+				'$._ys_ecpay_late_settlements.entries.*.mer_trade_no') IS NOT NULL";
 			$args[] = $merchant_trade_no;
 		}
 		$sql .= ' ORDER BY id DESC LIMIT 1';
@@ -501,9 +531,67 @@ final class EcpayPaymentController {
 		}
 
 		return $include_history
-			? EcpayPaymentAttempt::identity_is_discoverable( $detail, $merchant_trade_no )
+			? EcpayPaymentAttempt::identity_is_discoverable(
+				$detail,
+				$merchant_trade_no,
+				(int) ( $order->id ?? 0 )
+			)
 			: ( hash_equals( (string) ( $detail['mer_trade_no'] ?? '' ), $merchant_trade_no )
 				|| hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? '' ), $merchant_trade_no ) );
+	}
+
+	/** @param array<string,string> $params */
+	private function intercept_late_callback(
+		object $order,
+		array $params,
+		string $merchant_id,
+		string $environment,
+		string $action,
+		bool $must_resolve_late = false
+	): string {
+		$result = EcpayPaymentAttempt::record_historical_callback(
+			$order,
+			$params,
+			$merchant_id,
+			$environment,
+			$action
+		);
+		if ( EcpayPaymentAttempt::LATE_CALLBACK_NOT_LATE === $result ) {
+			if ( ! $must_resolve_late ) {
+				return $result;
+			}
+			YSLogger::error( 'ecpay', 'CRITICAL: 付款狀態競態後找不到可持久化的付款歸屬，拒絕 ACK', [
+				'order_id' => (int) $order->id,
+				'action'   => $action,
+			] );
+			$this->respond_text( '0|Persist Failed', 500 );
+			return $result;
+		}
+		if ( in_array( $result, [ EcpayPaymentAttempt::LATE_CALLBACK_RETRY, EcpayPaymentAttempt::LATE_CALLBACK_REJECTED ], true ) ) {
+			YSLogger::error( 'ecpay', 'CRITICAL: 延遲付款通知對帳紀錄未落盤，拒絕 ACK', [
+				'order_id' => (int) $order->id,
+				'action'   => $action,
+			] );
+			$this->respond_text( '0|Persist Failed', 500 );
+			return $result;
+		}
+
+		if ( ! in_array( $result, [
+			EcpayPaymentAttempt::LATE_CALLBACK_PERSISTED,
+			EcpayPaymentAttempt::LATE_CALLBACK_ANOMALY_PERSISTED,
+		], true ) ) {
+			$this->respond_text( '0|Persist Failed', 500 );
+			return $result;
+		}
+
+		YSLogger::warning( 'ecpay', EcpayPaymentAttempt::LATE_CALLBACK_PERSISTED === $result
+			? '收到已歸檔綠界付款嘗試的延遲通知；已保存供人工對帳'
+			: '收到與已歸檔綠界付款憑據不符的延遲通知；異常證據已保存', [
+				'order_id' => (int) $order->id,
+				'action'   => $action,
+		] );
+		$this->respond_text( '1|OK' );
+		return $result;
 	}
 
 	/**

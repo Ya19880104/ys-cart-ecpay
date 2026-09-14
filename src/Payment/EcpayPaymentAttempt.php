@@ -25,6 +25,49 @@ final class EcpayPaymentAttempt {
 	public const ACTION_FAILURE      = 'failure';
 	public const ACTION_PAYMENT_INFO = 'payment_info';
 
+	public const LATE_SETTLEMENT_KEY = '_ys_ecpay_late_settlements';
+	public const LATE_STATE_OPEN = 'open';
+	public const LATE_STATE_PROVIDER_TERMINAL = 'provider_terminal';
+	public const LATE_STATE_PAID_MANUAL = 'paid_manual';
+	public const LATE_CALLBACK_NOT_LATE = 'not_late';
+	public const LATE_CALLBACK_REJECTED = 'rejected';
+	public const LATE_CALLBACK_PERSISTED = 'persisted';
+	public const LATE_CALLBACK_ANOMALY_PERSISTED = 'anomaly_persisted';
+	public const LATE_CALLBACK_RETRY = 'retry';
+
+	private const LATE_SCHEMA = 1;
+	private const LATE_ENTRY_SCHEMA = 1;
+	private const LATE_MAX_ENTRIES = 4;
+	private const LATE_MAX_ANOMALIES = 4;
+	private const OFFLINE_GATEWAYS = [
+		'ys_ec_ecpay_atm' => 'atm',
+		'ys_ec_ecpay_cvs' => 'cvs',
+	];
+	private const EXTERNAL_DELAYED_GATEWAYS = [
+		'ys_ec_payuni_atm'   => true,
+		'ys_ec_payuni_cvs'   => true,
+		'ys_ec_shopline_atm' => true,
+	];
+	private const KNOWN_NON_DELAYED_GATEWAYS = [
+		'ys_ec_bank_transfer'            => true,
+		'ys_ec_cod'                      => true,
+		'ys_ec_pickup_onsite'            => true,
+		'ys_ec_test_pay'                 => true,
+		'ys_ec_payuni_credit'            => true,
+		'ys_ec_payuni_installment'       => true,
+		'ys_ec_payuni_installment_embed' => true,
+		'ys_ec_payuni_applepay'          => true,
+		'ys_ec_payuni_linepay'           => true,
+		'ys_ec_payuni_jkopay'            => true,
+		'ys_ec_payuni_aftee'             => true,
+		'ys_ec_shopline_credit'          => true,
+		'ys_ec_shopline_installment'     => true,
+		'ys_ec_shopline_applepay'        => true,
+		'ys_ec_shopline_linepay'         => true,
+		'ys_ec_shopline_jkopay'          => true,
+		'ys_ec_shopline_bnpl'            => true,
+	];
+
 	/** Safe reconciliation facts which move to Core's bounded attempt history. */
 	private const HISTORY_KEYS = [
 		'mer_trade_no',
@@ -74,6 +117,456 @@ final class EcpayPaymentAttempt {
 	}
 
 	/**
+	 * Project the one safe successor exception for an exact issued ATM/CVS code.
+	 *
+	 * @param array<string,mixed> $detail
+	 * @return array{recognized:bool,actionable:bool,reason:string,message:string,warning:string,candidate:?array}
+	 */
+	public static function repay_gate( object $order, array $detail, string $successor_gateway_id ): array {
+		$base = [
+			'recognized' => false,
+			'actionable' => false,
+			'reason'     => '',
+			'message'    => '',
+			'warning'    => '',
+			'candidate'  => null,
+		];
+		$ledger = self::late_ledger( $detail );
+		if ( null === $ledger ) {
+			return array_replace( $base, [
+				'recognized' => array_key_exists( self::LATE_SETTLEMENT_KEY, $detail ),
+				'reason'     => 'ecpay_predecessor_unreadable',
+				'message'    => '先前綠界付款紀錄無法安全確認，請聯繫客服。',
+			] );
+		}
+
+		$order_id = (int) ( $order->id ?? 0 );
+		$has_open = false;
+		foreach ( $ledger['entries'] as $entry_key => $entry ) {
+			if ( ! is_string( $entry_key ) || ! is_array( $entry )
+				|| ! self::valid_late_entry_for_order( $entry_key, $entry, $order_id ) ) {
+				return array_replace( $base, [
+					'recognized' => true,
+					'reason'     => 'ecpay_predecessor_unreadable',
+					'message'    => '先前綠界付款紀錄無法安全確認，請聯繫客服。',
+				] );
+			}
+			if ( self::LATE_STATE_PAID_MANUAL === $entry['state']
+				|| self::late_entry_has_success_anomaly( $entry ) ) {
+				return array_replace( $base, [
+					'recognized' => true,
+					'reason'     => 'ecpay_predecessor_unresolved',
+					'message'    => '先前綠界付款有成功結果需要確認，請先由客服完成人工對帳。',
+				] );
+			}
+			$has_open = $has_open || self::LATE_STATE_OPEN === $entry['state'];
+		}
+		if ( $has_open ) {
+			$base['warning'] = '先前取得的繳費帳號或代碼可能仍可使用，請擇一付款，避免重複繳款。';
+		}
+		$gateway = is_string( $order->gateway_id ?? null ) ? (string) $order->gateway_id : '';
+		$method  = is_string( $order->payment_method ?? null ) ? (string) $order->payment_method : '';
+		$successor_delayed = '' === $successor_gateway_id
+			? false
+			: self::successor_may_issue_delayed_instrument( $successor_gateway_id );
+		if ( $has_open && false !== $successor_delayed ) {
+			return array_replace( $base, [
+				'recognized' => true,
+				'reason'     => 'ecpay_predecessor_unresolved',
+				'message'    => '先前取得的繳費帳號或代碼可能仍可使用，請擇一付款，避免重複繳款。',
+			] );
+		}
+		if ( ! isset( self::OFFLINE_GATEWAYS[ $gateway ] )
+			|| ! hash_equals( $gateway, $method )
+			|| 'offline_payment' !== (string) ( $order->status ?? '' ) ) {
+			return $base;
+		}
+		$base['recognized'] = true;
+		// An OPEN receipt consumes the one predecessor slot only when the current
+		// order is itself another issued ECPay offline instrument. A non-offline
+		// successor remains governed by Core's ordinary dispatch/status gates, so
+		// a terminal successor cannot leave the order permanently unpayable.
+		// PAID_MANUAL and malformed ledgers remain global blockers above.
+		if ( $has_open ) {
+			return array_replace( $base, [
+				'reason'  => 'ecpay_predecessor_unresolved',
+				'message' => '先前取得的繳費帳號或代碼可能仍可使用，請擇一付款，避免重複繳款。',
+			] );
+		}
+		if ( count( $ledger['entries'] ) >= self::LATE_MAX_ENTRIES ) {
+			return array_replace( $base, [
+				'reason'  => 'ecpay_predecessor_capacity_reached',
+				'message' => '此訂單已有多筆綠界歷史付款紀錄，請由客服人工處理。',
+			] );
+		}
+
+		$total = self::legacy_order_amount( $order );
+		$currency = is_string( $order->currency ?? null ) ? (string) $order->currency : '';
+		$mtn = (string) ( $detail['mer_trade_no'] ?? '' );
+		$attempt = YSPaymentAttempt::current( $detail );
+		$record  = YSPaymentDispatch::current( $detail );
+		$operation = (string) ( $detail['ecpay_operation_key'] ?? '' );
+		$handoff = is_array( $record['payable_handoff'] ?? null ) ? $record['payable_handoff'] : [];
+		$pay_no = self::bounded_text( $detail['pay_no'] ?? null, 100 );
+		$expires = self::bounded_text( $detail['expire_date'] ?? null, 100 );
+		$bank = self::bounded_text( $detail['bank_type'] ?? null, 30 );
+		$family = self::offline_payment_family( $detail['payment_type'] ?? null );
+		$credentials = Settings::payment_credentials();
+		$merchant_id = (string) ( $credentials['merchant_id'] ?? '' );
+		$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
+
+		if ( $order_id <= 0 || 'TWD' !== $currency || $total <= 0 || '' === $merchant_id
+			|| ! self::required_positive_amount( $detail, 'ecpay_charged_amount', $total )
+			|| ! self::canonical_merchant_trade_no( $mtn )
+			|| ! self::root_aliases_match( $detail, $mtn, true )
+			|| ! self::required_exact( $detail, 'payment_provider', 'ecpay' )
+			|| ! self::required_exact( $detail, 'payment_method', $gateway )
+			|| ! self::required_exact( $detail, 'ecpay_merchant_id', $merchant_id )
+			|| ! self::required_exact( $detail, 'ecpay_environment', $environment )
+			|| null === $pay_no || null === $expires
+			|| ( 'atm' === self::OFFLINE_GATEWAYS[ $gateway ] && null === $bank )
+			|| self::OFFLINE_GATEWAYS[ $gateway ] !== $family
+			|| ! in_array( (string) ( $detail['trade_status'] ?? '' ), [ '2', '10100073' ], true )
+			|| ! is_string( $attempt['id'] ?? null ) || ! hash_equals( $mtn, $attempt['id'] )
+			|| ! self::modern_dispatch_matches(
+				$detail,
+				$order_id,
+				$gateway,
+				$operation,
+				(string) ( $record['token'] ?? '' ),
+				[ YSPaymentDispatch::STATE_SUBMITTED ]
+			)
+			|| ! is_string( $handoff['operation_key'] ?? null )
+			|| ! hash_equals( $operation, $handoff['operation_key'] )
+			|| 'provider' !== ( $handoff['kind'] ?? null )
+			|| ! is_string( $handoff['nonce'] ?? null )
+			|| 1 !== preg_match( '/^[a-f0-9]{32}$/D', $handoff['nonce'] )
+			|| ! is_int( $handoff['claimed_at'] ?? null ) || $handoff['claimed_at'] <= 0 ) {
+			return array_replace( $base, [
+				'reason'  => 'ecpay_predecessor_custody_unavailable',
+				'message' => '綠界付款嘗試保管資料無法安全確認，請聯繫客服。',
+			] );
+		}
+
+		$entry_key = hash( 'sha256', 'ecpay|' . $order_id . '|' . $mtn );
+		if ( isset( $ledger['entries'][ $entry_key ] ) ) {
+			return array_replace( $base, [
+				'reason'  => 'ecpay_predecessor_unresolved',
+				'message' => '此綠界付款嘗試已被保存，請由客服確認後續狀態。',
+			] );
+		}
+
+		return [
+			'recognized' => true,
+			'actionable' => true,
+			'reason'     => '',
+			'message'    => '',
+			'warning'    => '先前取得的繳費帳號或代碼可能仍可使用，請擇一付款，避免重複繳款。',
+			'candidate'  => [
+				'entry_key'                  => $entry_key,
+				'order_id'                   => $order_id,
+				'gateway_id'                 => $gateway,
+				'payment_family'             => $family,
+				'mer_trade_no'               => $mtn,
+				'pay_no_digest'              => hash( 'sha256', $pay_no ),
+				'expire_digest'              => hash( 'sha256', $expires ),
+				'bank_digest'                => null === $bank ? '' : hash( 'sha256', $bank ),
+				'amount'                     => $total,
+				'currency'                   => $currency,
+				'merchant_digest'            => hash( 'sha256', $merchant_id ),
+				'environment'                => $environment,
+				'predecessor_generation'     => $attempt['generation'],
+				'predecessor_nonce_digest'   => hash( 'sha256', (string) $attempt['nonce'] ),
+				'predecessor_dispatch_digest'=> hash( 'sha256', $operation ),
+				'successor_gateway_id'        => $successor_gateway_id,
+			],
+		];
+	}
+
+	/**
+	 * Add the predecessor receipt to the same Core detail that rotates attempts.
+	 *
+	 * @param array<string,mixed> $detail
+	 * @param array<string,mixed> $candidate
+	 * @param array<string,mixed> $successor_attempt
+	 * @param array<string,mixed> $successor_dispatch
+	 * @return array<string,mixed>|null
+	 */
+	public static function append_for_rotation(
+		array $detail,
+		array $candidate,
+		array $successor_attempt,
+		array $successor_dispatch,
+		string $successor_gateway
+	): ?array {
+		$ledger = self::late_ledger( $detail );
+		$entry_key = $candidate['entry_key'] ?? null;
+		$generation = $successor_attempt['generation'] ?? null;
+		$nonce = $successor_attempt['nonce'] ?? null;
+		$operation = $successor_dispatch['operation_key'] ?? null;
+		$history = self::history_entries( $detail );
+		$archived = [] === $history ? null : end( $history );
+		$archived_attempt = is_array( $archived['attempt'] ?? null ) ? $archived['attempt'] : [];
+		$archived_fields = is_array( $archived['fields'] ?? null ) ? $archived['fields'] : [];
+		if ( null === $ledger || count( $ledger['entries'] ) >= self::LATE_MAX_ENTRIES
+			|| ! is_string( $entry_key ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $entry_key )
+			|| isset( $ledger['entries'][ $entry_key ] )
+			|| ! is_int( $generation ) || $generation <= 0
+			|| ! is_string( $nonce ) || 1 !== preg_match( '/^[a-f0-9]{32}$/D', $nonce )
+			|| ! is_string( $operation ) || 1 !== preg_match( '/^[a-f0-9]{64}$/D', $operation )
+			|| 1 !== preg_match( '/^ys_ec_[a-z0-9_]{1,90}$/D', $successor_gateway )
+			|| ! is_string( $candidate['successor_gateway_id'] ?? null )
+			|| ! hash_equals( $successor_gateway, $candidate['successor_gateway_id'] )
+			|| ! hash_equals(
+				YSPaymentDispatch::operation_key( (int) ( $candidate['order_id'] ?? 0 ), $successor_attempt ),
+				$operation
+			)
+			|| $generation !== ( $successor_dispatch['attempt_generation'] ?? null )
+			|| $nonce !== ( $successor_dispatch['attempt_nonce'] ?? null )
+			|| $successor_gateway !== ( $successor_dispatch['gateway_id'] ?? null )
+			|| 'ecpay' !== ( $archived_attempt['provider'] ?? null )
+			|| ( $candidate['gateway_id'] ?? null ) !== ( $archived_attempt['gateway_id'] ?? null )
+			|| ( $candidate['predecessor_generation'] ?? null ) !== ( $archived_attempt['generation'] ?? null )
+			|| ! is_string( $archived_attempt['nonce'] ?? null )
+			|| ! hash_equals( (string) ( $candidate['predecessor_nonce_digest'] ?? '' ), hash( 'sha256', $archived_attempt['nonce'] ) )
+			|| ! self::root_aliases_match( $archived_fields, (string) ( $candidate['mer_trade_no'] ?? '' ), true )
+			|| ! self::required_positive_amount( $archived_fields, 'ecpay_charged_amount', (int) ( $candidate['amount'] ?? 0 ) )
+			|| ! self::required_exact( $archived_fields, 'payment_provider', 'ecpay' )
+			|| ! self::required_exact( $archived_fields, 'payment_method', (string) ( $candidate['gateway_id'] ?? '' ) )
+			|| ! self::required_exact( $archived_fields, 'ecpay_environment', (string) ( $candidate['environment'] ?? '' ) )
+			|| ! is_string( $archived_fields['ecpay_merchant_id'] ?? null )
+			|| ! hash_equals(
+				(string) ( $candidate['merchant_digest'] ?? '' ),
+				hash( 'sha256', $archived_fields['ecpay_merchant_id'] )
+			)
+			|| ! is_string( $archived_fields['ecpay_operation_key'] ?? null )
+			|| ! hash_equals(
+				(string) ( $candidate['predecessor_dispatch_digest'] ?? '' ),
+				hash( 'sha256', $archived_fields['ecpay_operation_key'] )
+			) ) {
+			return null;
+		}
+
+		$entry = [
+			'schema'                       => self::LATE_ENTRY_SCHEMA,
+			'order_id'                     => (int) ( $candidate['order_id'] ?? 0 ),
+			'provider'                     => 'ecpay',
+			'gateway_id'                   => $candidate['gateway_id'] ?? '',
+			'payment_family'               => $candidate['payment_family'] ?? '',
+			'mer_trade_no'                 => $candidate['mer_trade_no'] ?? '',
+			'pay_no_digest'                => $candidate['pay_no_digest'] ?? '',
+			'expire_digest'                => $candidate['expire_digest'] ?? '',
+			'bank_digest'                  => $candidate['bank_digest'] ?? '',
+			'amount'                       => $candidate['amount'] ?? 0,
+			'currency'                     => $candidate['currency'] ?? '',
+			'merchant_digest'              => $candidate['merchant_digest'] ?? '',
+			'environment'                  => $candidate['environment'] ?? '',
+			'predecessor_generation'       => $candidate['predecessor_generation'] ?? null,
+			'predecessor_nonce_digest'     => $candidate['predecessor_nonce_digest'] ?? '',
+			'predecessor_dispatch_digest'  => $candidate['predecessor_dispatch_digest'] ?? '',
+			'successor_generation'         => $generation,
+			'successor_nonce_digest'       => hash( 'sha256', $nonce ),
+			'successor_dispatch_digest'    => hash( 'sha256', $operation ),
+			'successor_gateway_id'         => $successor_gateway,
+			'archived_at'                  => current_time( 'mysql' ),
+			'state'                        => self::LATE_STATE_OPEN,
+			'last_action'                  => '',
+			'last_rtn_code'                => '',
+			'last_trade_no'                => '',
+			'last_trade_no_digest'         => '',
+			'last_callback_evidence_digest'=> '',
+			'last_callback_at'             => null,
+			'anomalies'                    => [],
+		];
+		$entry['claim_digest'] = self::late_claim_digest( $entry );
+		if ( ! self::valid_late_entry_for_order( $entry_key, $entry, $entry['order_id'] ) ) {
+			return null;
+		}
+		$ledger['entries'][ $entry_key ] = $entry;
+		$detail[ self::LATE_SETTLEMENT_KEY ] = $ledger;
+		return $detail;
+	}
+
+	/**
+	 * Persist a signed callback against a retired receipt only.
+	 *
+	 * @param array<string,string> $params
+	 */
+	public static function record_historical_callback(
+		object $order,
+		array $params,
+		string $merchant_id,
+		string $environment,
+		string $action
+	): string {
+		$order_id = (int) ( $order->id ?? 0 );
+		$mtn = (string) ( $params['MerchantTradeNo'] ?? '' );
+		$amount_raw = (string) ( $params['TradeAmt'] ?? '' );
+		$amount = 1 === preg_match( '/^[1-9][0-9]*$/D', $amount_raw ) ? (int) $amount_raw : 0;
+		// Do not let the late interceptor swallow a malformed *current* callback.
+		// Until a canonical MTN can name an exact durable receipt, the ordinary
+		// current-attempt controller remains the authority for validation/response.
+		if ( $order_id <= 0 || ! self::canonical_merchant_trade_no( $mtn )
+			|| '' === $merchant_id || ! in_array( $environment, [ 'stage', 'live' ], true )
+			|| ! in_array( $action, [ self::ACTION_SUCCESS, self::ACTION_FAILURE, self::ACTION_PAYMENT_INFO ], true ) ) {
+			return self::LATE_CALLBACK_NOT_LATE;
+		}
+
+		$outcome = OrderPaymentDetail::mutate(
+			$order_id,
+			static function ( array $detail, int $round, &$decision ) use ( $order_id, $params, $merchant_id, $environment, $action, $mtn, $amount ): ?array {
+				unset( $round );
+				if ( ! array_key_exists( self::LATE_SETTLEMENT_KEY, $detail ) ) {
+					$decision = self::LATE_CALLBACK_NOT_LATE;
+					return null;
+				}
+				$ledger = self::late_ledger( $detail );
+				$key = hash( 'sha256', 'ecpay|' . $order_id . '|' . $mtn );
+				$entry = null === $ledger ? null : ( $ledger['entries'][ $key ] ?? null );
+				if ( null === $ledger ) {
+					$decision = self::LATE_CALLBACK_RETRY;
+					return null;
+				}
+				if ( ! is_array( $entry ) ) {
+					$decision = self::LATE_CALLBACK_NOT_LATE;
+					return null;
+				}
+				if ( ! self::valid_late_entry_for_order( $key, $entry, $order_id ) ) {
+					$decision = self::LATE_CALLBACK_RETRY;
+					return null;
+				}
+				$evidence = self::late_callback_digest( $params, $action );
+				$trade_no = self::provider_trade_no( $params['TradeNo'] ?? null );
+				$trade_digest = null === $trade_no ? '' : hash( 'sha256', $trade_no );
+				if ( $amount <= 0
+					|| ! self::late_callback_matches( $entry, $params, $merchant_id, $environment, $action, $amount ) ) {
+					$reason = self::ACTION_SUCCESS === $action && null === $trade_no
+						? 'trade_no_missing'
+						: 'receipt_mismatch';
+					$entry = self::append_late_anomaly(
+						$entry,
+						$params,
+						$merchant_id,
+						$environment,
+						$action,
+						$amount,
+						$reason,
+						$evidence
+					);
+					if ( null === $entry ) {
+						$decision = self::LATE_CALLBACK_RETRY;
+						return null;
+					}
+					$ledger['entries'][ $key ] = $entry;
+					$detail[ self::LATE_SETTLEMENT_KEY ] = $ledger;
+					$decision = self::LATE_CALLBACK_ANOMALY_PERSISTED;
+					return $detail;
+				}
+
+				if ( self::LATE_STATE_PAID_MANUAL === $entry['state'] ) {
+					$same_paid_callback = self::ACTION_SUCCESS === $action
+						&& is_string( $trade_no )
+						&& hash_equals( $trade_no, (string) $entry['last_trade_no'] )
+						&& hash_equals( $trade_digest, (string) $entry['last_trade_no_digest'] )
+						&& hash_equals( $evidence, (string) $entry['last_callback_evidence_digest'] );
+					if ( $same_paid_callback ) {
+						$decision = self::LATE_CALLBACK_PERSISTED;
+						return $detail;
+					}
+					$entry = self::append_late_anomaly(
+						$entry,
+						$params,
+						$merchant_id,
+						$environment,
+						$action,
+						$amount,
+						'divergent_after_paid',
+						$evidence
+					);
+					if ( null === $entry ) {
+						$decision = self::LATE_CALLBACK_RETRY;
+						return null;
+					}
+					$ledger['entries'][ $key ] = $entry;
+					$detail[ self::LATE_SETTLEMENT_KEY ] = $ledger;
+					$decision = self::LATE_CALLBACK_ANOMALY_PERSISTED;
+					return $detail;
+				}
+				if ( self::LATE_STATE_PROVIDER_TERMINAL === $entry['state'] && self::ACTION_SUCCESS !== $action ) {
+					if ( $action === $entry['last_action']
+						&& hash_equals( $evidence, (string) $entry['last_callback_evidence_digest'] ) ) {
+						$decision = self::LATE_CALLBACK_PERSISTED;
+						return $detail;
+					}
+					$entry = self::append_late_anomaly(
+						$entry,
+						$params,
+						$merchant_id,
+						$environment,
+						$action,
+						$amount,
+						'divergent_after_terminal',
+						$evidence
+					);
+					if ( null === $entry ) {
+						$decision = self::LATE_CALLBACK_RETRY;
+						return null;
+					}
+					$ledger['entries'][ $key ] = $entry;
+					$detail[ self::LATE_SETTLEMENT_KEY ] = $ledger;
+					$decision = self::LATE_CALLBACK_ANOMALY_PERSISTED;
+					return $detail;
+				}
+
+				$next_state = $entry['state'];
+				if ( self::ACTION_SUCCESS === $action ) {
+					$next_state = self::LATE_STATE_PAID_MANUAL;
+				} elseif ( self::ACTION_FAILURE === $action ) {
+					$next_state = self::LATE_STATE_PROVIDER_TERMINAL;
+				}
+				if ( $next_state === $entry['state']
+					&& $action === $entry['last_action']
+					&& hash_equals( $evidence, (string) $entry['last_callback_evidence_digest'] ) ) {
+					$decision = self::LATE_CALLBACK_PERSISTED;
+					return $detail;
+				}
+
+				$entry['state'] = $next_state;
+				$entry['last_action'] = $action;
+				$entry['last_rtn_code'] = (string) ( $params['RtnCode'] ?? '' );
+				$entry['last_trade_no'] = null === $trade_no ? '' : $trade_no;
+				$entry['last_trade_no_digest'] = $trade_digest;
+				$entry['last_callback_evidence_digest'] = $evidence;
+				$entry['last_callback_at'] = current_time( 'mysql' );
+				if ( ! self::valid_late_entry_for_order( $key, $entry, $order_id ) ) {
+					$decision = self::LATE_CALLBACK_RETRY;
+					return null;
+				}
+				$ledger['entries'][ $key ] = $entry;
+				$detail[ self::LATE_SETTLEMENT_KEY ] = $ledger;
+				$decision = self::LATE_CALLBACK_PERSISTED;
+				return $detail;
+			},
+			null,
+			false
+		);
+
+		if ( $outcome->is_persisted() ) {
+			$decision = (string) $outcome->get_decision();
+			if ( in_array( $decision, [ self::LATE_CALLBACK_PERSISTED, self::LATE_CALLBACK_ANOMALY_PERSISTED ], true ) ) {
+				return $decision;
+			}
+		}
+		if ( $outcome->is_aborted() ) {
+			$decision = (string) $outcome->get_decision();
+			if ( in_array( $decision, [ self::LATE_CALLBACK_NOT_LATE, self::LATE_CALLBACK_REJECTED ], true ) ) {
+				return $decision;
+			}
+		}
+		return self::LATE_CALLBACK_RETRY;
+	}
+
+	/**
 	 * Bind merchant identity, attempt id, captured facts, and order gateway in
 	 * the same Core CAS before a payable form or provider call can be exposed.
 	 *
@@ -117,6 +610,7 @@ final class EcpayPaymentAttempt {
 				unset( $cas_attempt );
 				if ( $order_id <= 0
 					|| ! self::fresh_gateway_row_can_bind( $fresh_row, $gateway_id )
+					|| ! self::fresh_order_amount_matches( $fresh_row, $charged_amount )
 					|| ! self::canonical_gateway( $gateway_id )
 					|| ! self::canonical_merchant_trade_no( $merchant_trade_no )
 					|| $charged_amount <= 0
@@ -172,7 +666,7 @@ final class EcpayPaymentAttempt {
 			true,
 			[ 'gateway_id' => $gateway_id, 'payment_method' => $gateway_id ],
 			'pending',
-			[ 'gateway_id', 'payment_method' ]
+			[ 'gateway_id', 'payment_method', 'currency', 'total' ]
 		);
 	}
 
@@ -293,8 +787,12 @@ final class EcpayPaymentAttempt {
 		];
 	}
 
-	/** Discovery only: current root or a bounded retired attempt carries this MTN. */
-	public static function identity_is_discoverable( array $detail, string $merchant_trade_no ): bool {
+	/** Discovery only: current root, retired history, or an exact durable receipt. */
+	public static function identity_is_discoverable(
+		array $detail,
+		string $merchant_trade_no,
+		int $order_id = 0
+	): bool {
 		if ( ! self::canonical_merchant_trade_no( $merchant_trade_no ) ) {
 			return false;
 		}
@@ -304,6 +802,76 @@ final class EcpayPaymentAttempt {
 		foreach ( self::history_entries( $detail ) as $entry ) {
 			$fields = is_array( $entry['fields'] ?? null ) ? $entry['fields'] : [];
 			if ( self::root_aliases_match( $fields, $merchant_trade_no ) ) {
+				return true;
+			}
+		}
+		if ( $order_id > 0 ) {
+			$ledger = self::late_ledger( $detail );
+			$key = hash( 'sha256', 'ecpay|' . $order_id . '|' . $merchant_trade_no );
+			$receipt = null === $ledger ? null : ( $ledger['entries'][ $key ] ?? null );
+			if ( is_array( $receipt )
+				&& self::valid_late_entry_for_order( $key, $receipt, $order_id )
+				&& hash_equals( (string) $receipt['mer_trade_no'], $merchant_trade_no ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Fresh dispatch guard shared by requester pre-I/O and final form delivery.
+	 *
+	 * A predecessor may become paid after Core created the successor but before
+	 * that successor sends bytes or exposes a form. The successor stays a
+	 * separate attempt for manual reconciliation, yet it must not remain payable.
+	 * OPEN/provider-terminal receipts are observations, not a reason to disturb
+	 * the current dispatch; malformed ledgers fail closed.
+	 *
+	 * @param array<string,mixed> $detail
+	 */
+	public static function successor_dispatch_allows( array $detail, int $order_id, ?object $fresh_row = null ): bool {
+		if ( $order_id <= 0 ) {
+			return false;
+		}
+		if ( null !== $fresh_row ) {
+			$attempt = YSPaymentAttempt::current( $detail );
+			$record  = YSPaymentDispatch::current( $detail );
+			if ( 'ecpay' === ( $attempt['provider'] ?? null ) ) {
+				$gateway_id = is_string( $attempt['gateway_id'] ?? null ) ? $attempt['gateway_id'] : '';
+				$charged_amount = $detail['ecpay_charged_amount'] ?? null;
+				if ( ! self::canonical_gateway( $gateway_id )
+					|| $gateway_id !== ( $record['gateway_id'] ?? null )
+					|| ! self::required_positive_amount_value( $charged_amount )
+					|| ! self::fresh_gateway_row_matches( $fresh_row, $gateway_id )
+					|| ! self::fresh_order_amount_matches( $fresh_row, (int) $charged_amount ) ) {
+					return false;
+				}
+			}
+		}
+
+		$ledger = self::late_ledger( $detail );
+		if ( null === $ledger ) {
+			return false;
+		}
+		foreach ( $ledger['entries'] as $entry_key => $entry ) {
+			if ( ! is_string( $entry_key ) || ! is_array( $entry )
+				|| ! self::valid_late_entry_for_order( $entry_key, $entry, $order_id )
+				|| self::LATE_STATE_PAID_MANUAL === $entry['state']
+				|| self::late_entry_has_success_anomaly( $entry ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** A signed retired success anomaly is unresolved money, not permission. */
+	private static function late_entry_has_success_anomaly( array $entry ): bool {
+		$anomalies = $entry['anomalies'] ?? null;
+		if ( ! is_array( $anomalies ) ) {
+			return true;
+		}
+		foreach ( $anomalies as $anomaly ) {
+			if ( is_array( $anomaly ) && self::ACTION_SUCCESS === ( $anomaly['action'] ?? null ) ) {
 				return true;
 			}
 		}
@@ -461,6 +1029,9 @@ final class EcpayPaymentAttempt {
 					|| ! is_string( $operation )
 					|| '' !== (string) ( $attempt['id'] ?? '' )
 					|| ! self::fresh_gateway_row_matches( $fresh_row, $gateway_id )
+					|| ! self::required_positive_amount_value( $charged_amount )
+					|| ! self::fresh_order_amount_matches( $fresh_row, (int) $charged_amount )
+					|| ! self::successor_dispatch_allows( $detail, $order_id, $fresh_row )
 					|| 'ecpay' !== ( $detail['payment_provider'] ?? null )
 					|| $gateway_id !== ( $detail['payment_method'] ?? null )
 					|| ! ( is_int( $charged_amount ) || ( is_string( $charged_amount ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $charged_amount ) ) )
@@ -488,7 +1059,7 @@ final class EcpayPaymentAttempt {
 			true,
 			[],
 			'pending',
-			[ 'gateway_id', 'payment_method' ]
+			[ 'gateway_id', 'payment_method', 'currency', 'total' ]
 		);
 		$detail = $outcome->get_detail();
 		if ( ! $outcome->is_persisted() || '' === $mtn || ! is_array( $detail ) ) {
@@ -503,7 +1074,8 @@ final class EcpayPaymentAttempt {
 		int $order_id,
 		string $gateway_id,
 		string $merchant_trade_no,
-		string $fingerprint
+		string $fingerprint,
+		?object $fresh_row = null
 	): bool {
 		$credentials = Settings::payment_credentials();
 		$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
@@ -516,7 +1088,7 @@ final class EcpayPaymentAttempt {
 			$fingerprint,
 			$merchant_id,
 			$environment
-		);
+		) && self::successor_dispatch_allows( $detail, $order_id, $fresh_row );
 	}
 
 	private static function browser_owner_matches_identity(
@@ -576,7 +1148,7 @@ final class EcpayPaymentAttempt {
 			return false;
 		}
 		if ( null === $verified_identity ) {
-			return self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint );
+			return self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint, $order );
 		}
 		$merchant_id = $verified_identity['merchant_id'] ?? null;
 		$environment = $verified_identity['environment'] ?? null;
@@ -592,7 +1164,8 @@ final class EcpayPaymentAttempt {
 				$fingerprint,
 				$merchant_id,
 				$environment
-			);
+			)
+			&& self::successor_dispatch_allows( $detail, $order_id, $order );
 	}
 
 	/** Reserve the one hosted browser action allowed to authorize this attempt. */
@@ -624,7 +1197,7 @@ final class EcpayPaymentAttempt {
 			): ?array {
 				unset( $cas_attempt );
 				if ( ! self::fresh_gateway_row_matches( $fresh_row, $gateway_id )
-					|| ! self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint ) ) {
+					|| ! self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint, $fresh_row ) ) {
 					$decision = YSPaymentDetailStore::STALE;
 					return null;
 				}
@@ -649,7 +1222,7 @@ final class EcpayPaymentAttempt {
 			true,
 			[],
 			'pending',
-			[ 'gateway_id', 'payment_method' ]
+			[ 'gateway_id', 'payment_method', 'currency', 'total' ]
 		);
 		return $outcome->is_persisted() && hash_equals( $nonce, (string) $outcome->get_decision() ) ? $nonce : '';
 	}
@@ -673,7 +1246,7 @@ final class EcpayPaymentAttempt {
 			): ?array {
 				unset( $cas_attempt );
 				if ( ! self::fresh_gateway_row_matches( $fresh_row, $gateway_id )
-					|| ! self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint ) ) {
+					|| ! self::browser_owner_matches( $detail, $order_id, $gateway_id, $merchant_trade_no, $fingerprint, $fresh_row ) ) {
 					$decision = YSPaymentDetailStore::STALE;
 					return null;
 				}
@@ -699,7 +1272,7 @@ final class EcpayPaymentAttempt {
 			true,
 			[],
 			'pending',
-			[ 'gateway_id', 'payment_method' ]
+			[ 'gateway_id', 'payment_method', 'currency', 'total' ]
 		);
 		return $outcome->is_persisted() && 'send_authorized' === $outcome->get_decision();
 	}
@@ -768,7 +1341,8 @@ final class EcpayPaymentAttempt {
 						$fingerprint,
 						$credential_merchant_id,
 						$environment
-					) ) {
+					)
+					|| ! self::successor_dispatch_allows( $detail, $order_id, $fresh_row ) ) {
 					$decision = YSPaymentDetailStore::STALE;
 					return null;
 				}
@@ -818,7 +1392,7 @@ final class EcpayPaymentAttempt {
 			true,
 			[],
 			'pending',
-			[ 'gateway_id', 'payment_method' ]
+			[ 'gateway_id', 'payment_method', 'currency', 'total' ]
 		);
 		return $outcome->is_persisted() && hash_equals( $handoff_nonce, (string) $outcome->get_decision() );
 	}
@@ -867,6 +1441,405 @@ final class EcpayPaymentAttempt {
 			[ 'gateway_id', 'payment_method' ]
 		);
 		return $outcome->is_persisted() && 'released' === $outcome->get_decision();
+	}
+
+	/** @return array{schema:int,entries:array<string,array<string,mixed>>}|null */
+	private static function late_ledger( array $detail ): ?array {
+		if ( ! array_key_exists( self::LATE_SETTLEMENT_KEY, $detail ) ) {
+			return [ 'schema' => self::LATE_SCHEMA, 'entries' => [] ];
+		}
+
+		$ledger = $detail[ self::LATE_SETTLEMENT_KEY ];
+		$ledger_keys = is_array( $ledger ) ? array_keys( $ledger ) : [];
+		sort( $ledger_keys );
+		if ( ! is_array( $ledger )
+			|| [ 'entries', 'schema' ] !== $ledger_keys
+			|| self::LATE_SCHEMA !== ( $ledger['schema'] ?? null )
+			|| ! is_array( $ledger['entries'] ?? null )
+			|| ( [] !== $ledger['entries'] && array_is_list( $ledger['entries'] ) )
+			|| count( $ledger['entries'] ) > self::LATE_MAX_ENTRIES ) {
+			return null;
+		}
+
+		return [
+			'schema'  => self::LATE_SCHEMA,
+			'entries' => $ledger['entries'],
+		];
+	}
+
+	/** @param array<string,mixed> $entry */
+	private static function valid_late_entry_for_order( string $entry_key, array $entry, int $order_id ): bool {
+		$expected_keys = [
+			'anomalies',
+			'archived_at',
+			'amount',
+			'bank_digest',
+			'claim_digest',
+			'currency',
+			'environment',
+			'expire_digest',
+			'gateway_id',
+			'last_action',
+			'last_callback_at',
+			'last_callback_evidence_digest',
+			'last_rtn_code',
+			'last_trade_no',
+			'last_trade_no_digest',
+			'mer_trade_no',
+			'merchant_digest',
+			'order_id',
+			'pay_no_digest',
+			'payment_family',
+			'predecessor_dispatch_digest',
+			'predecessor_generation',
+			'predecessor_nonce_digest',
+			'provider',
+			'schema',
+			'state',
+			'successor_dispatch_digest',
+			'successor_gateway_id',
+			'successor_generation',
+			'successor_nonce_digest',
+		];
+		$actual_keys = array_keys( $entry );
+		sort( $expected_keys );
+		sort( $actual_keys );
+		if ( $expected_keys !== $actual_keys
+			|| self::LATE_ENTRY_SCHEMA !== ( $entry['schema'] ?? null )
+			|| $order_id <= 0 || $order_id !== ( $entry['order_id'] ?? null )
+			|| 'ecpay' !== ( $entry['provider'] ?? null )
+			|| ! isset( self::OFFLINE_GATEWAYS[ (string) ( $entry['gateway_id'] ?? '' ) ] )
+			|| self::OFFLINE_GATEWAYS[ (string) $entry['gateway_id'] ] !== ( $entry['payment_family'] ?? null )
+			|| ! self::canonical_merchant_trade_no( (string) ( $entry['mer_trade_no'] ?? '' ) )
+			|| ! hash_equals( hash( 'sha256', 'ecpay|' . $order_id . '|' . $entry['mer_trade_no'] ), $entry_key )
+			|| ! is_int( $entry['amount'] ?? null ) || $entry['amount'] <= 0
+			|| 'TWD' !== ( $entry['currency'] ?? null )
+			|| ! in_array( $entry['environment'] ?? null, [ 'stage', 'live' ], true )
+			|| ! self::digest_or_empty( $entry['bank_digest'] ?? null )
+			|| ( 'atm' === ( $entry['payment_family'] ?? null ) && ! self::digest( $entry['bank_digest'] ?? null ) )
+			|| ! self::digest( $entry['pay_no_digest'] ?? null )
+			|| ! self::digest( $entry['expire_digest'] ?? null )
+			|| ! self::digest( $entry['merchant_digest'] ?? null )
+			|| ! is_int( $entry['predecessor_generation'] ?? null ) || $entry['predecessor_generation'] <= 0
+			|| ! self::digest( $entry['predecessor_nonce_digest'] ?? null )
+			|| ! self::digest( $entry['predecessor_dispatch_digest'] ?? null )
+			|| ! is_int( $entry['successor_generation'] ?? null )
+			|| $entry['successor_generation'] !== $entry['predecessor_generation'] + 1
+			|| ! self::digest( $entry['successor_nonce_digest'] ?? null )
+			|| ! self::digest( $entry['successor_dispatch_digest'] ?? null )
+			|| 1 !== preg_match( '/^ys_ec_[a-z0-9_]{1,90}$/D', (string) ( $entry['successor_gateway_id'] ?? '' ) )
+			|| ! self::mysql_time( $entry['archived_at'] ?? null )
+			|| ! self::digest( $entry['claim_digest'] ?? null )
+			|| ! hash_equals( self::late_claim_digest( $entry ), (string) $entry['claim_digest'] )
+			|| ! in_array( $entry['state'] ?? null, [ self::LATE_STATE_OPEN, self::LATE_STATE_PROVIDER_TERMINAL, self::LATE_STATE_PAID_MANUAL ], true )
+			|| ! self::provider_trade_no_or_empty( $entry['last_trade_no'] ?? null )
+			|| ! self::digest_or_empty( $entry['last_trade_no_digest'] ?? null )
+			|| ( '' === $entry['last_trade_no'] ) !== ( '' === $entry['last_trade_no_digest'] )
+			|| ( '' !== $entry['last_trade_no']
+				&& ! hash_equals( hash( 'sha256', $entry['last_trade_no'] ), (string) $entry['last_trade_no_digest'] ) )
+			|| ! self::digest_or_empty( $entry['last_callback_evidence_digest'] ?? null )
+			|| ! self::valid_late_anomalies( $entry['anomalies'] ?? null, $order_id, (string) ( $entry['mer_trade_no'] ?? '' ) ) ) {
+			return false;
+		}
+
+		$action = $entry['last_action'] ?? null;
+		$rtn_code = $entry['last_rtn_code'] ?? null;
+		$at = $entry['last_callback_at'] ?? null;
+		if ( self::LATE_STATE_OPEN === $entry['state'] && '' === $action ) {
+			return '' === $rtn_code
+				&& '' === $entry['last_trade_no']
+				&& '' === $entry['last_trade_no_digest']
+				&& '' === $entry['last_callback_evidence_digest']
+				&& null === $at;
+		}
+		if ( self::LATE_STATE_OPEN === $entry['state'] ) {
+			return self::ACTION_PAYMENT_INFO === $action
+				&& in_array( $rtn_code, [ '2', '10100073' ], true )
+				&& self::digest( $entry['last_callback_evidence_digest'] )
+				&& self::mysql_time( $at );
+		}
+		if ( self::LATE_STATE_PROVIDER_TERMINAL === $entry['state'] ) {
+			return self::ACTION_FAILURE === $action
+				&& is_string( $rtn_code )
+				&& 1 === preg_match( '/^[0-9]{1,10}$/D', $rtn_code )
+				&& ! in_array( $rtn_code, [ '1', '2', '10100073' ], true )
+				&& self::digest( $entry['last_callback_evidence_digest'] )
+				&& self::mysql_time( $at );
+		}
+
+		return self::ACTION_SUCCESS === $action
+			&& '1' === $rtn_code
+			&& null !== self::provider_trade_no( $entry['last_trade_no'] )
+			&& hash_equals( hash( 'sha256', $entry['last_trade_no'] ), (string) $entry['last_trade_no_digest'] )
+			&& self::digest( $entry['last_trade_no_digest'] )
+			&& self::digest( $entry['last_callback_evidence_digest'] )
+			&& self::mysql_time( $at );
+	}
+
+	/** @param array<string,mixed> $entry */
+	private static function late_claim_digest( array $entry ): string {
+		$claim = [];
+		foreach ( [
+			'schema', 'order_id', 'provider', 'gateway_id', 'payment_family', 'mer_trade_no',
+			'pay_no_digest', 'expire_digest', 'bank_digest', 'amount', 'currency', 'merchant_digest',
+			'environment', 'predecessor_generation', 'predecessor_nonce_digest',
+			'predecessor_dispatch_digest', 'successor_generation', 'successor_nonce_digest',
+			'successor_dispatch_digest', 'successor_gateway_id', 'archived_at',
+		] as $key ) {
+			$claim[ $key ] = $entry[ $key ] ?? null;
+		}
+		return hash( 'sha256', (string) json_encode( $claim, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+	}
+
+	/** @param mixed $anomalies */
+	private static function valid_late_anomalies( mixed $anomalies, int $order_id, string $merchant_trade_no ): bool {
+		if ( ! is_array( $anomalies )
+			|| ( [] !== $anomalies && array_is_list( $anomalies ) )
+			|| count( $anomalies ) > self::LATE_MAX_ANOMALIES ) {
+			return false;
+		}
+		foreach ( $anomalies as $key => $anomaly ) {
+			if ( ! is_string( $key ) || ! is_array( $anomaly ) || array_is_list( $anomaly ) ) {
+				return false;
+			}
+			$expected_keys = [
+				'action', 'amount', 'environment', 'evidence_digest', 'merchant_digest',
+				'reason', 'recorded_at', 'rtn_code', 'schema', 'trade_no',
+			];
+			$actual_keys = array_keys( $anomaly );
+			sort( $expected_keys );
+			sort( $actual_keys );
+			if ( $expected_keys !== $actual_keys
+				|| 1 !== ( $anomaly['schema'] ?? null )
+				|| ! in_array( $anomaly['reason'] ?? null, [
+					'receipt_mismatch', 'trade_no_missing', 'divergent_after_paid', 'divergent_after_terminal',
+				], true )
+				|| ! in_array( $anomaly['action'] ?? null, [ self::ACTION_SUCCESS, self::ACTION_FAILURE, self::ACTION_PAYMENT_INFO ], true )
+				|| ! is_int( $anomaly['amount'] ?? null ) || $anomaly['amount'] < 0
+				|| ! self::provider_trade_no_or_empty( $anomaly['trade_no'] ?? null )
+				|| ! is_string( $anomaly['rtn_code'] ?? null )
+				|| 1 !== preg_match( '/^(?:[0-9]{1,10})?$/D', $anomaly['rtn_code'] )
+				|| ! self::digest( $anomaly['merchant_digest'] ?? null )
+				|| ! in_array( $anomaly['environment'] ?? null, [ 'stage', 'live' ], true )
+				|| ! self::digest( $anomaly['evidence_digest'] ?? null )
+				|| ! self::mysql_time( $anomaly['recorded_at'] ?? null )
+				|| ! hash_equals(
+					hash( 'sha256', 'ecpay-anomaly|' . $order_id . '|' . $merchant_trade_no . '|' . $anomaly['reason'] . '|' . $anomaly['evidence_digest'] ),
+					$key
+				) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Add one immutable, bounded receipt for a verified callback which names a
+	 * known predecessor but cannot alter its authoritative state.
+	 *
+	 * @param array<string,mixed> $entry
+	 * @param array<string,string> $params
+	 * @return array<string,mixed>|null
+	 */
+	private static function append_late_anomaly(
+		array $entry,
+		array $params,
+		string $merchant_id,
+		string $environment,
+		string $action,
+		int $amount,
+		string $reason,
+		string $evidence
+	): ?array {
+		$anomalies = $entry['anomalies'] ?? null;
+		if ( ! self::valid_late_anomalies( $anomalies, (int) $entry['order_id'], (string) $entry['mer_trade_no'] ) ) {
+			return null;
+		}
+		$trade_no = self::provider_trade_no( $params['TradeNo'] ?? null ) ?? '';
+		$rtn_code = self::bounded_text( $params['RtnCode'] ?? null, 10 );
+		$rtn_code = is_string( $rtn_code ) && 1 === preg_match( '/^[0-9]{1,10}$/D', $rtn_code ) ? $rtn_code : '';
+		$key = hash(
+			'sha256',
+			'ecpay-anomaly|' . $entry['order_id'] . '|' . $entry['mer_trade_no'] . '|' . $reason . '|' . $evidence
+		);
+		$anomaly = [
+			'schema'          => 1,
+			'reason'          => $reason,
+			'action'          => $action,
+			'rtn_code'        => $rtn_code,
+			'amount'          => max( 0, $amount ),
+			'trade_no'        => $trade_no,
+			'merchant_digest' => hash( 'sha256', $merchant_id ),
+			'environment'     => $environment,
+			'evidence_digest' => $evidence,
+			'recorded_at'     => current_time( 'mysql' ),
+		];
+		if ( array_key_exists( $key, $anomalies ) ) {
+			$existing = $anomalies[ $key ];
+			unset( $anomaly['recorded_at'] );
+			if ( ! is_array( $existing ) ) {
+				return null;
+			}
+			$existing_without_time = $existing;
+			unset( $existing_without_time['recorded_at'] );
+			return $anomaly === $existing_without_time ? $entry : null;
+		}
+		if ( count( $anomalies ) >= self::LATE_MAX_ANOMALIES ) {
+			return null;
+		}
+		$anomalies[ $key ] = $anomaly;
+		$entry['anomalies'] = $anomalies;
+		return self::valid_late_anomalies( $anomalies, (int) $entry['order_id'], (string) $entry['mer_trade_no'] )
+			? $entry
+			: null;
+	}
+
+	/** @param array<string,mixed> $entry @param array<string,string> $params */
+	private static function late_callback_matches(
+		array $entry,
+		array $params,
+		string $merchant_id,
+		string $environment,
+		string $action,
+		int $amount
+	): bool {
+		$mtn = self::bounded_text( $params['MerchantTradeNo'] ?? null, 20 );
+		$payment_type = self::bounded_text( $params['PaymentType'] ?? null, 100 );
+		$rtn_code = self::bounded_text( $params['RtnCode'] ?? null, 10 );
+		if ( null === $mtn || null === $payment_type || null === $rtn_code
+			|| ! hash_equals( (string) $entry['mer_trade_no'], $mtn )
+			|| $amount !== (int) $entry['amount']
+			|| ! hash_equals( (string) $entry['merchant_digest'], hash( 'sha256', $merchant_id ) )
+			|| ! hash_equals( (string) $entry['environment'], $environment )
+			|| ! hash_equals( $merchant_id, (string) ( $params['MerchantID'] ?? '' ) )
+			|| ! hash_equals( (string) $entry['payment_family'], self::offline_payment_family( $payment_type ) ) ) {
+			return false;
+		}
+
+		if ( self::ACTION_SUCCESS === $action ) {
+			return '1' === $rtn_code && null !== self::provider_trade_no( $params['TradeNo'] ?? null );
+		}
+		if ( self::ACTION_FAILURE === $action ) {
+			return 1 === preg_match( '/^[0-9]{1,10}$/D', $rtn_code )
+				&& ! in_array( $rtn_code, [ '1', '2', '10100073' ], true );
+		}
+		if ( ! in_array( $rtn_code, [ '2', '10100073' ], true ) ) {
+			return false;
+		}
+
+		$pay_no = 'atm' === $entry['payment_family']
+			? self::bounded_text( $params['vAccount'] ?? null, 100 )
+			: self::bounded_text( $params['PaymentNo'] ?? null, 100 );
+		$expires = self::bounded_text( $params['ExpireDate'] ?? null, 100 );
+		if ( null === $pay_no || null === $expires
+			|| ! hash_equals( (string) $entry['pay_no_digest'], hash( 'sha256', $pay_no ) )
+			|| ! hash_equals( (string) $entry['expire_digest'], hash( 'sha256', $expires ) ) ) {
+			return false;
+		}
+		if ( 'atm' !== $entry['payment_family'] ) {
+			return true;
+		}
+		$bank = self::bounded_text( $params['BankCode'] ?? null, 30 );
+		return null !== $bank
+			&& self::digest( $entry['bank_digest'] )
+			&& hash_equals( (string) $entry['bank_digest'], hash( 'sha256', $bank ) );
+	}
+
+	/** @param array<string,string> $params */
+	private static function late_callback_digest( array $params, string $action ): string {
+		$trade_no = self::bounded_text( $params['TradeNo'] ?? null, 100 );
+		$family = self::offline_payment_family( $params['PaymentType'] ?? null );
+		$pay_no = self::bounded_text(
+			'atm' === $family ? ( $params['vAccount'] ?? null ) : ( $params['PaymentNo'] ?? null ),
+			100
+		);
+		$expires = self::bounded_text( $params['ExpireDate'] ?? null, 100 );
+		$bank = self::bounded_text( $params['BankCode'] ?? null, 30 );
+		$canonical = [
+			'action'            => $action,
+			'merchant_id'       => (string) ( $params['MerchantID'] ?? '' ),
+			'merchant_trade_no' => (string) ( $params['MerchantTradeNo'] ?? '' ),
+			'trade_amount'      => (string) ( $params['TradeAmt'] ?? '' ),
+			'rtn_code'          => (string) ( $params['RtnCode'] ?? '' ),
+			'payment_type'      => (string) ( $params['PaymentType'] ?? '' ),
+			'trade_no_digest'   => null === $trade_no ? '' : hash( 'sha256', $trade_no ),
+			'pay_no_digest'     => null === $pay_no ? '' : hash( 'sha256', $pay_no ),
+			'expire_digest'     => null === $expires ? '' : hash( 'sha256', $expires ),
+			'bank_digest'       => null === $bank ? '' : hash( 'sha256', $bank ),
+		];
+		return hash( 'sha256', (string) json_encode( $canonical, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) );
+	}
+
+	private static function offline_payment_family( mixed $value ): string {
+		if ( ! is_string( $value ) ) {
+			return '';
+		}
+		$value = strtoupper( trim( $value ) );
+		if ( 'ATM' === $value || 1 === preg_match( '/^ATM(?:_|$)/D', $value ) ) {
+			return 'atm';
+		}
+		if ( in_array( $value, [ 'CVS', 'CVS_CODE' ], true )
+			|| 1 === preg_match( '/^(?:CVS|BARCODE)(?:_|$)/D', $value ) ) {
+			return 'cvs';
+		}
+		return '';
+	}
+
+	/**
+	 * Classify whether selecting a gateway can expose another long-lived payment
+	 * account/code while an archived ECPay instrument is still payable.
+	 *
+	 * ECPay descriptors are the provider's closed source of truth. Cross-provider
+	 * delayed gateways are the exact current Core inventory; a genuinely unknown
+	 * target is deliberately unclassified (null) and therefore fails closed at
+	 * the OPEN-receipt gate. This does not grant any predecessor rotation right.
+	 */
+	private static function successor_may_issue_delayed_instrument( string $gateway_id ): ?bool {
+		$descriptor = EcpayPaymentCatalog::get( $gateway_id );
+		if ( is_array( $descriptor ) ) {
+			$choose_payment = (string) ( $descriptor['choose_payment'] ?? '' );
+			return in_array( $choose_payment, [ 'ATM', 'CVS', 'BARCODE' ], true );
+		}
+		if ( isset( self::EXTERNAL_DELAYED_GATEWAYS[ $gateway_id ] ) ) {
+			return true;
+		}
+		if ( isset( self::KNOWN_NON_DELAYED_GATEWAYS[ $gateway_id ] ) ) {
+			return false;
+		}
+		return null;
+	}
+
+	private static function bounded_text( mixed $value, int $max_bytes ): ?string {
+		if ( ! is_string( $value ) || $max_bytes <= 0 || '' === $value
+			|| trim( $value ) !== $value || strlen( $value ) > $max_bytes
+			|| 1 === preg_match( '/[\x00-\x1F\x7F]/D', $value ) ) {
+			return null;
+		}
+		return $value;
+	}
+
+	private static function provider_trade_no( mixed $value ): ?string {
+		$value = self::bounded_text( $value, 100 );
+		return null !== $value && 1 === preg_match( '/^[A-Za-z0-9._-]{1,100}$/D', $value )
+			? $value
+			: null;
+	}
+
+	private static function provider_trade_no_or_empty( mixed $value ): bool {
+		return '' === $value || null !== self::provider_trade_no( $value );
+	}
+
+	private static function digest( mixed $value ): bool {
+		return is_string( $value ) && 1 === preg_match( '/^[a-f0-9]{64}$/D', $value );
+	}
+
+	private static function digest_or_empty( mixed $value ): bool {
+		return '' === $value || self::digest( $value );
+	}
+
+	private static function mysql_time( mixed $value ): bool {
+		return is_string( $value )
+			&& 1 === preg_match( '/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/D', $value );
 	}
 
 	/** @param array<string,mixed> $claim */
@@ -1058,6 +2031,15 @@ final class EcpayPaymentAttempt {
 			&& is_string( $row->payment_method )
 			&& hash_equals( $row->gateway_id, $gateway_id )
 			&& hash_equals( $row->payment_method, $gateway_id );
+	}
+
+	/** The signed ECPay amount is always a positive whole TWD amount. */
+	private static function fresh_order_amount_matches( ?object $row, int $charged_amount ): bool {
+		return is_object( $row )
+			&& property_exists( $row, 'currency' )
+			&& is_string( $row->currency )
+			&& hash_equals( 'TWD', $row->currency )
+			&& self::legacy_order_amount( $row ) === $charged_amount;
 	}
 
 	private static function fresh_legacy_gateway_row_matches( ?object $row, string $gateway_id ): bool {

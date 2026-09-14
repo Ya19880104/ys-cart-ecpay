@@ -168,7 +168,8 @@ final class EcpgPaymentController {
 			(int) $order->id,
 			$gateway_id,
 			$attempt_param,
-			$fingerprint
+			$fingerprint,
+			$order
 		) ) {
 			$this->render_notice( __( '付款連結已失效', 'ys-cart-ecpay' ), __( '這個付款頁屬於先前的付款嘗試，未載入付款元件。請從重新付款取得新連結。', 'ys-cart-ecpay' ), EcpgOrderContext::repay_url( $order ), __( '重新付款', 'ys-cart-ecpay' ) );
 		}
@@ -695,7 +696,8 @@ final class EcpgPaymentController {
 			(int) $order->id,
 			$gateway_id,
 			$this->string_param( $request, 'attempt' ),
-			$this->string_param( $request, 'afp' )
+			$this->string_param( $request, 'afp' ),
+			$order
 		) ? $order : null;
 	}
 
