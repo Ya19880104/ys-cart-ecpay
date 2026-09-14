@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.11 - 2026-09-15
+
+- ECPay 重新付款 rotation 以同一 CAS 歸檔精確 predecessor 收據；晚到 AIO／ATM／超商／ECPG callback 只在持久寫入已付款、已失敗或有限異常證據後 ACK，重播與舊別名不能改寫目前 attempt。
+- hosted form、browser send 與 callback lifecycle 都重驗 fresh gateway、payment method、TWD 金額、環境及 merchant 身分；owner 或金額／幣別漂移會 fail closed，不會交付過時付款表單。
+- BARCODE 與未知延遲目標沿用保守阻擋，舊 0.5.9 hosted identity 與真正 pre-attempt 訂單仍保留既有有界相容；最低 Core 版本維持 2.67.11。
+
 ## 0.5.10 - 2026-09-14
 
 - 每次重新付款會在 Core 的同一 rotation CAS 歸檔舊 ECPay MerchantTradeNo、金額、環境與對帳／退款證據；延遲 AIO／ATM／ECPG callback 只能被找到與 ACK，不能寫進新 attempt。
