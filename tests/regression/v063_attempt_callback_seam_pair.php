@@ -331,16 +331,19 @@ namespace {
 		$options = EcpayAttempt::callback_lifecycle_options( $claim, $patch, [ 'gateway_trade_no' => 'OLD-TRADE' ] );
 		$result = Store::mutate(
 			7,
-			static function ( array $detail, int $attempt, &$decision ) use ( $guard, $patch ): ?array {
+			static function ( array $detail, int $attempt, &$decision, ?object $fresh_row = null ) use ( $guard, $patch ): ?array {
 				unset( $attempt );
-				if ( ! $guard( $detail ) ) { $decision = 'stale'; return null; }
+				if ( ! $guard( $detail, $fresh_row ) ) { $decision = 'stale'; return null; }
 				return $patch( $detail );
 			},
 			5,
 			true,
 			$options['columns'] ?? [],
 			'pending',
-			array_keys( $options['expected_column_values'] ?? [] )
+			array_values( array_unique( array_merge(
+				[ 'gateway_id', 'payment_method', 'gateway_trade_no' ],
+				array_keys( $options['expected_column_values'] ?? [] )
+			) ) )
 		);
 		$zero_writes = $zero_writes
 			&& Result::ABORTED === $result->get_outcome()
@@ -355,20 +358,36 @@ namespace {
 	$db = $seed( $current );
 	$db->before_write = static function ( AttemptSeamWpdb $race ) use ( $next_bytes ): void { $race->value = $next_bytes; };
 	$guard = EcpayAttempt::callback_guard( $current_claim );
+	$exact_fresh = (object) [
+		'gateway_id'       => $gateway,
+		'payment_method'   => $gateway,
+		'gateway_trade_no' => '',
+	];
+	$check(
+		$guard( $current, $exact_fresh )
+		&& ! $guard( $current, (object) [ 'gateway_id' => $gateway, 'payment_method' => $gateway . ' ', 'gateway_trade_no' => '' ] )
+		&& ! $guard( $current, (object) [ 'gateway_id' => $gateway, 'payment_method' => 'ys_ec_payuni_credit', 'gateway_trade_no' => '' ] )
+		&& ! $guard( $current, (object) [ 'gateway_id' => strtoupper( $gateway ), 'payment_method' => $gateway, 'gateway_trade_no' => '' ] )
+		&& ! $guard( $current ),
+		'R6a modern callback guard rechecks both fresh scalar gateway owners byte-exact on every CAS attempt'
+	);
 	$patch = EcpayAttempt::callback_detail_patch( $current_claim, [ 'gwsr' => 'LOSER' ] );
 	$options = EcpayAttempt::callback_lifecycle_options( $current_claim, $patch, [ 'gateway_trade_no' => 'LOSER-TRADE' ] );
 	$race_result = Store::mutate(
 		7,
-		static function ( array $detail, int $attempt, &$decision ) use ( $guard, $patch ): ?array {
+		static function ( array $detail, int $attempt, &$decision, ?object $fresh_row = null ) use ( $guard, $patch ): ?array {
 			unset( $attempt );
-			if ( ! $guard( $detail ) ) { $decision = 'stale'; return null; }
+			if ( ! $guard( $detail, $fresh_row ) ) { $decision = 'stale'; return null; }
 			return $patch( $detail );
 		},
 		5,
 		true,
 		$options['columns'],
 		'pending',
-		array_keys( $options['expected_column_values'] )
+		array_values( array_unique( array_merge(
+			[ 'gateway_id', 'payment_method', 'gateway_trade_no' ],
+			array_keys( $options['expected_column_values'] )
+		) ) )
 	);
 	$check(
 		Result::ABORTED === $race_result->get_outcome()
@@ -421,10 +440,15 @@ namespace {
 	$legacy_options = is_array( $legacy_claim )
 		? EcpayAttempt::callback_lifecycle_options( $legacy_claim, EcpayAttempt::callback_detail_patch( $legacy_claim ) )
 		: [];
+	$legacy_guard = is_array( $legacy_claim ) ? EcpayAttempt::callback_guard( $legacy_claim ) : null;
 	$check(
 		'legacy' === ( $legacy_claim['mode'] ?? null )
 		&& ! isset( $legacy_options['expected_column_values'] )
-		&& ! isset( $legacy_options['columns']['gateway_id'] ),
+		&& ! isset( $legacy_options['columns']['gateway_id'] )
+		&& is_callable( $legacy_guard )
+		&& $legacy_guard( $legacy_detail, (object) [ 'gateway_id' => null, 'payment_method' => $gateway ] )
+		&& ! $legacy_guard( $legacy_detail, (object) [ 'gateway_id' => '', 'payment_method' => $gateway ] )
+		&& ! $legacy_guard( $legacy_detail, (object) [ 'gateway_id' => null, 'payment_method' => $gateway . ' ' ] ),
 		'R11 bounded pre-attempt legacy identity keeps detail-only compatibility when scalar gateway is NULL'
 	);
 	$foreign_scalar_order = (object) [

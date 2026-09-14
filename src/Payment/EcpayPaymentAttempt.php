@@ -357,7 +357,22 @@ final class EcpayPaymentAttempt {
 
 	/** @param array<string,mixed> $claim */
 	public static function callback_guard( array $claim ): callable {
-		return static fn ( array $detail ): bool => self::callback_claim_matches( $detail, $claim );
+		return static function ( array $detail, ?object $fresh_row = null ) use ( $claim ): bool {
+			if ( ! self::callback_claim_matches( $detail, $claim ) ) {
+				return false;
+			}
+
+			$gateway_id = (string) ( $claim['gateway_id'] ?? '' );
+			if ( ! empty( $claim['scalar_gateway_bound'] ) ) {
+				return self::fresh_gateway_row_matches( $fresh_row, $gateway_id );
+			}
+
+			// Only a genuine pre-attempt legacy row may retain the historical
+			// detail-only path. Its scalar gateway is NULL, while payment_method
+			// still has to own the same ECPay method byte-for-byte.
+			return 'legacy' === (string) ( $claim['mode'] ?? '' )
+				&& self::fresh_legacy_gateway_row_matches( $fresh_row, $gateway_id );
+		};
 	}
 
 	/** @param array<string,mixed> $claim @param array<string,scalar> $fields */
@@ -1042,6 +1057,15 @@ final class EcpayPaymentAttempt {
 			&& is_string( $row->gateway_id )
 			&& is_string( $row->payment_method )
 			&& hash_equals( $row->gateway_id, $gateway_id )
+			&& hash_equals( $row->payment_method, $gateway_id );
+	}
+
+	private static function fresh_legacy_gateway_row_matches( ?object $row, string $gateway_id ): bool {
+		return is_object( $row )
+			&& property_exists( $row, 'gateway_id' )
+			&& property_exists( $row, 'payment_method' )
+			&& null === $row->gateway_id
+			&& is_string( $row->payment_method )
 			&& hash_equals( $row->payment_method, $gateway_id );
 	}
 
