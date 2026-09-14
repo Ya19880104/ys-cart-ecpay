@@ -61,6 +61,7 @@ namespace {
 namespace YangSheep\Ecommerce\Models {
 	final class YSOrder {
 		public static int $tks_calls = 0;
+		public static function forget( int $id ): void { unset( $id ); }
 
 		public static function find( int $id ): ?object {
 			if ( 7 !== $id ) {

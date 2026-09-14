@@ -7,7 +7,6 @@ defined( 'ABSPATH' ) || exit;
 
 use YangSheep\Ecommerce\Gateways\YSGatewayInterface;
 use YangSheep\Ecommerce\Models\YSOrder;
-use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Plugin;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
@@ -194,7 +193,17 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 			];
 		}
 
-		$error = $this->persist_payment_identity( $order_id, $merchant_trade_no, (int) ( $form_data['charged_amount'] ?? 0 ) );
+		$credential_context = is_array( $form_data['credential_context'] ?? null )
+			? $form_data['credential_context']
+			: null;
+		unset( $form_data['credential_context'] );
+		$error = $this->persist_payment_identity(
+			$order_id,
+			$merchant_trade_no,
+			(int) ( $form_data['charged_amount'] ?? 0 ),
+			[],
+			$credential_context
+		);
 		if ( null !== $error ) {
 			return $error;
 		}
@@ -223,37 +232,40 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 	 * @param string              $merchant_trade_no 穩定交易識別（見 make_merchant_trade_no）
 	 * @param int                 $charged_amount    **實際送出的金額**——退款端據此判定全額／部分
 	 * @param array<string,mixed> $extra_detail      方式專屬的額外 payment_detail 鍵（例如站內付的流程種類）
+	 * @param array{merchant_id:string,environment:string}|null $credential_context 已簽表單／請求的非機密憑證快照
 	 * @return array<string,mixed>|null null＝全部落盤；否則是可直接回傳的失敗結果
 	 */
-	protected function persist_payment_identity( int $order_id, string $merchant_trade_no, int $charged_amount, array $extra_detail = [] ): ?array {
-		$method_id     = $this->get_id();
-		$operation_key = class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch' )
-			? (string) \YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch::current_operation_key()
-			: '';
-		$credentials = Settings::payment_credentials();
-		$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
-		$merchant_id = (string) ( $credentials['merchant_id'] ?? '' );
+	protected function persist_payment_identity( int $order_id, string $merchant_trade_no, int $charged_amount, array $extra_detail = [], ?array $credential_context = null ): ?array {
+		$method_id = $this->get_id();
+		if ( null === $credential_context ) {
+			$credentials = Settings::payment_credentials();
+			$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
+			$merchant_id = (string) ( $credentials['merchant_id'] ?? '' );
+		} else {
+			$environment = is_string( $credential_context['environment'] ?? null )
+				? $credential_context['environment']
+				: '';
+			$merchant_id = is_string( $credential_context['merchant_id'] ?? null )
+				? trim( $credential_context['merchant_id'] )
+				: '';
+		}
+		if ( '' === $merchant_id || ! in_array( $environment, [ 'stage', 'live' ], true ) ) {
+			return [
+				'success'   => false,
+				'outcome'   => 'rejected_terminal',
+				'retryable' => false,
+				'message'   => __( '付款商店身分無法確認，未交付付款要求。', 'ys-cart-ecpay' ),
+			];
+		}
 
-		$persisted = OrderPaymentDetail::mutate(
+		$persisted = EcpayPaymentAttempt::bind_payment_identity(
 			$order_id,
-			static function ( array $detail ) use ( $merchant_trade_no, $method_id, $charged_amount, $environment, $merchant_id, $operation_key, $extra_detail ): array {
-				$detail['mer_trade_no']            = $merchant_trade_no;
-				$detail['ecpay_merchant_trade_no'] = $merchant_trade_no;
-				// 這個交易編號屬於哪一次 dispatch operation——續作時據此沿用同一個。
-				$detail['ecpay_operation_key'] = $operation_key;
-				$detail['payment_provider']    = 'ecpay';
-				$detail['payment_method']      = $method_id;
-				// 實際送出的金額——退款端據此判定全額／部分，不再回頭讀 $order->total。
-				$detail['ecpay_charged_amount'] = $charged_amount;
-				// 環境與商店身分：設定被切換（stage↔live、換商店代號）之後，若不綁定
-				// 這兩個值，退款會拿著**另一個環境／另一家商店**的憑證去操作這筆交易。
-				$detail['ecpay_environment'] = $environment;
-				$detail['ecpay_merchant_id'] = $merchant_id;
-				foreach ( $extra_detail as $key => $value ) {
-					$detail[ (string) $key ] = $value;
-				}
-				return $detail;
-			}
+			$method_id,
+			$merchant_trade_no,
+			$charged_amount,
+			$environment,
+			$merchant_id,
+			$extra_detail
 		);
 
 		if ( ! $persisted->is_persisted() ) {
@@ -265,26 +277,6 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 				],
 				$persisted->to_log_context()
 			) );
-
-			return [
-				'success'   => false,
-				'outcome'   => 'rejected_terminal',
-				'retryable' => false,
-				'message'   => __( '付款資料寫入失敗，請重新整理後再試一次。', 'ys-cart-ecpay' ),
-			];
-		}
-
-		$identity = ScalarColumnWriter::write( $order_id, [
-			'gateway_id'     => $method_id,
-			'payment_method' => $method_id,
-		] );
-
-		if ( ! ScalarColumnWriter::is_persisted( $identity ) ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: gateway identity 寫入失敗，拒絕簽發付款表單', [
-				'order_id' => $order_id,
-				'method'   => $method_id,
-				'state'    => $identity['state'],
-			] );
 
 			return [
 				'success'   => false,

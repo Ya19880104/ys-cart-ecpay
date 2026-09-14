@@ -193,9 +193,14 @@ final class EcpgOrderContext {
 	}
 
 	/** 託管付款頁（本站）：process_payment 交給結帳頁跳轉的目標。 */
-	public static function pay_page_url( object $order ): string {
+	public static function pay_page_url( object $order, string $merchant_trade_no = '', string $fingerprint = '' ): string {
+		$query = [ 'order' => (int) ( $order->id ?? 0 ), 'key' => self::order_key( $order ) ];
+		if ( '' !== $merchant_trade_no && '' !== $fingerprint ) {
+			$query['attempt'] = $merchant_trade_no;
+			$query['afp']     = $fingerprint;
+		}
 		return add_query_arg(
-			[ 'order' => (int) ( $order->id ?? 0 ), 'key' => self::order_key( $order ) ],
+			$query,
 			rest_url( 'ys-ecommerce/v1/ecpay/ecpg/pay' )
 		);
 	}

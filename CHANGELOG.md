@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.10 - 2026-09-14
+
+- 每次重新付款會在 Core 的同一 rotation CAS 歸檔舊 ECPay MerchantTradeNo、金額、環境與對帳／退款證據；延遲 AIO／ATM／ECPG callback 只能被找到與 ACK，不能寫進新 attempt。
+- AIO 與 ECPG callback 將 incoming MerchantTradeNo、attempt/dispatch、merchant、環境、金額與 scalar gateway 在同一 lifecycle CAS 重驗；成功證據、TradeNo 與狀態不再分段寫入。
+- ATM／超商取號只把 `vAccount`／`PaymentNo` 當作繳費識別，`BankCode` 保留為銀行資料；QueryTrade 缺少 `PaymentType` 時沿用舊單的 `payment_method` 類型，缺少新識別則保留已存值。
+- ECPG 託管付款頁帶 exact attempt fingerprint，provider I/O 前後都重驗 owner，已送出但回應不明保持 pending，明確失敗只有在 guarded terminal 寫入成功後才提供重新付款。
+- 最低 Core 版本提高至 2.67.11；舊 0.5.9 託管連結與 pre-attempt 訂單保留有界相容路徑。
+
 ## 0.5.9 - 2026-09-14
 
 - ECPay 設定頁改用與 Core provider 一致的頁首儲存動作、分頁導覽及緊湊 section，不再用單一白色 Surface 包住整頁。

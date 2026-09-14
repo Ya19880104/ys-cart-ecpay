@@ -10,7 +10,6 @@ use YangSheep\Ecommerce\Gateways\YSOrderScopedTokenChargeGatewayInterface;
 use YangSheep\Ecommerce\Models\YSCreditCard;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\Ecommerce\Models\YSSubscription;
-use YangSheep\Ecommerce\Services\Payment\YSPaymentDetailStore;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch;
 use YangSheep\Ecommerce\Services\Payment\YSSavedCardChargePolicy;
 use YangSheep\Ecommerce\Utils\YSLogger;
@@ -117,10 +116,15 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 		if ( null !== $error ) {
 			return $error;
 		}
+		$bound = OrderPaymentDetail::read( $order_id );
+		$fingerprint = is_array( $bound ) ? EcpayPaymentAttempt::browser_fingerprint( $bound ) : '';
+		if ( '' === $fingerprint ) {
+			return $this->rejected_terminal( __( '付款嘗試識別無法確認，未交付付款頁。', 'ys-cart-ecpay' ) );
+		}
 
 		return [
 			'success'      => true,
-			'redirect_url' => EcpgOrderContext::pay_page_url( $order ),
+			'redirect_url' => EcpgOrderContext::pay_page_url( $order, $merchant_trade_no, $fingerprint ),
 			'message'      => '',
 		];
 	}
@@ -212,31 +216,25 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 			return $this->rejected_terminal( '續訂交易識別已被其他付款嘗試占用。' );
 		}
 
-		$credentials = Settings::payment_credentials();
-		$mutated     = $baseline;
-		$mutated['mer_trade_no']            = $merchant_trade_no;
-		$mutated['ecpay_merchant_trade_no'] = $merchant_trade_no;
-		$mutated['ecpay_operation_key']     = (string) YSPaymentDispatch::current_operation_key();
-		$mutated['payment_provider']        = 'ecpay';
-		$mutated['payment_method']          = $this->get_id();
-		$mutated['ecpay_charged_amount']    = $order_amount;
-		$mutated['ecpay_environment']       = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
-		$mutated['ecpay_merchant_id']       = (string) ( $credentials['merchant_id'] ?? '' );
-		$mutated['ecpay_ecpg_flow']         = 'token_charge';
-		$mutated['ecpay_ecpg_member_id']    = EcpgOrderContext::member_id( $customer_id );
-		if ( ! $this->persist_renewal_detail( $order_id, $baseline, $mutated ) ) {
-			return $this->rejected_terminal( '交易識別無法落盤，未送出任何扣款。' );
-		}
-
 		$member_id     = EcpgOrderContext::member_id( $customer_id );
 		$consumer_info = EcpgOrderContext::consumer_info( $order, $member_id );
+		$identity_error = null;
 		$result        = $this->client()->create_payment_with_card_id( [
 			'BindCardID'   => $bind_card_id,
 			'OrderInfo'    => EcpgOrderContext::order_info( $order, $merchant_trade_no, $order_amount, EcpgOrderContext::return_url() ),
 			'ConsumerInfo' => $consumer_info,
 			'Need3D'       => 0,
 			'CustomField'  => '',
-		] );
+		], null, function ( array $credential_context ) use ( &$identity_error, $order_id, $merchant_trade_no, $order_amount, $member_id ): bool {
+			$identity_error = $this->persist_payment_identity( $order_id, $merchant_trade_no, $order_amount, [
+				'ecpay_ecpg_flow'      => 'token_charge',
+				'ecpay_ecpg_member_id' => $member_id,
+			], $credential_context );
+			return null === $identity_error;
+		} );
+		if ( null !== $identity_error ) {
+			return $identity_error;
+		}
 
 		if ( EcpgClient::OUTCOME_REJECTED === $result['outcome'] ) {
 			// 什麼都沒送出（client 的前置檢查）。
@@ -309,26 +307,6 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 			$this->client = new EcpgClient();
 		}
 		return $this->client;
-	}
-
-	/**
-	 * 續訂單 payment_detail 的 delta 寫入（與 PayUni `persist_payment_detail()` 同式）：
-	 * 只套用這段程式碼實際改動的鍵，STALE（dispatch 已被接管）視為失敗。
-	 */
-	private function persist_renewal_detail( int $order_id, array $baseline, array $mutated ): bool {
-		if ( ! class_exists( YSPaymentDetailStore::class ) || ! method_exists( YSPaymentDetailStore::class, 'apply_delta' ) ) {
-			return false;
-		}
-		$result = YSPaymentDetailStore::apply_delta( $order_id, $baseline, $mutated );
-		if ( defined( YSPaymentDetailStore::class . '::STALE' ) && YSPaymentDetailStore::STALE === $result->get_decision() ) {
-			YSLogger::warning( 'ecpay', 'dispatch 已被接管，續訂付款明細未寫入', [ 'order_id' => $order_id ] );
-			return false;
-		}
-		if ( ! $result->is_persisted() ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: 續訂付款明細寫入失敗', array_merge( [ 'order_id' => $order_id ], $result->to_log_context() ) );
-			return false;
-		}
-		return true;
 	}
 
 	/** 前置檢查沒過＝確定未送出任何東西，不可重複對同一訂單重試。 */

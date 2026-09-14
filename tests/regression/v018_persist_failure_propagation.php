@@ -245,7 +245,7 @@ namespace {
     // 因此以「寫入結果的判定必須出現在 ACK 之前，且失敗分支回非 1|OK」為契約。
     // 對應的行為面由 (a) 與 v015 涵蓋（同一個 OrderPaymentDetail 回傳型別）。
     $payment = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Api/EcpayPaymentController.php'));
-    $pos_check = strpos($payment, '$gwsr_written->is_persisted()');
+    $pos_check = strpos($payment, '! $this->transition_persisted( $transition');
     $pos_fail  = strpos($payment, "'0|Persist Failed'");
     // SimulatePaid=1 is intentionally ACKed before real-payment persistence,
     // because it must not mutate paid state at all.  The persistence contract
@@ -254,13 +254,13 @@ namespace {
     $assert(
         false !== $pos_check && false !== $pos_fail && false !== $pos_ok
         && $pos_check < $pos_ok && $pos_fail < $pos_ok,
-        '(b) 真實付款通知：gwsr 寫入結果先判定，失敗回 0|Persist Failed 且早於最終成功 ACK'
+        '(b) 真實付款通知：原子生命週期寫入結果先判定，失敗回 0|Persist Failed 且早於最終成功 ACK'
     );
 
     $assert(
         str_contains($payment, '$transition = YSPaymentLifecycleService::mark_paid(')
-        && str_contains($payment, "empty( \$transition['success'] )"),
-        '(b2) 付款通知：生命週期推進結果也必須判定（推進失敗同樣不得 ACK）'
+        && str_contains($payment, '$this->transition_persisted( $transition'),
+        '(b2) 付款通知：生命週期推進結果由相容判定器處理（推進失敗同樣不得 ACK）'
     );
 
     // 合流後（0.2.16 main）：callback 走 label-bound 序列化閉包——
@@ -282,9 +282,9 @@ namespace {
     // (d) 負向：三個進入點都不得再出現「忽略回傳值」的呼叫形態
     $base = str_replace("\r\n", "\n", (string) file_get_contents(dirname(__DIR__, 2) . '/src/Payment/EcpayGatewayBase.php'));
     $assert(
-        1 === preg_match('/\$persisted\s*=\s*OrderPaymentDetail::mutate\(/', $base)
-        && 0 === preg_match('/^\s*OrderPaymentDetail::mutate\(/m', $base),
-        '(d) GatewayBase 不得再有捨棄回傳值的 OrderPaymentDetail::mutate() 呼叫'
+        1 === preg_match('/\$persisted\s*=\s*EcpayPaymentAttempt::bind_payment_identity\(/', $base)
+        && 0 === preg_match('/^\s*EcpayPaymentAttempt::bind_payment_identity\(/m', $base),
+        '(d) GatewayBase 不得捨棄 attempt identity 綁定結果'
     );
 
     $assert(

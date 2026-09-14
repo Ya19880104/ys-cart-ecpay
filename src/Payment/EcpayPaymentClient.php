@@ -33,7 +33,7 @@ final class EcpayPaymentClient {
 	 *                                            `UnionPay=1`、分期的 `CreditInstallment`）。
 	 *                                            會在**簽章之前**併入，因此一定納入
 	 *                                            CheckMacValue。
-	 * @return array{action_url:string,fields:array<string,string>,charged_amount:int}
+	 * @return array{action_url:string,fields:array<string,string>,charged_amount:int,credential_context:array{merchant_id:string,environment:string}}
 	 * @throws \InvalidArgumentException 金額非 canonical TWD 正整數，或額外欄位不合法
 	 */
 	public function build_aio_form( object $order, string $merchant_trade_no, string $choose_payment, array $extra_fields = [] ): array {
@@ -46,6 +46,7 @@ final class EcpayPaymentClient {
 		}
 
 		$credentials = Settings::payment_credentials();
+		$environment = ! empty( $credentials['test_mode'] ) ? 'stage' : 'live';
 
 		$total = $order->total ?? null;
 		if ( is_string( $total ) && '' !== $total && is_numeric( $total ) ) {
@@ -114,11 +115,19 @@ final class EcpayPaymentClient {
 		}
 
 		return [
-			'action_url'     => Settings::payment_endpoint(),
+			// action 與 CMV 必須來自同一份 snapshot；不可在 lease fence 後重讀設定。
+			'action_url'     => 'stage' === $environment
+				? 'https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5'
+				: 'https://payment.ecpay.com.tw/Cashier/AioCheckOut/V5',
 			'fields'         => $fields,
 			// 呼叫端必須把這個值持久化：它是**實際送出的金額**，退款端據此判定
 			// 全額／部分，不得再回頭讀 $order->total（可能已被其他流程改動）。
 			'charged_amount' => $amount,
+			// 非機密內部 handoff：caller 用與表單簽章相同的商店身分做 attempt CAS。
+			'credential_context' => [
+				'merchant_id' => (string) $credentials['merchant_id'],
+				'environment' => $environment,
+			],
 		];
 	}
 

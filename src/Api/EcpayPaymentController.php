@@ -8,7 +8,7 @@ defined( 'ABSPATH' ) || exit;
 use YangSheep\Ecommerce\DTOs\YSPaymentDetailDTO;
 use YangSheep\Ecommerce\Models\YSOrder;
 use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
-use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 use YangSheep\Ecommerce\Security\YSInboundPermission;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\Ecommerce\Utils\YSLogger;
@@ -76,7 +76,8 @@ final class EcpayPaymentController {
 
 	public function notify( \WP_REST_Request $request ): void {
 		$params = $this->params( $request );
-		if ( ! $this->verify_payment_payload( $params ) ) {
+		$verified_identity = null;
+		if ( ! $this->verify_payment_payload( $params, $verified_identity ) || ! is_array( $verified_identity ) ) {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
 
@@ -89,14 +90,52 @@ final class EcpayPaymentController {
 		// total 可能在建單之後被其他流程改動（改價、折扣重算），拿它比對會把一筆
 		// 正確的付款判成金額不符；而 `(int) round( total )` 更會讓 1000.5 的訂單
 		// 「剛好」對上 1001 的付款，把錯付當成正確。
-		$detail_now      = OrderPaymentDetail::read( (int) $order->id );
-		$charged         = is_array( $detail_now ) && isset( $detail_now['ecpay_charged_amount'] )
-			? (int) $detail_now['ecpay_charged_amount']
-			: null;
-		$expected_amount = null !== $charged ? $charged : (int) round( (float) ( $order->total ?? 0 ) );
-		$received_amount = (int) ( $params['TradeAmt'] ?? 0 );
-		if ( $expected_amount > 0 && $expected_amount !== $received_amount ) {
+		$detail_now = OrderPaymentDetail::read( (int) $order->id );
+		if ( null === $detail_now ) {
+			$this->respond_text( '0|Persist Failed', 500 );
+		}
+		$received_raw    = (string) ( $params['TradeAmt'] ?? '' );
+		$received_amount = 1 === preg_match( '/^[1-9][0-9]*$/D', $received_raw ) ? (int) $received_raw : 0;
+		$merchant_trade_no = (string) ( $params['MerchantTradeNo'] ?? '' );
+		$merchant_id       = (string) $verified_identity['merchant_id'];
+		$environment       = (string) $verified_identity['environment'];
+		$action            = '1' === (string) ( $params['RtnCode'] ?? '' )
+			? EcpayPaymentAttempt::ACTION_SUCCESS
+			: EcpayPaymentAttempt::ACTION_FAILURE;
+		if ( EcpayPaymentAttempt::historical_callback_matches(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$received_amount,
+			$merchant_id,
+			$environment
+		) ) {
+			YSLogger::warning( 'ecpay', '收到已歸檔付款嘗試的延遲通知；已 ACK 且零寫入', [
+				'order_id' => (int) $order->id,
+			] );
+			$this->respond_text( '1|OK' );
+		}
+		$charged         = $detail_now['ecpay_charged_amount'] ?? null;
+		if ( $received_amount <= 0
+			|| ( array_key_exists( 'ecpay_charged_amount', $detail_now )
+				&& ( ! ( is_int( $charged ) || ( is_string( $charged ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $charged ) ) )
+					|| (int) $charged !== $received_amount ) ) ) {
 			$this->respond_text( '0|Amount Mismatch', 400 );
+		}
+		$callback_claim = EcpayPaymentAttempt::callback_claim(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$received_amount,
+			$merchant_id,
+			$environment,
+			$action
+		);
+		if ( null === $callback_claim ) {
+			YSLogger::warning( 'ecpay', '付款通知屬於過時或無法證明的付款嘗試；已 ACK 且零寫入', [
+				'order_id' => (int) $order->id,
+			] );
+			$this->respond_text( '1|OK' );
 		}
 
 		// ECPay's backend simulation is signed and reports RtnCode=1, but no funds
@@ -110,7 +149,9 @@ final class EcpayPaymentController {
 			return;
 		}
 
-		$detail = $this->detail_from_payload( $params );
+		$detail = $this->detail_from_payload( $params, (string) ( $callback_claim['gateway_id'] ?? '' ) );
+		$guard  = EcpayPaymentAttempt::callback_guard( $callback_claim );
+		$installment_fallback = false;
 		if ( '1' === (string) ( $params['RtnCode'] ?? '' ) ) {
 			// v0.3.0：持久化信用卡授權單號 gwsr（NeedExtraPaidInfo=Y 回傳、已過
 			// CheckMacValue 驗證）——退款的關帳狀態查詢（CreditDetail/QueryTrade）依賴它。
@@ -145,49 +186,19 @@ final class EcpayPaymentController {
 			//
 			// 🔴 日後若加上「我們自己按期數加費」，這條檢查會從稽核升級為對帳關鍵：
 			// 落回一次付清代表消費者被多收了手續費卻沒拿到分期。
-			$paid_method = is_array( $detail_now ) ? (string) ( $detail_now['payment_method'] ?? '' ) : '';
+			$paid_method = (string) ( $callback_claim['gateway_id'] ?? '' );
 			if ( 'ys_ec_ecpay_credit_installment' === $paid_method && array_key_exists( 'stage', $params ) ) {
 				$reported_stage = (int) $program_fields['ecpay_stage'];
 				if ( $reported_stage < 2 ) {
 					$program_fields['ecpay_installment_fallback'] = '1';
-					YSLogger::error( 'ecpay', '分期交易被綠界改以一次付清成立（廠商可能未開通該期數）', [
-						'order_id'          => (int) $order->id,
-						'merchant_trade_no' => sanitize_text_field( (string) ( $params['MerchantTradeNo'] ?? '' ) ),
-						'reported_stage'    => $reported_stage,
-					] );
+					$installment_fallback = true;
 				}
 			}
 
 			$gwsr = sanitize_text_field( (string) ( $params['gwsr'] ?? '' ) );
-			if ( '' !== $gwsr || $program_fields ) {
-				// 走核心共用 CAS。此處與退款 ledger（`_ys_ecpay_refunds`）是同一個
-				// payment_detail 欄位的兩個併發 writer；read-modify-write 會在
-				// webhook 與退款重疊時整包覆蓋對方的寫入。
-				$gwsr_written = OrderPaymentDetail::mutate(
-					(int) $order->id,
-					static function ( array $detail ) use ( $gwsr, $program_fields ): array {
-						if ( '' !== $gwsr ) {
-							$detail['gwsr'] = $gwsr;
-						}
-						foreach ( $program_fields as $key => $value ) {
-							$detail[ $key ] = $value;
-						}
-						return $detail;
-					}
-				);
-
-				// v0.3.0：寫不進去就**不得** ACK。gwsr 是關帳狀態查詢（CreditDetail/
-				// QueryTrade）的唯一輸入，缺了它整條退款路徑都無法判定該送 E／N／R。
-				// 回 1|OK 會讓綠界停止重送，這個欄位就永久遺失了；回非 1|OK 才能讓
-				// 綠界依其重送機制再送一次。
-				if ( ! $gwsr_written->is_persisted() ) {
-					YSLogger::error( 'ecpay', 'CRITICAL: 付款通知的授權／卡別欄位寫入失敗，拒絕 ACK 以觸發綠界重送', array_merge(
-						[ 'order_id' => (int) $order->id ],
-						$gwsr_written->to_log_context()
-					) );
-					$this->respond_text( '0|Persist Failed', 500 );
-					return;
-				}
+			$callback_fields = $program_fields;
+			if ( '' !== $gwsr ) {
+				$callback_fields['gwsr'] = $gwsr;
 			}
 
 			// v0.3.0：TradeNo 是退款、對帳、客服查詢的唯一交易識別碼。
@@ -197,11 +208,9 @@ final class EcpayPaymentController {
 			//      「這筆交易沒有編號」，而下游會把那當成事實。
 			//   2. 值**確實落在 DB 裡**。`YSOrder::update()` 回 true 不代表寫進去了
 			//      （affected=0 也算 true，而那可能是「訂單不存在」）。
-			$trade_no = ScalarColumnWriter::required_string(
-				sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) )
-			);
+			$trade_no = trim( sanitize_text_field( (string) ( $params['TradeNo'] ?? '' ) ) );
 
-			if ( null === $trade_no ) {
+			if ( '' === $trade_no ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: 付款成功通知未帶 TradeNo，拒絕 ACK', [
 					'order_id' => (int) $order->id,
 				] );
@@ -209,18 +218,29 @@ final class EcpayPaymentController {
 				return;
 			}
 
-			$written = ScalarColumnWriter::write( (int) $order->id, [ 'gateway_trade_no' => $trade_no ] );
-			if ( ! ScalarColumnWriter::is_persisted( $written ) ) {
-				YSLogger::error( 'ecpay', 'CRITICAL: gateway_trade_no 寫入失敗，拒絕 ACK 以觸發綠界重送', [
-					'order_id' => (int) $order->id,
-					'state'    => $written['state'],
-				] );
-				$this->respond_text( '0|Persist Failed', 500 );
-				return;
-			}
-			$transition = YSPaymentLifecycleService::mark_paid( (int) $order->id, $detail, 'webhook_ecpay_notify' );
+			$transition = YSPaymentLifecycleService::mark_paid(
+				(int) $order->id,
+				$detail,
+				'webhook_ecpay_notify',
+				$guard,
+				EcpayPaymentAttempt::callback_lifecycle_options(
+					$callback_claim,
+					EcpayPaymentAttempt::callback_detail_patch( $callback_claim, $callback_fields ),
+					[ 'gateway_trade_no' => $trade_no ]
+				)
+			);
 		} else {
-			$transition = YSPaymentLifecycleService::mark_failed( (int) $order->id, $detail, 'webhook_ecpay_notify' );
+			$transition = YSPaymentLifecycleService::mark_failed(
+				(int) $order->id,
+				$detail,
+				'webhook_ecpay_notify',
+				'failed',
+				$guard,
+				EcpayPaymentAttempt::callback_lifecycle_options(
+					$callback_claim,
+					EcpayPaymentAttempt::callback_detail_patch( $callback_claim )
+				)
+			);
 		}
 
 		// v0.3.0：生命週期推進失敗（含 payment_detail CAS 失敗）同樣不得 ACK——
@@ -229,13 +249,21 @@ final class EcpayPaymentController {
 			$this->respond_text( '0|Persist Failed', 500 );
 			return;
 		}
+		if ( $installment_fallback && 'stale' !== (string) ( $transition['outcome'] ?? '' ) ) {
+			YSLogger::error( 'ecpay', '分期交易被綠界改以一次付清成立（廠商可能未開通該期數）', [
+				'order_id'          => (int) $order->id,
+				'merchant_trade_no' => sanitize_text_field( (string) ( $params['MerchantTradeNo'] ?? '' ) ),
+				'reported_stage'    => (int) ( $program_fields['ecpay_stage'] ?? 0 ),
+			] );
+		}
 
 		$this->respond_text( '1|OK' );
 	}
 
 	public function payment_info( \WP_REST_Request $request ): void {
 		$params = $this->params( $request );
-		if ( ! $this->verify_payment_payload( $params ) ) {
+		$verified_identity = null;
+		if ( ! $this->verify_payment_payload( $params, $verified_identity ) || ! is_array( $verified_identity ) ) {
 			$this->respond_text( '0|Invalid CheckMacValue', 400 );
 		}
 
@@ -243,13 +271,56 @@ final class EcpayPaymentController {
 		if ( ! $order ) {
 			$this->respond_text( '0|Order Not Found', 404 );
 		}
+		$detail_now = OrderPaymentDetail::read( (int) $order->id );
+		if ( null === $detail_now ) {
+			$this->respond_text( '0|Persist Failed', 500 );
+		}
+		$received_raw    = (string) ( $params['TradeAmt'] ?? '' );
+		$received_amount = 1 === preg_match( '/^[1-9][0-9]*$/D', $received_raw ) ? (int) $received_raw : 0;
+		$merchant_trade_no = (string) ( $params['MerchantTradeNo'] ?? '' );
+		$merchant_id       = (string) $verified_identity['merchant_id'];
+		$environment       = (string) $verified_identity['environment'];
+		if ( EcpayPaymentAttempt::historical_callback_matches(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$received_amount,
+			$merchant_id,
+			$environment
+		) ) {
+			$this->respond_text( '1|OK' );
+		}
+		$charged = $detail_now['ecpay_charged_amount'] ?? null;
+		if ( $received_amount <= 0
+			|| ( array_key_exists( 'ecpay_charged_amount', $detail_now )
+				&& ( ! ( is_int( $charged ) || ( is_string( $charged ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $charged ) ) )
+					|| (int) $charged !== $received_amount ) ) ) {
+			$this->respond_text( '0|Amount Mismatch', 400 );
+		}
+		$claim = EcpayPaymentAttempt::callback_claim(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$received_amount,
+			$merchant_id,
+			$environment,
+			EcpayPaymentAttempt::ACTION_PAYMENT_INFO
+		);
+		if ( null === $claim ) {
+			$this->respond_text( '1|OK' );
+		}
 
 		$rtn_code = (string) ( $params['RtnCode'] ?? '' );
 		if ( in_array( $rtn_code, [ '2', '10100073' ], true ) ) {
 			$transition = YSPaymentLifecycleService::mark_pending_offline(
 				(int) $order->id,
-				$this->detail_from_payload( $params ),
-				'webhook_ecpay_payment_info'
+				$this->detail_from_payload( $params, (string) ( $claim['gateway_id'] ?? '' ) ),
+				'webhook_ecpay_payment_info',
+				EcpayPaymentAttempt::callback_guard( $claim ),
+				EcpayPaymentAttempt::callback_lifecycle_options(
+					$claim,
+					EcpayPaymentAttempt::callback_detail_patch( $claim )
+				)
 			);
 
 			// v0.3.0：取號資訊（繳費代碼、虛擬帳號、繳費期限）沒落盤就**不得** ACK。
@@ -267,7 +338,7 @@ final class EcpayPaymentController {
 	public function return_page( \WP_REST_Request $request ): void {
 		$params = $this->params( $request, true );
 		$order  = $this->verify_payment_payload( $params )
-			? $this->find_order_by_merchant_trade_no( (string) ( $params['MerchantTradeNo'] ?? '' ) )
+			? $this->find_order_by_merchant_trade_no( (string) ( $params['MerchantTradeNo'] ?? '' ), false )
 			: null;
 
 		if ( $order ) {
@@ -310,7 +381,8 @@ final class EcpayPaymentController {
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function verify_payment_payload( array $params ): bool {
+	private function verify_payment_payload( array $params, ?array &$verified_identity = null ): bool {
+		$verified_identity = null;
 		// 🔴 R14 reader lease：驗章讀的也是當下憑證——設定 commit 期間讀到的
 		// 可能是半套用 tuple，據以判「驗章失敗」會誤拒真回呼。拿不到 lease＝
 		// 回 false → 呼叫端回 0|Invalid（非 2xx），綠界會重送 notify；
@@ -332,13 +404,20 @@ final class EcpayPaymentController {
 			return false;
 		}
 
-		return CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' );
+		if ( ! CheckMacValue::verify( $params, $credentials['hash_key'], $credentials['hash_iv'], 'sha256' ) ) {
+			return false;
+		}
+		$verified_identity = [
+			'merchant_id' => (string) $credentials['merchant_id'],
+			'environment' => ! empty( $credentials['test_mode'] ) ? 'stage' : 'live',
+		];
+		return true;
 	}
 
 	/**
 	 * @param array<string,string> $params
 	 */
-	private function detail_from_payload( array $params ): YSPaymentDetailDTO {
+	private function detail_from_payload( array $params, string $gateway_id = '' ): YSPaymentDetailDTO {
 		$detail = [
 			'payment_type'     => sanitize_text_field( (string) ( $params['PaymentType'] ?? '' ) ),
 			'trade_status'     => sanitize_text_field( (string) ( $params['RtnCode'] ?? '' ) ),
@@ -347,53 +426,84 @@ final class EcpayPaymentController {
 			'mer_trade_no'     => sanitize_text_field( (string) ( $params['MerchantTradeNo'] ?? '' ) ),
 			'response_code'    => sanitize_text_field( (string) ( $params['RtnCode'] ?? '' ) ),
 			'response_message' => sanitize_text_field( (string) ( $params['RtnMsg'] ?? '' ) ),
-			'pay_no'           => sanitize_text_field( (string) ( $params['PaymentNo'] ?? $params['BankCode'] ?? $params['vAccount'] ?? '' ) ),
 			'bank_type'        => sanitize_text_field( (string) ( $params['BankCode'] ?? '' ) ),
 			'expire_date'      => sanitize_text_field( (string) ( $params['ExpireDate'] ?? '' ) ),
 			'card_4no'         => sanitize_text_field( (string) ( $params['card4no'] ?? $params['Card4No'] ?? '' ) ),
 			'card_6no'         => sanitize_text_field( (string) ( $params['card6no'] ?? $params['Card6No'] ?? '' ) ),
 			'auth_code'        => sanitize_text_field( (string) ( $params['auth_code'] ?? $params['AuthCode'] ?? '' ) ),
 		];
+		$pay_no = $this->offline_pay_no( $params, $gateway_id );
+		if ( '' !== $pay_no ) {
+			// BankCode is routing metadata, never the customer's payment reference.
+			// Omitting an unavailable fresh value lets Core preserve a previously
+			// persisted ATM account / CVS code during callback reconciliation.
+			$detail['pay_no'] = sanitize_text_field( $pay_no );
+		}
 
 		return YSPaymentDetailDTO::from_legacy_array( $detail, '' );
 	}
 
-	private function find_order_by_merchant_trade_no( string $merchant_trade_no ): ?object {
+	/** @param array<string,string> $params */
+	private function offline_pay_no( array $params, string $gateway_id = '' ): string {
+		$payment_type = strtoupper( trim( (string) ( $params['PaymentType'] ?? '' ) ) );
+		$is_atm       = 'ys_ec_ecpay_atm' === strtolower( trim( $gateway_id ) )
+			|| 1 === preg_match( '/^ATM(?:_|$)/D', $payment_type );
+		$is_cvs       = 'ys_ec_ecpay_cvs' === strtolower( trim( $gateway_id ) )
+			|| 1 === preg_match( '/^CVS(?:_|$)/D', $payment_type );
+
+		if ( $is_atm ) {
+			return trim( (string) ( $params['vAccount'] ?? '' ) );
+		}
+		if ( $is_cvs ) {
+			return trim( (string) ( $params['PaymentNo'] ?? '' ) );
+		}
+
+		return trim( (string) ( $params['PaymentNo'] ?? '' ) );
+	}
+
+	private function find_order_by_merchant_trade_no( string $merchant_trade_no, bool $include_history = true ): ?object {
 		if ( '' === $merchant_trade_no ) {
 			return null;
 		}
 
 		if ( preg_match( '/^YS(\d+)T[A-Za-z0-9]+$/', $merchant_trade_no, $matches ) ) {
+			YSOrder::forget( (int) $matches[1] );
 			$order = YSOrder::find( (int) $matches[1] );
-			if ( $order && $this->order_has_merchant_trade_no( $order, $merchant_trade_no ) ) {
+			if ( $order && $this->order_has_merchant_trade_no( $order, $merchant_trade_no, $include_history ) ) {
 				return $order;
 			}
 		}
 
 		global $wpdb;
 		$table = $wpdb->prefix . YS_ECOMMERCE_TABLE_PREFIX . 'orders';
-		$order = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT * FROM {$table}
-				 WHERE JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.mer_trade_no')) = %s
-				    OR JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.ecpay_merchant_trade_no')) = %s
-				 ORDER BY id DESC LIMIT 1",
-				$merchant_trade_no,
-				$merchant_trade_no
-			)
-		);
+		$sql = "SELECT * FROM {$table}
+			 WHERE JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.mer_trade_no')) = %s
+			    OR JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.ecpay_merchant_trade_no')) = %s";
+		$args = [ $merchant_trade_no, $merchant_trade_no ];
+		if ( $include_history ) {
+			$sql .= " OR JSON_SEARCH(payment_detail, 'one', %s, NULL,
+				'$.ys_payment_attempt_history[*].fields.mer_trade_no',
+				'$.ys_payment_attempt_history[*].fields.ecpay_merchant_trade_no') IS NOT NULL";
+			$args[] = $merchant_trade_no;
+		}
+		$sql .= ' ORDER BY id DESC LIMIT 1';
+		$order = $wpdb->get_row( $wpdb->prepare( $sql, ...$args ) );
 
-		return $order ?: null;
+		return is_object( $order ) && $this->order_has_merchant_trade_no( $order, $merchant_trade_no, $include_history )
+			? $order
+			: null;
 	}
 
-	private function order_has_merchant_trade_no( object $order, string $merchant_trade_no ): bool {
+	private function order_has_merchant_trade_no( object $order, string $merchant_trade_no, bool $include_history = true ): bool {
 		$detail = json_decode( (string) ( $order->payment_detail ?? '{}' ), true );
 		if ( ! is_array( $detail ) ) {
 			return false;
 		}
 
-		return hash_equals( (string) ( $detail['mer_trade_no'] ?? '' ), $merchant_trade_no )
-			|| hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? '' ), $merchant_trade_no );
+		return $include_history
+			? EcpayPaymentAttempt::identity_is_discoverable( $detail, $merchant_trade_no )
+			: ( hash_equals( (string) ( $detail['mer_trade_no'] ?? '' ), $merchant_trade_no )
+				|| hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? '' ), $merchant_trade_no ) );
 	}
 
 	/**

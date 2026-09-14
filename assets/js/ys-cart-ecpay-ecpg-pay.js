@@ -114,7 +114,7 @@
 						setStatus(errMsg || cfg.i18n.token_failed, 'error');
 						return;
 					}
-					postJson(cfg.confirmUrl, { order: cfg.order, key: cfg.key, bind_card_pay_token: info.BindCardPayToken }).then(handleAuthorization);
+					postJson(cfg.confirmUrl, { order: cfg.order, key: cfg.key, attempt: cfg.attempt, afp: cfg.afp, bind_card_pay_token: info.BindCardPayToken }).then(handleAuthorization);
 				});
 			} else {
 				window.ECPay.getPayToken(function (info, errMsg) {
@@ -123,7 +123,7 @@
 						setStatus(errMsg || cfg.i18n.token_failed, 'error');
 						return;
 					}
-					postJson(cfg.confirmUrl, { order: cfg.order, key: cfg.key, pay_token: info.PayToken }).then(handleAuthorization);
+					postJson(cfg.confirmUrl, { order: cfg.order, key: cfg.key, attempt: cfg.attempt, afp: cfg.afp, pay_token: info.PayToken }).then(handleAuthorization);
 				});
 			}
 		} catch (err) {
@@ -173,7 +173,7 @@
 			chooseNew.hidden = true;
 		}
 		setStatus(cfg.i18n.loading, 'info');
-		postJson(cfg.tokenUrl, { order: cfg.order, key: cfg.key }).then(function (result) {
+		postJson(cfg.tokenUrl, { order: cfg.order, key: cfg.key, attempt: cfg.attempt, afp: cfg.afp }).then(function (result) {
 			if (!result.ok || !result.token) {
 				setStatus(result.message || cfg.i18n.token_failed, 'error');
 				return;
@@ -196,7 +196,7 @@
 				}
 				setBusy(true);
 				setStatus(cfg.i18n.submitting, 'info');
-				postJson(cfg.savedUrl, { order: cfg.order, key: cfg.key, card_id: cardId }).then(handleAuthorization);
+				postJson(cfg.savedUrl, { order: cfg.order, key: cfg.key, attempt: cfg.attempt, afp: cfg.afp, card_id: cardId }).then(handleAuthorization);
 			});
 		}
 	}

@@ -23,6 +23,7 @@ use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Api\EcpayPrintController;
 use YangSheep\YSCartEcpay\Payment\EcpayGatewayBase;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 use YangSheep\YSCartEcpay\Payment\EcpayPaymentReconciler;
 use YangSheep\YSCartEcpay\Payment\EcpgPaymentReconciler;
 use YangSheep\YSCartEcpay\Services\Shipping\Adapters\EcpayShippingAdapter;
@@ -46,7 +47,7 @@ final class Plugin {
 	 * 同時不因「錯在哪一種形狀」而多洩漏一個判別位元。
 	 */
 	private const CART_SCOPE_ERROR = '購物階段（cart_scope）格式不正確；必須符合 [a-z0-9_]{1,32}，或整個省略。';
-	private const ECPG_REQUIRES_CORE = '2.66.3';
+	private const ECPG_REQUIRES_CORE = '2.67.11';
 
 	/**
 	 * 一次性提領碼的**鑄造格式**——與 `EcpayStoreSelector::generate_result_code()`
@@ -161,7 +162,16 @@ final class Plugin {
 			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDetailStore', 'read' )
 			|| ! class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDetailResult' )
 			|| ! class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch' )
-			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch', 'current_operation_key' ) ) {
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch', 'current_operation_key' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch', 'current_token' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch', 'operation_key' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch', 'state' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentAttempt' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentAttempt', 'current' )
+			|| ! class_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService', 'mark_paid' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService', 'mark_failed' )
+			|| ! method_exists( '\YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService', 'mark_pending_offline' ) ) {
 			return [
 				'met'     => false,
 				'reason'  => 'core_capability_missing',
@@ -195,9 +205,9 @@ final class Plugin {
 	}
 
 	/**
-	 * 站內付訂閱綁卡需要 Core 2.66.3 首次提供的 receipt/binder 配對。
+	 * 站內付訂閱綁卡與 attempt-safe hosted flow require Core 2.67.11.
 	 *
-	 * 這是 ECPG method 級 gate；AIO 金流與物流仍沿用外掛既有的 Core floor。
+	 * 全域 gate 已套同一 floor；保留 method gate 作精確 capability 診斷。
 	 *
 	 * @return array{met:bool,reason:string,message:string}
 	 */
@@ -249,6 +259,7 @@ final class Plugin {
 		add_action( 'init', [ $this, 'sync_print_route' ], 20 );
 
 		add_filter( 'ys_ec_provider_manifests', [ $this, 'register_manifest' ], 10, 1 );
+		add_filter( 'ys_ec_repay_attempt_history_keys', [ EcpayPaymentAttempt::class, 'contribute_history_keys' ], 10, 4 );
 		add_action( 'ys_ec_register_gateways', [ $this, 'register_gateways' ] );
 		add_action( 'ys_ec_register_shipping_methods', [ $this, 'register_shipping_methods' ] );
 		// 🔴 門市目錄的 production caller（v0.2.13）：沒有這一行，refresh() 只有

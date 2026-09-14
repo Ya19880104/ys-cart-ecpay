@@ -82,8 +82,11 @@ class EcpgClient {
 		if ( ! is_array( $outer ) || ! array_key_exists( 'TransCode', $outer ) ) {
 			return self::result( self::OUTCOME_INDETERMINATE, null, '', null, '', null, '綠界回應不是可解讀的站內付 2.0 信封。' );
 		}
-		$trans_code = is_numeric( $outer['TransCode'] ) ? (int) $outer['TransCode'] : null;
+		$trans_code = self::parse_result_code( $outer['TransCode'] );
 		$trans_msg  = (string) ( $outer['TransMsg'] ?? '' );
+		if ( null === $trans_code ) {
+			return self::result( self::OUTCOME_INDETERMINATE, null, $trans_msg, null, '', null, '綠界回應的 TransCode 格式無法確認。' );
+		}
 		if ( 1 !== $trans_code ) {
 			// 傳輸資料未被接受（MerchantID／Timestamp／解密失敗）：綠界沒有處理任何交易。
 			return self::result( self::OUTCOME_PROVIDER_FAILED, $trans_code, $trans_msg, null, '', null, '綠界拒絕請求（TransCode ' . ( $trans_code ?? '?' ) . '）：' . $trans_msg );
@@ -93,8 +96,11 @@ class EcpgClient {
 		if ( null === $data ) {
 			return self::result( self::OUTCOME_INDETERMINATE, $trans_code, $trans_msg, null, '', null, '綠界回應的 Data 無法以目前金鑰解密。' );
 		}
-		$rtn_code = isset( $data['RtnCode'] ) && is_numeric( $data['RtnCode'] ) ? (int) $data['RtnCode'] : null;
+		$rtn_code = self::parse_result_code( $data['RtnCode'] ?? null );
 		$rtn_msg  = (string) ( $data['RtnMsg'] ?? '' );
+		if ( null === $rtn_code ) {
+			return self::result( self::OUTCOME_INDETERMINATE, $trans_code, $trans_msg, null, $rtn_msg, $data, '綠界回應的 RtnCode 格式無法確認。' );
+		}
 		if ( 1 === $rtn_code ) {
 			return self::result( self::OUTCOME_SUCCESS, $trans_code, $trans_msg, $rtn_code, $rtn_msg, $data, '' );
 		}
@@ -116,7 +122,29 @@ class EcpgClient {
 			$outer = json_decode( $outer, true );
 		}
 		$classified = self::classify_response( $outer, $hash_key, $hash_iv );
-		return $classified['data'];
+		if ( ! is_array( $classified['data'] ?? null ) ) {
+			return null;
+		}
+		return ( in_array( $classified['outcome'], [ self::OUTCOME_SUCCESS, self::OUTCOME_PROVIDER_FAILED ], true )
+			|| self::RTN_PENDING_CONFIRMATION === ( $classified['rtn_code'] ?? null ) )
+				? $classified['data']
+				: null;
+	}
+
+	/** Only canonical non-negative integer codes are safe business evidence. */
+	public static function parse_result_code( mixed $value ): ?int {
+		if ( is_int( $value ) ) {
+			return $value >= 0 ? $value : null;
+		}
+		if ( ! is_string( $value ) || 1 !== preg_match( '/^(?:0|[1-9][0-9]*)$/D', $value ) ) {
+			return null;
+		}
+		$max = (string) PHP_INT_MAX;
+		if ( strlen( $value ) > strlen( $max )
+			|| ( strlen( $value ) === strlen( $max ) && strcmp( $value, $max ) > 0 ) ) {
+			return null;
+		}
+		return (int) $value;
 	}
 
 	/** `OrderInfo.TradeStatus`：'1' 已付款、'0' 成立未付款；缺欄位回 null。 */
@@ -149,34 +177,34 @@ class EcpgClient {
 	}
 
 	/** 綁定信用卡／取得廠商驗證碰（35591）——交易且綁卡。 */
-	public function get_token_by_binding_card( array $data ): array {
-		return $this->post( '/Merchant/GetTokenbyBindingCard', $data, false );
+	public function get_token_by_binding_card( array $data, ?callable $pre_send_guard = null ): array {
+		return $this->post( '/Merchant/GetTokenbyBindingCard', $data, false, false, $pre_send_guard );
 	}
 
 	/** 綁定信用卡／建立綁定信用卡交易（35596）——會實際授權 TotalAmount 並回 BindCardID。 */
-	public function create_bind_card( string $bind_card_pay_token, string $merchant_member_id ): array {
+	public function create_bind_card( string $bind_card_pay_token, string $merchant_member_id, ?callable $pre_send_guard = null ): array {
 		return $this->post( '/Merchant/CreateBindCard', [
 			'BindCardPayToken' => $bind_card_pay_token,
 			'MerchantMemberID' => $merchant_member_id,
-		], true );
+		], true, false, $pre_send_guard );
 	}
 
 	/** 站內付 2.0／取得廠商驗證碼（9040）——純交易。 */
-	public function get_token_by_trade( array $data ): array {
-		return $this->post( '/Merchant/GetTokenbyTrade', $data, false );
+	public function get_token_by_trade( array $data, ?callable $pre_send_guard = null ): array {
+		return $this->post( '/Merchant/GetTokenbyTrade', $data, false, false, $pre_send_guard );
 	}
 
 	/** 站內付 2.0／建立交易（9053）。 */
-	public function create_payment( string $pay_token, string $merchant_trade_no ): array {
+	public function create_payment( string $pay_token, string $merchant_trade_no, ?callable $pre_send_guard = null ): array {
 		return $this->post( '/Merchant/CreatePayment', [
 			'PayToken'        => $pay_token,
 			'MerchantTradeNo' => $merchant_trade_no,
-		], true );
+		], true, false, $pre_send_guard );
 	}
 
 	/** 綁定信用卡後交易／幕後交易授權（35630）——續扣用。 */
-	public function create_payment_with_card_id( array $data ): array {
-		return $this->post( '/Merchant/CreatePaymentWithCardID', $data, true );
+	public function create_payment_with_card_id( array $data, ?callable $pre_send_guard = null, ?callable $pre_submit_guard = null ): array {
+		return $this->post( '/Merchant/CreatePaymentWithCardID', $data, true, false, $pre_send_guard, $pre_submit_guard );
 	}
 
 	/** 綁定信用卡／查詢綁定信用卡（35613）。 */
@@ -209,18 +237,21 @@ class EcpgClient {
 	 *                         必須把 dispatch 標成 submitted（落不了盤就不送）。
 	 * @return array{outcome:string,sent:bool,trans_code:?int,trans_msg:string,rtn_code:?int,rtn_msg:string,data:?array,message:string,http_status:int}
 	 */
-	public function post( string $path, array $data, bool $authorizes, bool $trade_domain = false ): array {
-		$credentials = Settings::payment_credentials();
-		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
-			return self::not_sent( '綠界金流設定不完整，未送出任何請求。' );
-		}
-
+	public function post( string $path, array $data, bool $authorizes, bool $trade_domain = false, ?callable $pre_send_guard = null, ?callable $pre_submit_guard = null ): array {
 		// 🔴 R14 reader lease：與 AIO 客戶端同一條規則——設定 commit 期間不得用可能被
 		// 回滾的金鑰簽任何請求。拿不到 lease＝未送出。
 		$lease = ProviderMaintenanceLock::reader_lease();
 		if ( null === $lease ) {
 			return self::not_sent( '綠界設定維護中（簽章憑證變更進行中或前次變更未完成），未送出任何請求。' );
 		}
+		$credentials = Settings::payment_credentials();
+		if ( '' === $credentials['merchant_id'] || '' === $credentials['hash_key'] || '' === $credentials['hash_iv'] ) {
+			return self::not_sent( '綠界金流設定不完整，未送出任何請求。' );
+		}
+		$credential_context = [
+			'merchant_id' => (string) $credentials['merchant_id'],
+			'environment' => ! empty( $credentials['test_mode'] ) ? 'stage' : 'live',
+		];
 
 		$payload = [ 'PlatformID' => '', 'MerchantID' => $credentials['merchant_id'] ] + $data;
 		try {
@@ -231,6 +262,24 @@ class EcpgClient {
 
 		if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
 			return self::not_sent( '綠界設定維護窗與本次請求重疊，未送出任何請求。' );
+		}
+		// 續扣的 provider identity 必須以這份實際加密／送出的 snapshot 綁定，且在
+		// dispatch submitted 之前完成。這個 hook 與下方 browser pre-send guard 的
+		// ownership 不同，不能合併或調換順序。
+		if ( null !== $pre_submit_guard ) {
+			try {
+				$prepared = true === $pre_submit_guard( $credential_context );
+			} catch ( \Throwable $error ) {
+				unset( $error );
+				$prepared = false;
+			}
+			if ( ! $prepared ) {
+				return self::not_sent( '付款商店身分寫入失敗，未送出任何請求。' );
+			}
+			// hook 可能碰 DB；再次續租自己的 reader row，避免逾期被 writer 收割後送出。
+			if ( ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+				return self::not_sent( '綠界設定維護窗與本次請求重疊，未送出任何請求。' );
+			}
 		}
 
 		// 🔴 會授權的端點：送出意圖必須在網路呼叫之前落盤（v2.57.0 #2H，與 PayUni requester 同式）。
@@ -247,6 +296,17 @@ class EcpgClient {
 		$body = json_encode( $envelope );
 		if ( false === $body ) {
 			return self::not_sent( '綠界請求信封無法序列化。' );
+		}
+		if ( null !== $pre_send_guard ) {
+			try {
+				$authorized = true === $pre_send_guard();
+			} catch ( \Throwable $error ) {
+				unset( $error );
+				$authorized = false;
+			}
+			if ( ! $authorized ) {
+				return self::not_sent( '付款嘗試已變更，未送出任何綠界請求。' );
+			}
 		}
 
 		$response = wp_remote_post( $host . $path, [
@@ -269,7 +329,7 @@ class EcpgClient {
 		}
 
 		$classified = self::classify_response( json_decode( $raw, true ), $credentials['hash_key'], $credentials['hash_iv'] );
-		return $classified + [ 'sent' => true, 'http_status' => $status ];
+		return $classified + [ 'sent' => true, 'http_status' => $status, 'credential_context' => $credential_context ];
 	}
 
 	/** @return array{outcome:string,sent:bool,trans_code:?int,trans_msg:string,rtn_code:?int,rtn_msg:string,data:?array,message:string,http_status:int} */

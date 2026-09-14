@@ -68,6 +68,7 @@ namespace YangSheep\Ecommerce\DTOs {
 namespace YangSheep\Ecommerce\Models {
 	final class YSOrder
 	{
+		public static function forget(int $id): void { unset($id); }
 		public static function find(int $id): ?object
 		{
 			if (7 !== $id) {
@@ -77,6 +78,8 @@ namespace YangSheep\Ecommerce\Models {
 			return (object) [
 				'id'             => 7,
 				'total'          => 100.0,
+				'gateway_id'     => (string) ($GLOBALS['ys_ecpay_paid_method'] ?? ''),
+				'payment_method' => (string) ($GLOBALS['ys_ecpay_paid_method'] ?? ''),
 				'payment_detail' => json_encode(['mer_trade_no' => 'YS7TLOCAL', 'ecpay_charged_amount' => 100]),
 			];
 		}
@@ -86,23 +89,76 @@ namespace YangSheep\Ecommerce\Models {
 namespace YangSheep\Ecommerce\Services\Payment {
 	final class YSPaymentLifecycleService
 	{
-		public static function mark_paid(int $order_id, object $detail, string $source): array
+		public static function mark_paid(int $order_id, object $detail, string $source, ?callable $guard = null, array $options = []): array
 		{
-			unset($order_id, $detail, $source);
+			unset($detail, $source);
+			$current = \YangSheep\YSCartEcpay\Support\OrderPaymentDetail::read($order_id);
+			if (null !== $guard && ! $guard($current)) {
+				return ['success' => false, 'retryable' => false, 'outcome' => 'stale'];
+			}
+			$patch = $options['detail_patch'] ?? null;
+			$written = is_callable($patch) ? $patch($current) : $current;
+			\ys_v054_record('detail:' . json_encode($written, JSON_UNESCAPED_UNICODE));
 			\ys_v054_record('paid');
+			return ['success' => true, 'retryable' => false, 'outcome' => 'won'];
+		}
+
+		public static function mark_failed(int $order_id, object $detail, string $source, string $target = 'failed', ?callable $guard = null, array $options = []): array
+		{
+			unset($order_id, $detail, $source, $target, $guard, $options);
 			return ['success' => true];
 		}
 
-		public static function mark_failed(int $order_id, object $detail, string $source): array
+		public static function mark_pending_offline(int $order_id, object $detail, string $source, ?callable $guard = null, array $options = []): array
 		{
-			unset($order_id, $detail, $source);
+			unset($order_id, $detail, $source, $guard, $options);
 			return ['success' => true];
 		}
+	}
+}
 
-		public static function mark_pending_offline(int $order_id, object $detail, string $source): array
+namespace YangSheep\YSCartEcpay\Payment {
+	final class EcpayPaymentAttempt
+	{
+		public const ACTION_SUCCESS = 'success';
+		public const ACTION_FAILURE = 'failure';
+		public const ACTION_PAYMENT_INFO = 'payment_info';
+		public static function identity_is_discoverable(array $detail, string $mtn): bool
 		{
-			unset($order_id, $detail, $source);
-			return ['success' => true];
+			return ($detail['mer_trade_no'] ?? $detail['ecpay_merchant_trade_no'] ?? '') === $mtn;
+		}
+		public static function historical_callback_matches(object $order, array $detail, string $mtn, int $amount, string $merchant_id, string $environment): bool
+		{
+			unset($order, $detail, $mtn, $amount, $merchant_id, $environment);
+			return false;
+		}
+		public static function callback_claim(object $order, array $detail, string $merchant_trade_no, int $amount, string $merchant_id, string $environment = '', string $action = self::ACTION_SUCCESS): ?array
+		{
+			return '' !== $merchant_trade_no && $amount > 0
+				? [
+					'gateway_id' => (string) ($order->gateway_id ?? ''),
+					'merchant_trade_no' => $merchant_trade_no,
+					'charged_amount' => $amount,
+					'merchant_id' => $merchant_id,
+					'environment' => $environment,
+					'action' => $action,
+					'scalar_gateway_bound' => true,
+				]
+				: null;
+		}
+		public static function callback_guard(array $claim): callable
+		{
+			return static fn(array $detail): bool => ($detail['mer_trade_no'] ?? '') === ($claim['merchant_trade_no'] ?? '');
+		}
+		public static function callback_detail_patch(array $claim, array $fields = []): callable
+		{
+			unset($claim);
+			return static fn(array $detail): array => array_merge($detail, $fields);
+		}
+		public static function callback_lifecycle_options(array $claim, callable $patch, array $columns = []): array
+		{
+			$columns['gateway_id'] = (string) ($claim['gateway_id'] ?? '');
+			return ['detail_patch' => $patch, 'columns' => $columns, 'expected_column_values' => ['gateway_id' => $columns['gateway_id']]];
 		}
 	}
 }
@@ -158,9 +214,13 @@ namespace YangSheep\YSCartEcpay\Support {
 			unset($order_id);
 
 			return [
+				'mer_trade_no'        => 'YS7TLOCAL',
 				'ecpay_charged_amount' => 100,
+				'payment_provider'     => 'ecpay',
 				// 建單時由 EcpayGatewayBase 寫入——這是「消費者選的是哪個方式」的權威。
 				'payment_method'       => (string) ($GLOBALS['ys_ecpay_paid_method'] ?? ''),
+				'ecpay_merchant_id'    => 'LOCAL-MERCHANT',
+				'ecpay_environment'    => 'stage',
 			];
 		}
 

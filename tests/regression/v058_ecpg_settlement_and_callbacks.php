@@ -58,6 +58,15 @@ namespace {
 		$sent = json_decode( (string) ( $args['body'] ?? '' ), true );
 		$data = is_array( $sent ) ? \YangSheep\YSCartEcpay\Ecpg\EcpgAesCodec::decrypt( (string) ( $sent['Data'] ?? '' ), 'pwFHCqoQZGmho4w6', 'EkRm7iFT261dpevs' ) : null;
 		ys_mark( 'remote:' . json_encode( [ 'url' => $url, 'data' => $data ] ) );
+		if ( ! empty( $GLOBALS['ys_rotate_credentials_after_response'] ) ) {
+			\YangSheep\YSCartEcpay\Support\Settings::$credentials = [
+				'test_mode'   => false,
+				'merchant_id' => 'NEW-MERCHANT',
+				'hash_key'    => 'new-hash-key',
+				'hash_iv'     => 'new-hash-iv',
+			];
+			ys_mark( 'credentials:rotated-after-response' );
+		}
 		return $GLOBALS['ys_remote_response'] ?? null;
 	}
 	function is_wp_error( $thing ): bool { return false; }
@@ -91,6 +100,7 @@ namespace YangSheep\Ecommerce\Models {
 	final class YSOrder {
 		public static array $orders = [];
 		public static function find( int $id ): ?object { return self::$orders[ $id ] ?? null; }
+		public static function forget( int $id ): void { unset( $id ); }
 		public static function get_items( int $order_id ): array { return []; }
 		public static function generate_order_key( int $order_id, string $order_number ): string { return 'key-' . $order_id; }
 		public static function verify_order_key( int $order_id, string $key ): bool { return 'key-' . $order_id === $key; }
@@ -137,15 +147,34 @@ namespace YangSheep\Ecommerce\Services\Payment {
 		public static array $paid_result   = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'processing', 'message' => '', 'receipt_id' => 'receipt-42' ];
 		public static array $failed_result = [ 'success' => true, 'retryable' => false, 'from' => 'pending', 'to' => 'failed', 'message' => '' ];
 		public static array $calls = [];
-		public static function mark_paid( int $order_id, object $detail, string $reason = '' ): array {
-			self::$calls[] = [ 'paid', $order_id, $detail->fields, $reason ];
-			\ys_mark( 'paid:' . json_encode( [ 'order' => $order_id, 'reason' => $reason, 'trade_no' => $detail->fields['trade_no'] ?? null, 'paid_amount' => $detail->fields['paid_amount'] ?? null ] ) );
-			return self::$paid_result;
+		private static function transition( string $kind, int $order_id, object $detail, string $reason, ?callable $guard, array $options, array $scripted ): array {
+			$current = \YangSheep\YSCartEcpay\Support\OrderPaymentDetail::read( $order_id ) ?? [];
+			self::$calls[] = [ $kind, $order_id, $detail->fields, $reason, $guard, $options ];
+			if ( null !== $guard && ! $guard( $current ) ) {
+				return [ 'success' => false, 'retryable' => false, 'outcome' => 'stale', 'from' => 'pending' ];
+			}
+			if ( ! \YangSheep\YSCartEcpay\Support\OrderPaymentDetail::$persist
+				|| ! \YangSheep\YSCartEcpay\Support\ScalarColumnWriter::$persist ) {
+				return [ 'success' => false, 'retryable' => true, 'outcome' => 'db_error', 'from' => 'pending' ];
+			}
+			if ( ! empty( $scripted['success'] ) ) {
+				$patch = $options['detail_patch'] ?? null;
+				if ( is_callable( $patch ) ) {
+					\YangSheep\YSCartEcpay\Support\OrderPaymentDetail::$details[ $order_id ] = $patch( $current );
+				}
+			}
+			return $scripted;
 		}
-		public static function mark_failed( int $order_id, object $detail, string $reason = '' ): array {
-			self::$calls[] = [ 'failed', $order_id, $detail->fields, $reason ];
+		public static function mark_paid( int $order_id, object $detail, string $reason = '', ?callable $guard = null, array $options = [] ): array {
+			$result = self::transition( 'paid', $order_id, $detail, $reason, $guard, $options, self::$paid_result );
+			\ys_mark( 'paid:' . json_encode( [ 'order' => $order_id, 'reason' => $reason, 'trade_no' => $detail->fields['trade_no'] ?? null, 'paid_amount' => $detail->fields['paid_amount'] ?? null ] ) );
+			return $result;
+		}
+		public static function mark_failed( int $order_id, object $detail, string $reason = '', string $target = 'failed', ?callable $guard = null, array $options = [] ): array {
+			unset( $target );
+			$result = self::transition( 'failed', $order_id, $detail, $reason, $guard, $options, self::$failed_result );
 			\ys_mark( 'failed:' . json_encode( [ 'order' => $order_id, 'reason' => $reason, 'code' => $detail->fields['response_code'] ?? null ] ) );
-			return self::$failed_result;
+			return $result;
 		}
 	}
 	final class YSPaymentEffects {
@@ -230,6 +259,120 @@ namespace YangSheep\YSCartEcpay\Support {
 	}
 }
 
+namespace YangSheep\YSCartEcpay\Payment {
+	use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
+
+	/** Broad controller fixture; real Core/ECPay ownership is exercised by v063. */
+	final class EcpayPaymentAttempt {
+		public const ACTION_SUCCESS = 'success';
+		public const ACTION_FAILURE = 'failure';
+		public const ACTION_PAYMENT_INFO = 'payment_info';
+		public static bool $owner_current = true;
+		public static ?array $authorization = null;
+		public static bool $handoff_allowed = true;
+		public static function identity_is_discoverable( array $detail, string $mtn ): bool {
+			return hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' ), $mtn );
+		}
+		public static function historical_callback_matches( object $order, array $detail, string $mtn, int $amount, string $merchant_id, string $environment ): bool {
+			unset( $order, $detail, $mtn, $amount, $merchant_id, $environment );
+			return false;
+		}
+		public static function callback_claim( object $order, array $detail, string $merchant_trade_no, int $amount, string $merchant_id, string $environment = '', string $action = self::ACTION_SUCCESS ): ?array {
+			$stored = (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' );
+			return self::$owner_current
+				&& '' !== $merchant_trade_no
+				&& hash_equals( $stored, $merchant_trade_no )
+				&& $amount > 0
+				&& (int) ( $detail['ecpay_charged_amount'] ?? 0 ) === $amount
+				&& ( ! isset( $detail['ecpay_merchant_id'] ) || hash_equals( (string) $detail['ecpay_merchant_id'], $merchant_id ) )
+				? [
+					'gateway_id' => (string) ( $order->gateway_id ?? '' ),
+					'merchant_trade_no' => $merchant_trade_no,
+					'charged_amount' => $amount,
+					'merchant_id' => $merchant_id,
+					'environment' => $environment,
+					'action' => $action,
+					'scalar_gateway_bound' => true,
+				]
+				: null;
+		}
+		public static function callback_guard( array $claim ): callable {
+			return static fn ( array $detail ): bool => self::$owner_current
+				&& hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' ), (string) ( $claim['merchant_trade_no'] ?? '' ) );
+		}
+		public static function callback_detail_patch( array $claim, array $fields = [] ): callable {
+			unset( $claim );
+			return static fn ( array $detail ): array => array_merge( $detail, $fields );
+		}
+		public static function callback_lifecycle_options( array $claim, callable $patch, array $columns = [] ): array {
+			$columns['gateway_id'] = (string) ( $claim['gateway_id'] ?? '' );
+			return [ 'detail_patch' => $patch, 'columns' => $columns, 'expected_column_values' => [ 'gateway_id' => $columns['gateway_id'] ] ];
+		}
+		public static function browser_fingerprint( array $detail ): string {
+			$mtn = (string) ( $detail['ecpay_merchant_trade_no'] ?? '' );
+			return '' === $mtn ? '' : substr( hash( 'sha256', 'fixture|' . $mtn ), 0, 32 );
+		}
+		public static function browser_owner_matches( array $detail, int $order_id, string $gateway_id, string $mtn, string $fingerprint ): bool {
+			unset( $order_id, $gateway_id );
+			return self::$owner_current
+				&& hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? '' ), $mtn )
+				&& hash_equals( self::browser_fingerprint( $detail ), $fingerprint );
+		}
+		public static function browser_owner_is_current( int $order_id, string $gateway_id, string $mtn, string $fingerprint, ?array $verified_identity = null ): bool {
+			$detail = OrderPaymentDetail::read( $order_id );
+			$identity = $verified_identity ?? [
+				'merchant_id' => (string) ( \YangSheep\YSCartEcpay\Support\Settings::$credentials['merchant_id'] ?? '' ),
+				'environment' => ! empty( \YangSheep\YSCartEcpay\Support\Settings::$credentials['test_mode'] ) ? 'stage' : 'live',
+			];
+			\ys_mark( 'owner_identity:' . json_encode( $identity ) );
+			return is_array( $detail )
+				&& self::browser_owner_matches( $detail, $order_id, $gateway_id, $mtn, $fingerprint )
+				&& is_string( $identity['merchant_id'] ?? null )
+				&& is_string( $identity['environment'] ?? null )
+				&& hash_equals( (string) ( $detail['ecpay_merchant_id'] ?? '' ), $identity['merchant_id'] )
+				&& hash_equals( (string) ( $detail['ecpay_environment'] ?? '' ), $identity['environment'] );
+		}
+		public static function migrate_hosted_identity( int $order_id, string $gateway_id ): ?array { unset( $order_id, $gateway_id ); return null; }
+		public static function claim_browser_authorization( int $order_id, string $gateway_id, string $mtn, string $fingerprint, string $kind ): string {
+			if ( null !== self::$authorization || ! self::browser_owner_is_current( $order_id, $gateway_id, $mtn, $fingerprint ) ) { return ''; }
+			$nonce = str_repeat( 'a', 32 );
+			self::$authorization = [ 'nonce' => $nonce, 'state' => 'reserved', 'kind' => $kind ];
+			return $nonce;
+		}
+		public static function authorize_browser_send( int $order_id, string $gateway_id, string $mtn, string $fingerprint, string $nonce ): bool {
+			if ( ! self::browser_owner_is_current( $order_id, $gateway_id, $mtn, $fingerprint )
+				|| 'reserved' !== ( self::$authorization['state'] ?? null )
+				|| ! hash_equals( (string) ( self::$authorization['nonce'] ?? '' ), $nonce ) ) { return false; }
+			self::$authorization['state'] = 'sent';
+			return true;
+		}
+		public static function claim_browser_result_handoff( int $order_id, string $gateway_id, string $browser_mtn, string $fingerprint, string $nonce, string $credential_merchant, string $environment, string $reported_merchant, string $reported_mtn, int $reported_amount ): bool {
+			\ys_mark( 'handoff:' . json_encode( [ $order_id, $gateway_id, $browser_mtn, $fingerprint, $nonce, $credential_merchant, $environment, $reported_merchant, $reported_mtn, $reported_amount ] ) );
+			$detail = OrderPaymentDetail::read( $order_id );
+			if ( ! self::$handoff_allowed
+				|| ! is_array( $detail )
+				|| ! self::browser_owner_matches( $detail, $order_id, $gateway_id, $browser_mtn, $fingerprint )
+				|| 'sent' !== ( self::$authorization['state'] ?? null )
+				|| ! hash_equals( (string) ( self::$authorization['nonce'] ?? '' ), $nonce )
+				|| ! hash_equals( '3002607', $credential_merchant )
+				|| 'stage' !== $environment
+				|| ! hash_equals( '3002607', $reported_merchant )
+				|| ! hash_equals( $browser_mtn, $reported_mtn )
+				|| (int) ( $detail['ecpay_charged_amount'] ?? 0 ) !== $reported_amount ) {
+				return false;
+			}
+			self::$authorization['state'] = 'handed_off';
+			return true;
+		}
+		public static function release_browser_authorization( int $order_id, string $gateway_id, string $mtn, string $fingerprint, string $nonce ): bool {
+			unset( $order_id, $gateway_id, $mtn, $fingerprint );
+			if ( 'reserved' !== ( self::$authorization['state'] ?? null ) || ! hash_equals( (string) ( self::$authorization['nonce'] ?? '' ), $nonce ) ) { return false; }
+			self::$authorization = null;
+			return true;
+		}
+	}
+}
+
 namespace {
 	$root = str_replace( '\\', '/', dirname( __DIR__, 2 ) );
 	require_once $root . '/src/Support/Utf8Text.php';
@@ -251,6 +394,7 @@ namespace {
 	use YangSheep\YSCartEcpay\Api\EcpgPaymentController;
 	use YangSheep\YSCartEcpay\Ecpg\EcpgAesCodec;
 	use YangSheep\YSCartEcpay\Ecpg\EcpgSettlement;
+	use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 	use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 	use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 	use YangSheep\YSCartEcpay\Support\Settings;
@@ -258,9 +402,10 @@ namespace {
 	$KEY = 'pwFHCqoQZGmho4w6';
 	$IV  = 'EkRm7iFT261dpevs';
 	$MTN = 'YSABCDEF1234567890';
+	$AFP = substr( hash( 'sha256', 'fixture|' . $MTN ), 0, 32 );
 
 	$make_order = static function ( int $customer_id = 7, string $status = 'pending', int $charged = 1290 ) use ( $MTN ): object {
-		$detail = [ 'mer_trade_no' => $MTN, 'ecpay_merchant_trade_no' => $MTN, 'ecpay_charged_amount' => $charged, 'ecpay_ecpg_flow' => $customer_id > 0 ? 'bind' : 'pay', 'ecpay_ecpg_member_id' => $customer_id > 0 ? 'YSC' . $customer_id : '' ];
+		$detail = [ 'mer_trade_no' => $MTN, 'ecpay_merchant_trade_no' => $MTN, 'ecpay_charged_amount' => $charged, 'payment_provider' => 'ecpay', 'payment_method' => 'ys_ec_ecpay_ecpg_credit', 'ecpay_merchant_id' => '3002607', 'ecpay_environment' => 'stage', 'ecpay_ecpg_flow' => $customer_id > 0 ? 'bind' : 'pay', 'ecpay_ecpg_member_id' => $customer_id > 0 ? 'YSC' . $customer_id : '' ];
 		$order  = (object) [ 'id' => 42, 'order_number' => 'YS-42', 'total' => (string) $charged, 'status' => $status, 'customer_id' => $customer_id, 'user_id' => 70, 'gateway_id' => 'ys_ec_ecpay_ecpg_credit', 'billing_email' => 'b@example.com', 'billing_phone' => '0912345678', 'billing_name' => '王小明', 'billing_country' => 'TW', 'payment_detail' => json_encode( $detail ) ];
 		YSOrder::$orders[42]            = $order;
 		OrderPaymentDetail::$details[42] = $detail;
@@ -327,25 +472,25 @@ namespace {
 				( new EcpgPaymentController() )->order_result( $request );
 				exit( 97 );
 			case 'pay-page':
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42' ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP ] );
 				( new EcpgPaymentController() )->pay_page( $request );
 				exit( 97 );
 			case 'pay-page-bad-key':
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'nope' ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'nope', 'attempt' => $MTN, 'afp' => $AFP ] );
 				( new EcpgPaymentController() )->pay_page( $request );
 				exit( 97 );
 			case 'pay-page-saved':
 				// 登入 cookie 屬於訂單擁有者（user 70）：付款頁要列出已綁定的卡、帶該使用者的 wp_rest nonce。
 				$GLOBALS['ys_cookie_user'] = 70;
 				$GLOBALS['ys_cards']       = [ (object) [ 'id' => 14, 'card_last4' => '2222', 'card_brand' => 'visa', 'expire_date' => '12/28', 'status' => 'active' ] ];
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42' ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP ] );
 				( new EcpgPaymentController() )->pay_page( $request );
 				exit( 97 );
 			case 'pay-page-foreign-cookie':
 				// 登入的是別人（user 71）：能力網址仍可付款，但不得看到擁有者的卡。
 				$GLOBALS['ys_cookie_user'] = 71;
 				$GLOBALS['ys_cards']       = [ (object) [ 'id' => 14, 'card_last4' => '2222', 'card_brand' => 'visa', 'expire_date' => '12/28', 'status' => 'active' ] ];
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42' ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP ] );
 				( new EcpgPaymentController() )->pay_page( $request );
 				exit( 97 );
 			case 'charge-saved':
@@ -355,14 +500,31 @@ namespace {
 				$charge = $success_data();
 				unset( $charge['BindCardID'], $charge['MerchantMemberID'], $charge['IsSameCard'] );
 				$GLOBALS['ys_remote_response'] = [ 'code' => 200, 'body' => $envelope( $charge, $KEY, $IV ) ];
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'card_id' => 14 ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP, 'card_id' => 14 ] );
+				( new EcpgPaymentController() )->charge_saved( $request );
+				exit( 97 );
+			case 'charge-saved-3d':
+			case 'charge-saved-3d-credential-drift':
+			case 'charge-saved-3d-handoff-lost':
+				$GLOBALS['ys_current_user'] = 70;
+				$GLOBALS['ys_authority']    = [ 'card_id' => 14, 'raw_token' => 'bindcard0123456789abcdef', 'token_hash' => str_repeat( 'ab', 32 ) ];
+				$charge = $success_data( [ 'ThreeDInfo' => [ 'ThreeDURL' => 'https://3d.example/authorize' ] ] );
+				unset( $charge['BindCardID'], $charge['MerchantMemberID'], $charge['IsSameCard'] );
+				$GLOBALS['ys_remote_response'] = [ 'code' => 200, 'body' => $envelope( $charge, $KEY, $IV ) ];
+				if ( 'charge-saved-3d-credential-drift' === $scenario ) {
+					$GLOBALS['ys_rotate_credentials_after_response'] = true;
+				}
+				if ( 'charge-saved-3d-handoff-lost' === $scenario ) {
+					EcpayPaymentAttempt::$handoff_allowed = false;
+				}
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP, 'card_id' => 14 ] );
 				( new EcpgPaymentController() )->charge_saved( $request );
 				exit( 97 );
 			case 'charge-saved-anon':
 				// 沒有登入身分：能力網址不足以扣一張存好的卡。
 				$GLOBALS['ys_current_user'] = 0;
 				$GLOBALS['ys_authority']    = [ 'card_id' => 14, 'raw_token' => 'bindcard0123456789abcdef', 'token_hash' => str_repeat( 'ab', 32 ) ];
-				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'card_id' => 14 ] );
+				$request = new WP_REST_Request( [ 'order' => 42, 'key' => 'key-42', 'attempt' => $MTN, 'afp' => $AFP, 'card_id' => 14 ] );
 				( new EcpgPaymentController() )->charge_saved( $request );
 				exit( 97 );
 			case 'pay-page-paid':
@@ -389,7 +551,18 @@ namespace {
 	$run = static function ( string $scenario ): array {
 		$marker = tempnam( sys_get_temp_dir(), 'ys-ecpg-' );
 		file_put_contents( $marker, '' );
-		$process = proc_open( [ PHP_BINARY, '-d', 'display_errors=stderr', __FILE__, '--child', $scenario, $marker ], [ 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );
+		$command = [ PHP_BINARY ];
+		if ( 'Windows' === PHP_OS_FAMILY && extension_loaded( 'openssl' ) ) {
+			$command = array_merge( $command, [
+				'-n',
+				'-d',
+				'extension_dir="' . (string) ini_get( 'extension_dir' ) . '"',
+				'-d',
+				'extension=php_openssl.dll',
+			] );
+		}
+		$command = array_merge( $command, [ '-d', 'display_errors=stderr', __FILE__, '--child', $scenario, $marker ] );
+		$process = proc_open( $command, [ 1 => [ 'pipe', 'w' ], 2 => [ 'pipe', 'w' ] ], $pipes );
 		if ( ! is_resource( $process ) ) {
 			throw new RuntimeException( 'cannot start child' );
 		}
@@ -429,12 +602,15 @@ namespace {
 		YSPaymentEffects::$run_calls = 0;
 		YSPaymentDetailStore::$readable = true;
 		YSPaymentDetailStore::$detail = [ '_ys_payment_effects' => [ 'receipt-42' => [ 'target' => 'processing', 'effects' => [] ] ] ];
+		EcpayPaymentAttempt::$owner_current = true;
+		EcpayPaymentAttempt::$authorization = null;
 		YSCreditCard::$created       = [];
 		YSCreditCard::$create_result = 77;
 		YSSubscription::$bind_result = true;
 		YSSubscription::$bind_calls = [];
 		YSLogger::$entries = [];
 		Settings::$credentials = [ 'test_mode' => true, 'merchant_id' => '3002607', 'hash_key' => 'pwFHCqoQZGmho4w6', 'hash_iv' => 'EkRm7iFT261dpevs' ];
+		$GLOBALS['ys_rotate_credentials_after_response'] = false;
 	};
 
 	$reset();
@@ -448,7 +624,12 @@ namespace {
 	$d = OrderPaymentDetail::$details[42];
 	$assert( '12345678' === ( $d['gwsr'] ?? null ) && '5' === ( $d['ecpay_eci'] ?? null ) && '777777' === ( $d['ecpay_auth_code'] ?? null ) && 'Credit' === ( $d['ecpay_payment_type'] ?? null ) && 'ecpg_return' === ( $d['ecpay_ecpg_source'] ?? null ), 'A4 authorization evidence (gwsr/eci/auth code/type/source) persisted via CAS' );
 	$assert( ! array_key_exists( 'BindCardID', $d ) && ! str_contains( json_encode( $d ), 'bindcard0123456789abcdef' ), 'A5 BindCardID never lands in payment_detail' );
-	$assert( [ [ 42, [ 'gateway_trade_no' => '2609101200001234' ] ] ] === ScalarColumnWriter::$writes, 'A6 gateway_trade_no column written' );
+	$assert(
+		[ 'gateway_trade_no' => '2609101200001234', 'gateway_id' => 'ys_ec_ecpay_ecpg_credit' ] === ( $call[5]['columns'] ?? null )
+		&& [ 'gateway_id' => 'ys_ec_ecpay_ecpg_credit' ] === ( $call[5]['expected_column_values'] ?? null )
+		&& [] === ScalarColumnWriter::$writes,
+		'A6 gateway identity, gateway_trade_no and callback detail are part of the same lifecycle CAS'
+	);
 	$card = YSCreditCard::$created[0] ?? [];
 	$assert( 'bindcard0123456789abcdef' === ( $card['token'] ?? null ) && 'ys_ec_ecpay_ecpg_credit' === ( $card['gateway_id'] ?? null ) && 7 === ( $card['customer_id'] ?? null ) && 70 === ( $card['user_id'] ?? null ) && true === ( $card['is_default'] ?? null ), 'A7 vault: BindCardID is the token, owner + gateway bound, set as default' );
 	$assert( '2222' === ( $card['card_last4'] ?? null ) && 'visa' === ( $card['card_brand'] ?? null ) && '12/28' === ( $card['expire_date'] ?? null ), 'A8 vault metadata: last4, brand from BIN, expiry MM/YY' );
@@ -555,13 +736,13 @@ namespace {
 	$order = $make_order();
 	OrderPaymentDetail::$persist = false;
 	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
-	$assert( 'persist_failed' === $r['status'] && true === $r['retryable'] && [] === YSPaymentLifecycleService::$calls && [] === ScalarColumnWriter::$writes, 'A19 evidence CAS failure → persist_failed before any state change' );
+	$assert( 'persist_failed' === $r['status'] && true === $r['retryable'] && 1 === count( YSPaymentLifecycleService::$calls ) && [] === ScalarColumnWriter::$writes, 'A19 lifecycle/detail CAS failure → persist_failed with no split state or scalar write' );
 
 	$reset();
 	$order = $make_order();
 	ScalarColumnWriter::$persist = false;
 	$r = EcpgSettlement::apply( $order, $success_data(), 'ecpg_return' );
-	$assert( 'persist_failed' === $r['status'] && [] === YSPaymentLifecycleService::$calls, 'A20 gateway_trade_no write failure → persist_failed' );
+	$assert( 'persist_failed' === $r['status'] && 1 === count( YSPaymentLifecycleService::$calls ) && [] === ScalarColumnWriter::$writes, 'A20 atomic gateway_trade_no/lifecycle write failure → persist_failed' );
 
 	$reset();
 	$order = $make_order();
@@ -577,7 +758,16 @@ namespace {
 	$found = EcpgSettlement::find_order_by_merchant_trade_no( $MTN );
 	$sql   = $GLOBALS['wpdb']->queries[0] ?? '';
 	$assert( is_object( $found ) && 42 === $found->id, 'C1 order found by MerchantTradeNo' );
-	$assert( 2 === substr_count( $sql, 'JSON_UNQUOTE(JSON_EXTRACT(payment_detail' ) && str_contains( $sql, "'$.mer_trade_no'" ) && str_contains( $sql, "'$.ecpay_merchant_trade_no'" ) && str_contains( $sql, "= '{$MTN}'" ), 'C2 lookup compares JSON_UNQUOTE(JSON_EXTRACT()) of both keys (never a quoted literal)' );
+	$assert(
+		2 === substr_count( $sql, 'JSON_UNQUOTE(JSON_EXTRACT(payment_detail' )
+		&& str_contains( $sql, "'$.mer_trade_no'" )
+		&& str_contains( $sql, "'$.ecpay_merchant_trade_no'" )
+		&& str_contains( $sql, 'JSON_SEARCH(payment_detail' )
+		&& str_contains( $sql, "'$.ys_payment_attempt_history[*].fields.mer_trade_no'" )
+		&& str_contains( $sql, "'$.ys_payment_attempt_history[*].fields.ecpay_merchant_trade_no'" )
+		&& str_contains( $sql, "= '{$MTN}'" ),
+		'C2 lookup discovers current aliases and bounded attempt-history aliases without granting write authority'
+	);
 	$GLOBALS['wpdb']->queries = [];
 	$assert( null === EcpgSettlement::find_order_by_merchant_trade_no( "YS' OR 1=1" ) && [] === $GLOBALS['wpdb']->queries, 'C3 non-alphanumeric MerchantTradeNo is refused before SQL' );
 	$GLOBALS['wpdb']->row = (object) [ 'id' => 42 ];
@@ -626,6 +816,42 @@ namespace {
 	$res = $run( 'charge-saved-anon' );
 	$json = json_decode( $res['stdout'], true );
 	$assert( [ '403' ] === $res['status'] && 'forbidden' === ( $json['status'] ?? '' ) && [] === array_filter( $res['lines'], static fn ( string $l ): bool => str_starts_with( $l, 'remote:' ) ) && [] === $res['paid'], 'B21 charge-saved without a logged-in owner → 403, nothing sent' );
+	$res = $run( 'charge-saved-3d' );
+	$json = json_decode( $res['stdout'], true );
+	$handoffs = array_values( array_filter( $res['lines'], static fn ( string $l ): bool => str_starts_with( $l, 'handoff:' ) ) );
+	$handoff_args = [] !== $handoffs ? json_decode( substr( $handoffs[0], 8 ), true ) : [];
+	$assert(
+		[ '200' ] === $res['status']
+		&& true === ( $json['ok'] ?? false )
+		&& 'redirect' === ( $json['status'] ?? '' )
+		&& 'https://3d.example/authorize' === ( $json['url'] ?? '' )
+		&& [ '3002607', 'stage', '3002607', $MTN, 1290 ] === array_slice( $handoff_args, 5, 5 )
+		&& [] === $res['paid'],
+		'B22 3D URL is exposed only after the provider merchant, attempt and amount reach the final handoff CAS'
+	);
+	$res = $run( 'charge-saved-3d-handoff-lost' );
+	$json = json_decode( $res['stdout'], true );
+	$assert(
+		[ '202' ] === $res['status']
+		&& false === ( $json['ok'] ?? true )
+		&& 'pending' === ( $json['status'] ?? '' )
+		&& ! array_key_exists( 'url', is_array( $json ) ? $json : [] )
+		&& str_contains( (string) ( $json['redirect'] ?? '' ), '/thankyou/' )
+		&& [] === $res['paid']
+		&& [] === $res['failed'],
+		'B23 a lost post-provider handoff race returns pending/thank-you with no stale 3D URL or lifecycle write'
+	);
+	$res = $run( 'charge-saved-3d-credential-drift' );
+	$json = json_decode( $res['stdout'], true );
+	$owner_identities = array_values( array_filter( $res['lines'], static fn ( string $l ): bool => str_starts_with( $l, 'owner_identity:' ) ) );
+	$assert(
+		[ '200' ] === $res['status']
+		&& true === ( $json['ok'] ?? false )
+		&& 'redirect' === ( $json['status'] ?? '' )
+		&& in_array( 'credentials:rotated-after-response', $res['lines'], true )
+		&& in_array( 'owner_identity:{"merchant_id":"3002607","environment":"stage"}', $owner_identities, true ),
+		'B24 post-provider owner check uses the verified response credential snapshot after settings rotate'
+	);
 	$res = $run( 'pay-page-paid' );
 	$assert( [ 'https://shop.invalid/thankyou/?order=42&key=key-42' ] === $res['redirect'], 'B14 already-paid order → straight to the thank-you page' );
 

@@ -83,10 +83,12 @@ namespace YangSheep\Ecommerce\Services\Payment {
 	final class YSPaymentDispatch {
 		public static int $order_id = 0;
 		public static string $operation_key = '';
+		public static ?string $token = 'fixture-dispatch-token';
 		public static bool $bind_result = true;
 		public static array $bind_calls = [];
 		public static function current_order_id(): int { return self::$order_id; }
 		public static function current_operation_key(): string { return self::$operation_key; }
+		public static function current_token(): ?string { return self::$token; }
 		public static function bind_renewal_token_identity_from_context( int $card_id, string $token_hash ): bool {
 			self::$bind_calls[] = [ $card_id, $token_hash ];
 			return self::$bind_result;
@@ -133,7 +135,8 @@ namespace YangSheep\YSCartEcpay {
 namespace YangSheep\YSCartEcpay\Support {
 	final class Settings {
 		public static bool $has_credentials = true;
-		public static function payment_credentials(): array { return [ 'merchant_id' => '3002607', 'hash_key' => 'pwFHCqoQZGmho4w6', 'hash_iv' => 'EkRm7iFT261dpevs', 'test_mode' => true ]; }
+		public static array $credentials = [ 'merchant_id' => '3002607', 'hash_key' => 'pwFHCqoQZGmho4w6', 'hash_iv' => 'EkRm7iFT261dpevs', 'test_mode' => true ];
+		public static function payment_credentials(): array { return self::$credentials; }
 		public static function has_payment_credentials(): bool { return self::$has_credentials; }
 		public static function gateway_enabled( string $alias ): bool { return true; }
 	}
@@ -173,6 +176,41 @@ namespace YangSheep\YSCartEcpay\Support {
 	}
 }
 
+namespace YangSheep\YSCartEcpay\Payment {
+	use YangSheep\Ecommerce\Services\Payment\YSPaymentDispatch;
+	use YangSheep\YSCartEcpay\Support\FakeWrite;
+	use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
+
+	/** Controller-neutral seam fake; v063 exercises the real attempt helper. */
+	final class EcpayPaymentAttempt {
+		public static bool $bind_result = true;
+		public static array $bind_calls = [];
+		public static function bind_payment_identity(int $order_id, string $gateway_id, string $merchant_trade_no, int $amount, string $environment, string $merchant_id, array $extra = []): FakeWrite {
+			self::$bind_calls[] = func_get_args();
+			$current = OrderPaymentDetail::$details[$order_id] ?? [];
+			$current = array_merge($current, [
+				'mer_trade_no' => $merchant_trade_no,
+				'ecpay_merchant_trade_no' => $merchant_trade_no,
+				'ecpay_operation_key' => YSPaymentDispatch::current_operation_key(),
+				'payment_provider' => 'ecpay',
+				'payment_method' => $gateway_id,
+				'ecpay_charged_amount' => $amount,
+				'ecpay_environment' => $environment,
+				'ecpay_merchant_id' => $merchant_id,
+			], $extra);
+			if (self::$bind_result && OrderPaymentDetail::$persist) {
+				OrderPaymentDetail::$details[$order_id] = $current;
+			}
+			return new FakeWrite(self::$bind_result && OrderPaymentDetail::$persist);
+		}
+		public static function browser_fingerprint(array $detail): string {
+			$op = (string) ($detail['ecpay_operation_key'] ?? '');
+			$mtn = (string) ($detail['ecpay_merchant_trade_no'] ?? '');
+			return '' === $op || '' === $mtn ? '' : substr(hash('sha256', $op . '|' . $mtn), 0, 32);
+		}
+	}
+}
+
 namespace {
 	$root = str_replace( '\\', '/', dirname( __DIR__, 2 ) );
 	require_once $root . '/src/Support/Utf8Text.php';
@@ -191,7 +229,14 @@ namespace YangSheep\YSCartEcpay\Ecpg {
 	final class FakeEcpgClient extends EcpgClient {
 		public array $calls = [];
 		public array $next = [];
-		public function create_payment_with_card_id( array $data ): array {
+		public array $credential_context = [ 'merchant_id' => '3002607', 'environment' => 'stage' ];
+		public function create_payment_with_card_id( array $data, ?callable $before_send = null, ?callable $pre_submit = null ): array {
+			if ( null !== $pre_submit && ! $pre_submit( $this->credential_context ) ) {
+				return [ 'outcome' => self::OUTCOME_REJECTED, 'sent' => false, 'message' => 'pre-submit refused', 'data' => null ];
+			}
+			if (null !== $before_send && ! $before_send()) {
+				return [ 'outcome' => self::OUTCOME_REJECTED, 'sent' => false, 'message' => 'pre-send refused', 'data' => null ];
+			}
 			$this->calls[] = $data;
 			return $this->next;
 		}
@@ -212,6 +257,7 @@ namespace {
 	use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 	use YangSheep\YSCartEcpay\Ecpg\FakeEcpgClient;
 	use YangSheep\YSCartEcpay\Payment\EcpayEcpgCreditGateway;
+	use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 	use YangSheep\YSCartEcpay\Payment\EcpayPaymentCatalog;
 	use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 	use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
@@ -274,11 +320,14 @@ namespace {
 		ScalarColumnWriter::$persist   = true;
 		YSPaymentDispatch::$order_id      = 0;
 		YSPaymentDispatch::$operation_key = '';
+		YSPaymentDispatch::$token         = 'fixture-dispatch-token';
 		YSPaymentDispatch::$bind_result   = true;
 		YSPaymentDispatch::$bind_calls    = [];
 		YSPaymentDetailStore::$deltas     = [];
 		YSPaymentDetailStore::$decision   = 'updated';
 		YSPaymentDetailStore::$persisted  = true;
+		EcpayPaymentAttempt::$bind_result = true;
+		EcpayPaymentAttempt::$bind_calls  = [];
 		YSSavedCardChargePolicy::$allow   = true;
 		YSCreditCard::$default_result     = [ 'outcome' => 'absent' ];
 		YSCreditCard::$default_calls      = [];
@@ -286,8 +335,10 @@ namespace {
 		YSCreditCard::$authority_calls    = [];
 		YSLogger::$entries = [];
 		Settings::$has_credentials = true;
+		Settings::$credentials = [ 'merchant_id' => '3002607', 'hash_key' => 'pwFHCqoQZGmho4w6', 'hash_iv' => 'EkRm7iFT261dpevs', 'test_mode' => true ];
 		$client->calls = [];
 		$client->next  = [];
+		$client->credential_context = [ 'merchant_id' => '3002607', 'environment' => 'stage' ];
 	};
 	$order_of = static function ( int $id, string $total, bool $subscription, int $customer_id = 7 ): object {
 		YSOrder::$orders[ $id ] = (object) [ 'id' => $id, 'order_number' => 'YS-' . $id, 'total' => $total, 'status' => 'pending', 'customer_id' => $customer_id, 'user_id' => 70, 'billing_email' => 'buyer@example.com', 'billing_phone' => '0912345678', 'billing_name' => '王小明', 'billing_country' => 'TW', 'payment_detail' => '{}' ];
@@ -303,12 +354,12 @@ namespace {
 	$r = $gateway->process_payment( 42 );
 	$expected_mtn = 'YS' . strtoupper( substr( hash( 'sha256', 'op-42-gen1-nonce' ), 0, 18 ) );
 	$assert( true === ( $r['success'] ?? false ) && ! isset( $r['form_data'] ), 'C1 process_payment succeeds without any AIO form' );
-	$assert( str_starts_with( (string) ( $r['redirect_url'] ?? '' ), 'https://shop.invalid/wp-json/ys-ecommerce/v1/ecpay/ecpg/pay?' ) && str_contains( (string) $r['redirect_url'], 'order=42' ) && str_contains( (string) $r['redirect_url'], 'key=key-42-YS-42' ), 'C2 redirect goes to the hosted pay page with order + key' );
+	$assert( str_starts_with( (string) ( $r['redirect_url'] ?? '' ), 'https://shop.invalid/wp-json/ys-ecommerce/v1/ecpay/ecpg/pay?' ) && str_contains( (string) $r['redirect_url'], 'order=42' ) && str_contains( (string) $r['redirect_url'], 'key=key-42-YS-42' ) && str_contains( (string) $r['redirect_url'], 'attempt=' . $expected_mtn ) && 1 === preg_match( '/(?:^|&)afp=[a-f0-9]{32}(?:&|$)/', (string) parse_url( (string) $r['redirect_url'], PHP_URL_QUERY ) ), 'C2 redirect is bound to order + key + exact attempt fingerprint' );
 	$d = OrderPaymentDetail::$details[42] ?? [];
 	$assert( $expected_mtn === ( $d['mer_trade_no'] ?? null ) && $expected_mtn === ( $d['ecpay_merchant_trade_no'] ?? null ) && 'op-42-gen1-nonce' === ( $d['ecpay_operation_key'] ?? null ), 'C3 stable MerchantTradeNo derived from the operation key is persisted (both keys) with the operation key' );
 	$assert( 1290 === ( $d['ecpay_charged_amount'] ?? null ) && 'ecpay' === ( $d['payment_provider'] ?? null ) && 'ys_ec_ecpay_ecpg_credit' === ( $d['payment_method'] ?? null ) && 'stage' === ( $d['ecpay_environment'] ?? null ) && '3002607' === ( $d['ecpay_merchant_id'] ?? null ), 'C4 charged amount, provider, method, environment and merchant are persisted' );
 	$assert( 'subscription_renewal' === ( $d['type'] ?? null ) && 'bind' === ( $d['ecpay_ecpg_flow'] ?? null ) && 'YSC7' === ( $d['ecpay_ecpg_member_id'] ?? null ), 'C5 manual renewal of a subscription item → CreateBindCard flow retains follow-up identity' );
-	$assert( [ [ 42, [ 'gateway_id' => 'ys_ec_ecpay_ecpg_credit', 'payment_method' => 'ys_ec_ecpay_ecpg_credit' ] ] ] === ScalarColumnWriter::$writes, 'C6 gateway identity columns written' );
+	$assert( 1 === count( EcpayPaymentAttempt::$bind_calls ) && [] === ScalarColumnWriter::$writes, 'C6 detail and gateway identity use one attempt-bound CAS with no split scalar writer' );
 	$assert( [] === $client->calls, 'C7 process_payment never calls ECPay' );
 
 	$reset();
@@ -344,9 +395,9 @@ namespace {
 	$reset();
 	YSPaymentDispatch::$operation_key = 'op-48';
 	$order_of( 48, '500', false );
-	ScalarColumnWriter::$persist = false;
+	EcpayPaymentAttempt::$bind_result = false;
 	$r = $gateway->process_payment( 48 );
-	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ), 'C13 gateway identity write failure → rejected' );
+	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ), 'C13 attempt-bound identity CAS refusal → rejected' );
 
 	$reset();
 	$r = $gateway->process_payment( 999 );
@@ -387,10 +438,31 @@ namespace {
 	$assert( 'BINDCARD1234567890' === ( $call['BindCardID'] ?? null ) && 0 === ( $call['Need3D'] ?? null ), 'D4 payload uses the vault raw token as BindCardID with Need3D=0' );
 	$assert( $expected_renewal_mtn === ( $call['OrderInfo']['MerchantTradeNo'] ?? null ) && 1290 === ( $call['OrderInfo']['TotalAmount'] ?? null ) && 'https://shop.invalid/wp-json/ys-ecommerce/v1/ecpay/ecpg/return' === ( $call['OrderInfo']['ReturnURL'] ?? null ) && '月訂閱' === ( $call['OrderInfo']['ItemName'] ?? null ) && '2026/09/10 12:00:00' === ( $call['OrderInfo']['MerchantTradeDate'] ?? null ), 'D5 OrderInfo: MTN, integer amount, ReturnURL, ItemName, MerchantTradeDate' );
 	$assert( 'YSC7' === ( $call['ConsumerInfo']['MerchantMemberID'] ?? null ) && 'buyer@example.com' === ( $call['ConsumerInfo']['Email'] ?? null ) && '0912345678' === ( $call['ConsumerInfo']['Phone'] ?? null ) && '158' === ( $call['ConsumerInfo']['CountryCode'] ?? null ), 'D6 ConsumerInfo: member key matches the binding key, contact fields present' );
-	$delta = YSPaymentDetailStore::$deltas[0] ?? null;
-	$assert( is_array( $delta ) && $expected_renewal_mtn === $delta['mutated']['mer_trade_no'] && 'token_charge' === $delta['mutated']['ecpay_ecpg_flow'] && 1290 === $delta['mutated']['ecpay_charged_amount'] && 'ys_ec_ecpay_ecpg_credit' === $delta['mutated']['payment_method'], 'D7 identity persisted via apply_delta before the provider call' );
+	$bound_detail = OrderPaymentDetail::$details[500] ?? [];
+	$assert( $expected_renewal_mtn === ( $bound_detail['mer_trade_no'] ?? null ) && 'token_charge' === ( $bound_detail['ecpay_ecpg_flow'] ?? null ) && 1290 === ( $bound_detail['ecpay_charged_amount'] ?? null ) && 'ys_ec_ecpay_ecpg_credit' === ( $bound_detail['payment_method'] ?? null ) && 1 === count( EcpayPaymentAttempt::$bind_calls ), 'D7 renewal identity, including attempt id inputs, is persisted through the shared bind CAS before provider I/O' );
 	$assert( [ [ 31, str_repeat( 'ab', 32 ) ] ] === YSPaymentDispatch::$bind_calls, 'D8 card identity bound to the attempt (card id + token hash)' );
 	$assert( [ [ 31, 7, 70, 'ys_ec_ecpay_ecpg_credit' ] ] === YSCreditCard::$authority_calls, 'D9 authority looked up for the exact owner + this gateway' );
+
+	$renewal();
+	$client->credential_context = [ 'merchant_id' => 'ROTATED-MERCHANT', 'environment' => 'live' ];
+	$r = $gateway->process_token_charge( 9, 1290.0 );
+	$bind = EcpayPaymentAttempt::$bind_calls[0] ?? [];
+	$assert(
+		true === ( $r['success'] ?? false )
+		&& 'live' === ( $bind[4] ?? null )
+		&& 'ROTATED-MERCHANT' === ( $bind[5] ?? null ),
+		'D9a renewal binds the exact credential snapshot supplied by the provider client, not a prior Settings read'
+	);
+
+	$renewal();
+	EcpayPaymentAttempt::$bind_result = false;
+	$r = $gateway->process_token_charge( 9, 1290.0 );
+	$assert(
+		false === ( $r['success'] ?? true )
+		&& 'rejected_terminal' === ( $r['outcome'] ?? '' )
+		&& [] === $client->calls,
+		'D9b renewal identity CAS refusal occurs before provider I/O'
+	);
 
 	$renewal();
 	$client->next['outcome'] = EcpgClient::OUTCOME_INDETERMINATE;
@@ -471,8 +543,7 @@ namespace {
 	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ) && [] === $client->calls, 'D24 another attempt already owns mer_trade_no → rejected' );
 
 	$renewal();
-	YSPaymentDetailStore::$decision  = 'stale';
-	YSPaymentDetailStore::$persisted = false;
+	EcpayPaymentAttempt::$bind_result = false;
 	$r = $gateway->process_token_charge( 9, 1290.0 );
 	$assert( 'rejected_terminal' === ( $r['outcome'] ?? '' ) && [] === $client->calls, 'D25 identity persistence lost (stale dispatch) → nothing sent' );
 

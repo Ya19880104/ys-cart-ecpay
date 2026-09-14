@@ -1,13 +1,13 @@
 <?php
-/** ECPG's method-level Core gate must not disable AIO payment or shipping bootstrap. */
+/** Core 2.67.11 is the global attempt-safe payment floor; ECPG keeps extra method capabilities. */
 
 declare(strict_types=1);
 
 namespace {
 	$scenario = isset( $argv[1] ) && '--case' === $argv[1] ? (string) ( $argv[2] ?? '' ) : '';
 	define( 'ABSPATH', __DIR__ );
-	define( 'YS_ECOMMERCE_VERSION', 'legacy-version' === $scenario ? '2.61.7' : '2.66.3' );
-	define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.61.7' );
+	define( 'YS_ECOMMERCE_VERSION', 'legacy-version' === $scenario ? '2.67.10' : '2.67.11' );
+	define( 'YS_CART_ECPAY_REQUIRES_CORE', '2.67.11' );
 	define( 'YS_CART_ECPAY_VERSION', 'test' );
 	define( 'HOUR_IN_SECONDS', 3600 );
 	function get_transient( string $key ): false { return false; }
@@ -74,6 +74,17 @@ namespace YangSheep\Ecommerce\Services\Payment {
 	final class YSPaymentDetailResult {}
 	final class YSPaymentDispatch {
 		public static function current_operation_key(): string { return 'operation'; }
+		public static function current_token(): ?string { return 'token'; }
+		public static function operation_key( int $order_id, array $attempt ): string { return 'operation'; }
+		public static function state( array $detail ): string { return 'submitted'; }
+	}
+	final class YSPaymentAttempt {
+		public static function current( array $detail ): array { return []; }
+	}
+	final class YSPaymentLifecycleService {
+		public static function mark_paid( mixed ...$args ): array { return []; }
+		public static function mark_failed( mixed ...$args ): array { return []; }
+		public static function mark_pending_offline( mixed ...$args ): array { return []; }
 	}
 }
 
@@ -177,7 +188,7 @@ namespace {
 	$ecpg_class = \YangSheep\YSCartEcpay\Payment\TestEcpgGateway::class;
 
 	$complete = $run( 'complete' );
-	$check( 'Core 2.66.3 with receipt and binder registers AIO plus ECPG', 0 === $complete['exit'] && true === ( $complete['result']['base']['met'] ?? false ) && true === ( $complete['result']['ecpg']['met'] ?? false ) && [ $aio_class, $ecpg_class ] === ( $complete['result']['gateways'] ?? [] ) && 1 === ( $complete['result']['aio_routes'] ?? 0 ) && 1 === ( $complete['result']['ecpg_routes'] ?? 0 ), $complete );
+	$check( 'Core 2.67.11 with attempt/lifecycle, receipt and binder APIs registers AIO plus ECPG', 0 === $complete['exit'] && true === ( $complete['result']['base']['met'] ?? false ) && true === ( $complete['result']['ecpg']['met'] ?? false ) && [ $aio_class, $ecpg_class ] === ( $complete['result']['gateways'] ?? [] ) && 1 === ( $complete['result']['aio_routes'] ?? 0 ) && 1 === ( $complete['result']['ecpg_routes'] ?? 0 ), $complete );
 
 	$missing_binding = $run( 'missing-binding' );
 	$check( 'missing binder blocks only ECPG gateway/routes while AIO bootstrap stays live', 0 === $missing_binding['exit'] && true === ( $missing_binding['result']['base']['met'] ?? false ) && 'ecpg_core_capability_missing' === ( $missing_binding['result']['ecpg']['reason'] ?? '' ) && [ $aio_class ] === ( $missing_binding['result']['gateways'] ?? [] ) && 1 === ( $missing_binding['result']['aio_routes'] ?? 0 ) && 0 === ( $missing_binding['result']['ecpg_routes'] ?? -1 ), $missing_binding );
@@ -186,7 +197,24 @@ namespace {
 	$check( 'incomplete receipt API blocks only ECPG gateway/routes', 0 === $missing_effects['exit'] && true === ( $missing_effects['result']['base']['met'] ?? false ) && 'ecpg_core_capability_missing' === ( $missing_effects['result']['ecpg']['reason'] ?? '' ) && [ $aio_class ] === ( $missing_effects['result']['gateways'] ?? [] ) && 1 === ( $missing_effects['result']['aio_routes'] ?? 0 ) && 0 === ( $missing_effects['result']['ecpg_routes'] ?? -1 ), $missing_effects );
 
 	$legacy = $run( 'legacy-version' );
-	$check( 'advertised global Core 2.61.7 floor keeps AIO live but cannot register ECPG', 0 === $legacy['exit'] && true === ( $legacy['result']['base']['met'] ?? false ) && 'ecpg_core_too_old' === ( $legacy['result']['ecpg']['reason'] ?? '' ) && [ $aio_class ] === ( $legacy['result']['gateways'] ?? [] ) && 1 === ( $legacy['result']['aio_routes'] ?? 0 ) && 0 === ( $legacy['result']['ecpg_routes'] ?? -1 ), $legacy );
+	$entry = (string) file_get_contents( dirname( __DIR__, 2 ) . '/ys-cart-ecpay.php' );
+	$gate_pos = strpos( $entry, 'Plugin::core_requirements()' );
+	$init_pos = strpos( $entry, 'Plugin::instance()->init()' );
+	$check(
+		'Core 2.67.10 is below the global attempt-safe bootstrap floor',
+		0 === $legacy['exit']
+		&& false === ( $legacy['result']['base']['met'] ?? true )
+		&& 'core_too_old' === ( $legacy['result']['base']['reason'] ?? '' )
+		&& 'ecpg_core_too_old' === ( $legacy['result']['ecpg']['reason'] ?? '' )
+		&& [ $aio_class ] === ( $legacy['result']['gateways'] ?? [] )
+		&& 1 === ( $legacy['result']['aio_routes'] ?? 0 )
+		&& 0 === ( $legacy['result']['ecpg_routes'] ?? -1 )
+		&& false !== $gate_pos
+		&& false !== $init_pos
+		&& $gate_pos < $init_pos
+		&& str_contains( $entry, "if ( ! \$ys_cart_ecpay_gate['met'] )" ),
+		$legacy
+	);
 
 	echo "\nECPG subscription card capability gate: {$pass} PASS / {$fail} FAIL\n";
 	exit( $fail > 0 ? 1 : 0 );

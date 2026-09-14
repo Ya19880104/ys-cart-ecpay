@@ -189,6 +189,16 @@ namespace {
             === $withUnionPay['fields']['CheckMacValue'],
         'A4 簽章是對「含額外欄位」的完整欄位表計算的'
     );
+    $assert(
+        ['merchant_id' => '2000132', 'environment' => 'stage'] === ($plain['credential_context'] ?? null)
+            && ($plain['fields']['MerchantID'] ?? null) === ($plain['credential_context']['merchant_id'] ?? null),
+        'A5 attempt handoff 使用與 AIO 表單簽章相同的非機密商店快照'
+    );
+    $assert(
+        !array_key_exists('credential_context', $plain['fields'])
+            && 'https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5' === ($plain['action_url'] ?? null),
+        'A6 內部憑證快照不會送給 provider，且 stage action 與該快照一致'
+    );
 
     // ── B. 額外欄位只能新增，不得覆寫建單欄位 ────────────────────────────────
     foreach (['TotalAmount' => '1', 'ReturnURL' => 'https://attacker.invalid/', 'ChoosePayment' => 'ATM', 'MerchantID' => '9999999'] as $field => $value) {

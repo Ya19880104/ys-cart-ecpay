@@ -13,8 +13,8 @@ use YangSheep\Ecommerce\Services\Payment\YSPaymentDetailStore;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentEffects;
 use YangSheep\Ecommerce\Services\Payment\YSPaymentLifecycleService;
 use YangSheep\Ecommerce\Utils\YSLogger;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
-use YangSheep\YSCartEcpay\Support\ScalarColumnWriter;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 /**
@@ -75,7 +75,11 @@ final class EcpgSettlement {
 				"SELECT * FROM {$table}
 				 WHERE JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.mer_trade_no')) = %s
 				    OR JSON_UNQUOTE(JSON_EXTRACT(payment_detail, '$.ecpay_merchant_trade_no')) = %s
+				    OR JSON_SEARCH(payment_detail, 'one', %s, NULL,
+				       '$.ys_payment_attempt_history[*].fields.mer_trade_no',
+				       '$.ys_payment_attempt_history[*].fields.ecpay_merchant_trade_no') IS NOT NULL
 				 ORDER BY id DESC LIMIT 1",
+				$merchant_trade_no,
 				$merchant_trade_no,
 				$merchant_trade_no
 			)
@@ -84,16 +88,15 @@ final class EcpgSettlement {
 			return null;
 		}
 		// 走 YSOrder 的正式讀取（快取、型別），並再確認歸屬。
+		YSOrder::forget( (int) ( $row->id ?? 0 ) );
 		$order = YSOrder::find( (int) ( $row->id ?? 0 ) );
 		return $order && self::order_has_merchant_trade_no( $order, $merchant_trade_no ) ? $order : null;
 	}
 
 	public static function order_has_merchant_trade_no( object $order, string $merchant_trade_no ): bool {
 		$detail = self::detail_of( $order );
-		return '' !== $merchant_trade_no && (
-			hash_equals( (string) ( $detail['mer_trade_no'] ?? '' ), $merchant_trade_no )
-			|| hash_equals( (string) ( $detail['ecpay_merchant_trade_no'] ?? '' ), $merchant_trade_no )
-		);
+		return '' !== $merchant_trade_no
+			&& EcpayPaymentAttempt::identity_is_discoverable( $detail, $merchant_trade_no );
 	}
 
 	/** @return array<string,mixed> */
@@ -113,10 +116,10 @@ final class EcpgSettlement {
 	 * @param string              $source 'ecpg_confirm'｜'ecpg_return'｜'ecpg_result'｜'ecpg_charge_saved'
 	 * @return array{status:string,message:string,vault:string,retryable:bool}
 	 */
-	public static function apply( object $order, array $data, string $source ): array {
+	public static function apply( object $order, array $data, string $source, ?array $verified_identity = null ): array {
 		$order_id    = (int) ( $order->id ?? 0 );
-		$credentials = Settings::payment_credentials();
-		if ( '' === $credentials['merchant_id'] || (string) ( $data['MerchantID'] ?? '' ) !== $credentials['merchant_id'] ) {
+		$identity    = self::settlement_identity( $verified_identity );
+		if ( null === $identity || (string) ( $data['MerchantID'] ?? '' ) !== $identity['merchant_id'] ) {
 			return self::outcome( self::STATUS_REJECTED, 'MerchantID 與本站設定不符。' );
 		}
 
@@ -126,9 +129,54 @@ final class EcpgSettlement {
 			return self::outcome( self::STATUS_REJECTED, 'MerchantTradeNo 不屬於這張訂單。' );
 		}
 
-		$rtn_code = isset( $data['RtnCode'] ) && is_numeric( $data['RtnCode'] ) ? (int) $data['RtnCode'] : null;
+		$detail_now = OrderPaymentDetail::read( $order_id );
+		if ( null === $detail_now ) {
+			return self::outcome( self::STATUS_PERSIST_FAILED, '付款資料讀取失敗。', self::VAULT_SKIPPED, true );
+		}
+		$card_info  = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
+		$reported   = $order_info['TradeAmt'] ?? $card_info['Amount'] ?? null;
+		$reported_amount = ( is_int( $reported ) || ( is_string( $reported ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $reported ) ) )
+			? (int) $reported
+			: 0;
+		$environment = $identity['environment'];
+		$rtn_code = EcpgClient::parse_result_code( $data['RtnCode'] ?? null );
+		if ( null === $rtn_code ) {
+			return self::outcome( self::STATUS_REJECTED, 'RtnCode 格式無法確認。' );
+		}
+		$action   = 1 === $rtn_code ? EcpayPaymentAttempt::ACTION_SUCCESS : EcpayPaymentAttempt::ACTION_FAILURE;
+		if ( EcpayPaymentAttempt::historical_callback_matches(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$reported_amount,
+			(string) ( $data['MerchantID'] ?? '' ),
+			$environment
+		) ) {
+			return self::outcome( self::STATUS_REJECTED, '付款結果屬於已歸檔的付款嘗試。' );
+		}
+		$claim = EcpayPaymentAttempt::callback_claim(
+			$order,
+			$detail_now,
+			$merchant_trade_no,
+			$reported_amount,
+			(string) ( $data['MerchantID'] ?? '' ),
+			$environment,
+			$action
+		);
+		if ( null === $claim ) {
+			YSLogger::error( 'ecpay', 'ECPG 授權金額與建單金額不符，拒絕標記已付', [
+				'order_id' => $order_id,
+				'reported' => $reported,
+				'source'   => $source,
+			] );
+			return self::outcome( self::STATUS_REJECTED, '付款結果不屬於目前付款嘗試，或授權金額不符。' );
+		}
+
+		if ( EcpgClient::RTN_PENDING_CONFIRMATION === $rtn_code ) {
+			return self::outcome( self::STATUS_PENDING, '綠界回報付款結果仍待確認。' );
+		}
 		if ( 1 !== $rtn_code ) {
-			return self::mark_failure( $order, $data, $source );
+			return self::mark_failure( $order, $data, $source, $claim, $identity );
 		}
 
 		$trade_status = EcpgClient::trade_status( $data );
@@ -137,22 +185,8 @@ final class EcpgSettlement {
 			return self::outcome( self::STATUS_PENDING, '綠界回報交易成立但尚未付款。' );
 		}
 
-		$detail_now = self::detail_of( $order );
-		$expected   = isset( $detail_now['ecpay_charged_amount'] ) ? (int) $detail_now['ecpay_charged_amount'] : 0;
-		$card_info  = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
-		$reported   = $order_info['TradeAmt'] ?? $card_info['Amount'] ?? null;
-		if ( $expected > 0 && ( ! is_numeric( $reported ) || (int) $reported !== $expected ) ) {
-			YSLogger::error( 'ecpay', 'ECPG 授權金額與建單金額不符，拒絕標記已付', [
-				'order_id' => $order_id,
-				'expected' => $expected,
-				'reported' => $reported,
-				'source'   => $source,
-			] );
-			return self::outcome( self::STATUS_REJECTED, '授權金額與訂單金額不符。' );
-		}
-
-		$trade_no = ScalarColumnWriter::required_string( sanitize_text_field( (string) ( $order_info['TradeNo'] ?? '' ) ) );
-		if ( null === $trade_no ) {
+		$trade_no = trim( sanitize_text_field( (string) ( $order_info['TradeNo'] ?? '' ) ) );
+		if ( '' === $trade_no ) {
 			return self::outcome( self::STATUS_REJECTED, '付款成功結果未帶綠界交易編號。' );
 		}
 
@@ -166,26 +200,22 @@ final class EcpgSettlement {
 				$evidence[ $to ] = sanitize_text_field( (string) $card_info[ $from ] );
 			}
 		}
-		$written = OrderPaymentDetail::mutate( $order_id, static function ( array $detail ) use ( $evidence ): array {
-			foreach ( $evidence as $key => $value ) {
-				$detail[ $key ] = $value;
-			}
-			return $detail;
-		} );
-		if ( ! $written->is_persisted() ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: ECPG 授權證據寫入失敗', array_merge( [ 'order_id' => $order_id, 'source' => $source ], $written->to_log_context() ) );
-			return self::outcome( self::STATUS_PERSIST_FAILED, '付款證據寫入失敗。', self::VAULT_SKIPPED, true );
-		}
-
-		$identity = ScalarColumnWriter::write( $order_id, [ 'gateway_trade_no' => $trade_no ] );
-		if ( ! ScalarColumnWriter::is_persisted( $identity ) ) {
-			YSLogger::error( 'ecpay', 'CRITICAL: ECPG gateway_trade_no 寫入失敗', [ 'order_id' => $order_id, 'state' => $identity['state'] ?? '' ] );
-			return self::outcome( self::STATUS_PERSIST_FAILED, '交易編號寫入失敗。', self::VAULT_SKIPPED, true );
-		}
-
-		$transition = YSPaymentLifecycleService::mark_paid( $order_id, self::detail_dto( $data, $merchant_trade_no, $trade_no ), 'webhook_' . $source );
+		$transition = YSPaymentLifecycleService::mark_paid(
+			$order_id,
+			self::detail_dto( $data, $merchant_trade_no, $trade_no ),
+			'webhook_' . $source,
+			EcpayPaymentAttempt::callback_guard( $claim ),
+			EcpayPaymentAttempt::callback_lifecycle_options(
+				$claim,
+				EcpayPaymentAttempt::callback_detail_patch( $claim, $evidence ),
+				[ 'gateway_trade_no' => $trade_no ]
+			)
+		);
 		$status     = self::STATUS_PAID;
 		if ( ! is_array( $transition ) || empty( $transition['success'] ) ) {
+			if ( is_array( $transition ) && 'stale' === (string) ( $transition['outcome'] ?? '' ) ) {
+				return self::outcome( self::STATUS_REJECTED, '付款結果屬於先前的付款嘗試。' );
+			}
 			if ( is_array( $transition ) && ! empty( $transition['retryable'] ) ) {
 				YSLogger::error( 'ecpay', 'CRITICAL: ECPG 訂單狀態推進失敗', [
 					'order_id' => $order_id,
@@ -223,19 +253,122 @@ final class EcpgSettlement {
 	 *
 	 * @return array{status:string,message:string,vault:string,retryable:bool}
 	 */
-	public static function mark_failure( object $order, array $data, string $source ): array {
+	public static function mark_failure( object $order, array $data, string $source, ?array $claim = null, ?array $verified_identity = null ): array {
 		$order_id   = (int) ( $order->id ?? 0 );
 		$order_info = is_array( $data['OrderInfo'] ?? null ) ? $data['OrderInfo'] : [];
 		$message    = sanitize_text_field( (string) ( $data['RtnMsg'] ?? '' ) );
+		$rtn_code   = EcpgClient::parse_result_code( $data['RtnCode'] ?? null );
+		if ( null === $rtn_code || 1 === $rtn_code || EcpgClient::RTN_PENDING_CONFIRMATION === $rtn_code ) {
+			return self::outcome( self::STATUS_REJECTED, '失敗代碼格式或狀態無法確認。' );
+		}
+		if ( null === $claim ) {
+			$identity = self::settlement_identity( $verified_identity );
+			if ( null === $identity || ! hash_equals( $identity['merchant_id'], (string) ( $data['MerchantID'] ?? '' ) ) ) {
+				return self::outcome( self::STATUS_REJECTED, 'MerchantID 與已驗證的付款憑證不符。' );
+			}
+			$card_info = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
+			$reported  = $order_info['TradeAmt'] ?? $card_info['Amount'] ?? null;
+			$amount    = ( is_int( $reported ) || ( is_string( $reported ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $reported ) ) )
+				? (int) $reported
+				: 0;
+			$current = OrderPaymentDetail::read( $order_id );
+			if ( null === $current ) {
+				return self::outcome( self::STATUS_PERSIST_FAILED, '付款資料讀取失敗。', self::VAULT_SKIPPED, true );
+			}
+			$claim = EcpayPaymentAttempt::callback_claim(
+				$order,
+				$current,
+				(string) ( $order_info['MerchantTradeNo'] ?? '' ),
+				$amount,
+				(string) ( $data['MerchantID'] ?? '' ),
+				$identity['environment'],
+				EcpayPaymentAttempt::ACTION_FAILURE
+			);
+		}
+		if ( null === $claim ) {
+			return self::outcome( self::STATUS_REJECTED, '失敗結果不屬於目前付款嘗試。' );
+		}
 		$transition = YSPaymentLifecycleService::mark_failed(
 			$order_id,
 			self::detail_dto( $data, (string) ( $order_info['MerchantTradeNo'] ?? '' ), (string) ( $order_info['TradeNo'] ?? '' ) ),
-			'webhook_' . $source
+			'webhook_' . $source,
+			'failed',
+			EcpayPaymentAttempt::callback_guard( $claim ),
+			EcpayPaymentAttempt::callback_lifecycle_options(
+				$claim,
+				EcpayPaymentAttempt::callback_detail_patch( $claim )
+			)
 		);
+		if ( is_array( $transition ) && 'stale' === (string) ( $transition['outcome'] ?? '' ) ) {
+			return self::outcome( self::STATUS_REJECTED, '失敗結果屬於先前的付款嘗試。' );
+		}
 		if ( is_array( $transition ) && empty( $transition['success'] ) && ! empty( $transition['retryable'] ) ) {
 			return self::outcome( self::STATUS_PERSIST_FAILED, '失敗狀態寫入失敗。', self::VAULT_SKIPPED, true );
 		}
+		if ( is_array( $transition ) && empty( $transition['success'] ) ) {
+			// A non-retryable lifecycle refusal means this callback did not own a
+			// legal pending -> failed transition (for example the order already
+			// settled). It is handled, but it must not be advertised to the browser
+			// as a fresh provider failure with a new repay path.
+			return self::outcome( self::STATUS_REJECTED, '失敗結果與目前訂單狀態不相容。' );
+		}
 		return self::outcome( self::STATUS_FAILED, '' !== $message ? $message : '綠界回報授權失敗。' );
+	}
+
+	/**
+	 * A provider-level failure may have no decrypted Data envelope. Rebuild only
+	 * the current attempt identity from locally persisted facts, then use the same
+	 * guarded lifecycle path as a normal signed failure response.
+	 */
+	public static function mark_hosted_failure(
+		object $order,
+		string $merchant_trade_no,
+		string $source,
+		?int $rtn_code,
+		string $message,
+		?array $verified_identity = null
+	): array {
+		$order_id = (int) ( $order->id ?? 0 );
+		$current  = OrderPaymentDetail::read( $order_id );
+		$identity = self::settlement_identity( $verified_identity );
+		$amount = is_array( $current ) ? ( $current['ecpay_charged_amount'] ?? null ) : null;
+		if ( null === $identity
+			|| ! is_array( $current )
+			|| ! ( is_int( $amount ) || ( is_string( $amount ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $amount ) ) ) ) {
+			return self::outcome( self::STATUS_PERSIST_FAILED, '付款資料讀取失敗。', self::VAULT_SKIPPED, true );
+		}
+
+		$data = [
+			'MerchantID' => $identity['merchant_id'],
+			'RtnCode'    => null === $rtn_code ? 0 : $rtn_code,
+			'RtnMsg'     => sanitize_text_field( $message ),
+			'OrderInfo'  => [
+				'MerchantTradeNo' => $merchant_trade_no,
+				'TradeAmt'         => (int) $amount,
+				'TradeNo'          => '',
+			],
+		];
+		return self::mark_failure( $order, $data, $source, null, $identity );
+	}
+
+	/** @return array{merchant_id:string,environment:string}|null */
+	private static function settlement_identity( ?array $verified_identity ): ?array {
+		if ( null === $verified_identity ) {
+			$credentials = Settings::payment_credentials();
+			$verified_identity = [
+				'merchant_id' => (string) ( $credentials['merchant_id'] ?? '' ),
+				'environment' => ! empty( $credentials['test_mode'] ) ? 'stage' : 'live',
+			];
+		}
+		$merchant_id = $verified_identity['merchant_id'] ?? null;
+		$environment = $verified_identity['environment'] ?? null;
+		if ( ! is_string( $merchant_id )
+			|| '' === $merchant_id
+			|| ! is_string( $environment )
+			|| ! in_array( $environment, [ 'stage', 'live' ], true ) ) {
+			return null;
+		}
+		return [ 'merchant_id' => $merchant_id, 'environment' => $environment ];
 	}
 
 	/**

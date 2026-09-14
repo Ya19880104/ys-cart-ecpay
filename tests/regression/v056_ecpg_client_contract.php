@@ -30,10 +30,12 @@ namespace {
 
 	/** @var array<int,array{url:string,args:array}> */
 	$GLOBALS['ys_ecpg_requests'] = [];
+	$GLOBALS['ys_ecpg_events'] = [];
 	/** @var mixed 下一次 wp_remote_post 要回的東西 */
 	$GLOBALS['ys_ecpg_next_response'] = null;
 
 	function wp_remote_post( string $url, array $args ) {
+		$GLOBALS['ys_ecpg_events'][] = 'remote';
 		$GLOBALS['ys_ecpg_requests'][] = [ 'url' => $url, 'args' => $args ];
 		return $GLOBALS['ys_ecpg_next_response'];
 	}
@@ -60,6 +62,7 @@ namespace YangSheep\Ecommerce\Services\Payment {
 		public static bool $submitted_result = true;
 		public static int $submitted_calls = 0;
 		public static function mark_submitted_from_context(): bool {
+			$GLOBALS['ys_ecpg_events'][] = 'submitted';
 			++self::$submitted_calls;
 			return self::$submitted_result;
 		}
@@ -94,6 +97,7 @@ namespace {
 	};
 	$reset = static function (): void {
 		$GLOBALS['ys_ecpg_requests'] = [];
+		$GLOBALS['ys_ecpg_events'] = [];
 		YSPaymentDispatch::$submitted_calls  = 0;
 		YSPaymentDispatch::$submitted_result = true;
 		ProviderMaintenanceLock::$lease_available = true;
@@ -127,7 +131,23 @@ namespace {
 	$c = EcpgClient::classify_response( $reply( [ 'RtnCode' => 10100252, 'RtnMsg' => '額度不足' ] ), $key, $iv );
 	$assert( EcpgClient::OUTCOME_PROVIDER_FAILED === $c['outcome'] && 10100252 === $c['rtn_code'] && str_contains( $c['message'], '額度不足' ), 'B7 other RtnCode → provider_failed carrying code and message' );
 	$c = EcpgClient::classify_response( $reply( [ 'RtnMsg' => 'no code' ] ), $key, $iv );
-	$assert( EcpgClient::OUTCOME_PROVIDER_FAILED === $c['outcome'] && null === $c['rtn_code'], 'B8 missing RtnCode is not success' );
+	$assert( EcpgClient::OUTCOME_INDETERMINATE === $c['outcome'] && null === $c['rtn_code'], 'B8 missing RtnCode is indeterminate, never evidence of failure' );
+	$malformed_codes = true;
+	foreach ( [ '1e0', ' 1', 1.0, true, [], -1, '01', '999999999999999999999999' ] as $bad_code ) {
+		$outer_bad = [ 'TransCode' => $bad_code, 'TransMsg' => 'bad' ];
+		$inner_bad = $reply( [ 'RtnCode' => $bad_code, 'RtnMsg' => 'bad' ] );
+		$outer_result = EcpgClient::classify_response( $outer_bad, $key, $iv );
+		$inner_result = EcpgClient::classify_response( $inner_bad, $key, $iv );
+		$malformed_codes = $malformed_codes
+			&& EcpgClient::OUTCOME_INDETERMINATE === $outer_result['outcome']
+			&& null === $outer_result['trans_code']
+			// JSON encodes 1.0 as the canonical integer token `1`; after the
+			// provider envelope round-trip there is no float shape left to reject.
+			&& ( 1.0 === $bad_code
+				|| ( EcpgClient::OUTCOME_INDETERMINATE === $inner_result['outcome']
+					&& null === $inner_result['rtn_code'] ) );
+	}
+	$assert( $malformed_codes, 'B9 non-canonical TransCode/RtnCode shapes cannot prove success or terminal failure' );
 
 	// ── C. 回呼解碼 ──────────────────────────────────────────────────────────
 	$cb = $reply( [ 'RtnCode' => 1, 'OrderInfo' => [ 'MerchantTradeNo' => 'YSX', 'TradeStatus' => '1' ], 'ThreeDInfo' => [ 'ThreeDURL' => ' https://3d.example/ ' ] ] );
@@ -139,6 +159,11 @@ namespace {
 	$assert( null === EcpgClient::decode_callback( json_encode( $cb ), 'ejCk326UnaZWKisg', 'q9jcZX8Ib9LM8wYk' ), 'C5 another merchant key → null' );
 	$assert( '1' === EcpgClient::trade_status( $decoded ) && 'https://3d.example/' === EcpgClient::three_d_url( $decoded ), 'C6 trade_status / three_d_url read nested fields (ThreeDURL trimmed)' );
 	$assert( null === EcpgClient::trade_status( [ 'RtnCode' => 1 ] ) && '' === EcpgClient::three_d_url( [ 'ThreeDInfo' => [] ] ), 'C7 missing nested fields → null / empty string' );
+	$assert(
+		null === EcpgClient::decode_callback( $reply( [ 'RtnCode' => '1e0', 'OrderInfo' => [ 'MerchantTradeNo' => 'YSX' ] ] ), $key, $iv )
+		&& is_array( EcpgClient::decode_callback( $reply( [ 'RtnCode' => 10300066, 'OrderInfo' => [ 'MerchantTradeNo' => 'YSX' ] ] ), $key, $iv ) ),
+		'C8 malformed callback code is rejected while exact pending-confirmation remains readable without becoming failed'
+	);
 
 	// ── D. hosts ─────────────────────────────────────────────────────────────
 	$assert( 'https://ecpg-stage.ecpay.com.tw' === EcpgClient::token_host( true ) && 'https://ecpg.ecpay.com.tw' === EcpgClient::token_host( false ), 'D1 token host follows test_mode' );
@@ -185,7 +210,51 @@ namespace {
 	$r = $client->create_payment_with_card_id( [ 'BindCardID' => 'b' ] );
 	$req = $GLOBALS['ys_ecpg_requests'][0];
 	$assert( EcpgClient::OUTCOME_SUCCESS === $r['outcome'] && 1 === YSPaymentDispatch::$submitted_calls && 35 === $req['args']['timeout'], 'E11 authorising endpoint marks submitted first and uses the 35s timeout' );
+	$assert( [ 'merchant_id' => '3002607', 'environment' => 'stage' ] === ( $r['credential_context'] ?? null ), 'E11b classified provider response carries only its verified non-secret merchant/environment snapshot' );
 	$assert( 'https://ecpg-stage.ecpay.com.tw/Merchant/CreatePaymentWithCardID' === $req['url'], 'E12 CreatePaymentWithCardID path' );
+
+	$reset();
+	$GLOBALS['ys_ecpg_next_response'] = $http( $reply( [ 'RtnCode' => 1, 'OrderInfo' => [ 'TradeNo' => 'T2', 'TradeStatus' => '1' ] ] ) );
+	$seen_context = null;
+	$r = $client->create_payment_with_card_id(
+		[ 'BindCardID' => 'b' ],
+		static function (): bool {
+			$GLOBALS['ys_ecpg_events'][] = 'pre_send';
+			return true;
+		},
+		static function ( array $context ) use ( &$seen_context ): bool {
+			$seen_context = $context;
+			$GLOBALS['ys_ecpg_events'][] = 'pre_submit';
+			return true;
+		}
+	);
+	$assert(
+		EcpgClient::OUTCOME_SUCCESS === $r['outcome']
+		&& [ 'merchant_id' => '3002607', 'environment' => 'stage' ] === $seen_context
+		&& [ 'pre_submit', 'submitted', 'pre_send', 'remote' ] === $GLOBALS['ys_ecpg_events'],
+		'E12a credential snapshot bind runs before submitted and the existing browser pre-send guard'
+	);
+
+	$reset();
+	$r = $client->create_payment_with_card_id( [ 'BindCardID' => 'b' ], null, static fn ( array $context ): bool => false );
+	$assert(
+		EcpgClient::OUTCOME_REJECTED === $r['outcome']
+		&& false === $r['sent']
+		&& 0 === YSPaymentDispatch::$submitted_calls
+		&& [] === $GLOBALS['ys_ecpg_requests'],
+		'E12b rejected credential bind leaves dispatch reserved and sends zero HTTP bytes'
+	);
+
+	$reset();
+	$r = $client->create_payment_with_card_id( [ 'BindCardID' => 'b' ], null, static function ( array $context ): bool {
+		throw new \RuntimeException( 'fixture bind failure' );
+	} );
+	$assert(
+		EcpgClient::OUTCOME_REJECTED === $r['outcome']
+		&& 0 === YSPaymentDispatch::$submitted_calls
+		&& [] === $GLOBALS['ys_ecpg_requests'],
+		'E12c throwing credential bind fails closed before submitted or HTTP'
+	);
 
 	$reset();
 	Settings::$credentials['test_mode'] = false;

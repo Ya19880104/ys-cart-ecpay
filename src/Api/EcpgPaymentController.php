@@ -12,7 +12,9 @@ use YangSheep\Ecommerce\Utils\YSLogger;
 use YangSheep\YSCartEcpay\Ecpg\EcpgClient;
 use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Ecpg\EcpgSettlement;
+use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
+use YangSheep\YSCartEcpay\Support\ProviderMaintenanceLock;
 use YangSheep\YSCartEcpay\Support\Settings;
 
 /**
@@ -143,7 +145,33 @@ final class EcpgPaymentController {
 		// 付款頁是瀏覽器直接導航進來的，因此這裡要自己驗 logged_in cookie 才知道顧客是誰；
 		// 之後頁面上的 JS 帶著綁定該使用者的 wp_rest nonce 呼叫 charge-saved，走的就是 WP 標準機制。
 		$this->restore_cookie_user();
-		$detail = OrderPaymentDetail::read( (int) $order->id ) ?? [];
+		$detail = OrderPaymentDetail::read( (int) $order->id );
+		if ( null === $detail ) {
+			$this->render_notice( __( '付款資料暫時無法確認', 'ys-cart-ecpay' ), __( '請回到結帳頁重新整理後再試。', 'ys-cart-ecpay' ), EcpgOrderContext::repay_url( $order ), __( '回到結帳', 'ys-cart-ecpay' ) );
+		}
+		$attempt_param = $this->string_param( $request, 'attempt' );
+		$fingerprint   = $this->string_param( $request, 'afp' );
+		$gateway_id    = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+		if ( '' === $attempt_param && '' === $fingerprint ) {
+			$migrated = EcpayPaymentAttempt::migrate_hosted_identity( (int) $order->id, $gateway_id );
+			if ( is_array( $migrated ) ) {
+				wp_safe_redirect( EcpgOrderContext::pay_page_url(
+					$order,
+					$migrated['merchant_trade_no'],
+					$migrated['fingerprint']
+				) );
+				exit;
+			}
+		}
+		if ( ! EcpayPaymentAttempt::browser_owner_matches(
+			$detail,
+			(int) $order->id,
+			$gateway_id,
+			$attempt_param,
+			$fingerprint
+		) ) {
+			$this->render_notice( __( '付款連結已失效', 'ys-cart-ecpay' ), __( '這個付款頁屬於先前的付款嘗試，未載入付款元件。請從重新付款取得新連結。', 'ys-cart-ecpay' ), EcpgOrderContext::repay_url( $order ), __( '重新付款', 'ys-cart-ecpay' ) );
+		}
 		$flow   = (string) ( $detail['ecpay_ecpg_flow'] ?? EcpgOrderContext::FLOW_PAY );
 		$amount = (int) ( $detail['ecpay_charged_amount'] ?? 0 );
 		$saved  = $this->saved_cards_for( $order );
@@ -161,6 +189,8 @@ final class EcpgPaymentController {
 			'config'       => [
 				'order'       => (int) $order->id,
 				'key'         => (string) $request->get_param( 'key' ),
+				'attempt'     => $attempt_param,
+				'afp'         => $fingerprint,
 				'env'         => ! empty( $creds['test_mode'] ) ? 'Stage' : 'Prod',
 				'flow'        => $flow,
 				'tokenUrl'    => rest_url( self::NAMESPACE . '/ecpay/ecpg/token' ),
@@ -193,8 +223,12 @@ final class EcpgPaymentController {
 		if ( ! $order ) {
 			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '訂單不存在或不在可付款狀態。', 'ys-cart-ecpay' ) ], 404 );
 		}
-		$detail = OrderPaymentDetail::read( (int) $order->id ) ?? [];
-		$mtn    = (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' );
+		$detail = OrderPaymentDetail::read( (int) $order->id );
+		$mtn    = $this->string_param( $request, 'attempt' );
+		$afp    = $this->string_param( $request, 'afp' );
+		if ( null === $detail ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '付款資料無法確認，請回到結帳頁重新開始。', 'ys-cart-ecpay' ) ], 409 );
+		}
 		$amount = (int) ( $detail['ecpay_charged_amount'] ?? 0 );
 		$flow   = (string) ( $detail['ecpay_ecpg_flow'] ?? EcpgOrderContext::FLOW_PAY );
 		if ( '' === $mtn || $amount <= 0 ) {
@@ -208,13 +242,14 @@ final class EcpgPaymentController {
 		}
 
 		$client = new EcpgClient();
+		$pre_send = fn (): bool => $this->browser_owner_is_current( $order, $mtn, $afp );
 		if ( EcpgOrderContext::FLOW_BIND === $flow && '' !== $member_id ) {
 			$result = $client->get_token_by_binding_card( [
 				'ConsumerInfo'   => $consumer,
 				'OrderInfo'      => EcpgOrderContext::order_info( $order, $mtn, $amount, EcpgOrderContext::return_url() ),
 				'OrderResultURL' => EcpgOrderContext::order_result_url(),
 				'CustomField'    => '',
-			] );
+			], $pre_send );
 		} else {
 			$flow   = EcpgOrderContext::FLOW_PAY;
 			$result = $client->get_token_by_trade( [
@@ -224,7 +259,10 @@ final class EcpgPaymentController {
 				'OrderInfo'         => EcpgOrderContext::order_info( $order, $mtn, $amount, EcpgOrderContext::return_url() ),
 				'CardInfo'          => [ 'OrderResultURL' => EcpgOrderContext::order_result_url() ],
 				'ConsumerInfo'      => $consumer,
-			] );
+			], $pre_send );
+		}
+		if ( ! $this->browser_owner_is_current( $order, $mtn, $afp ) ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'stale', 'message' => __( '付款嘗試已變更，請使用最新的付款連結。', 'ys-cart-ecpay' ) ], 409 );
 		}
 
 		$token = is_array( $result['data'] ?? null ) ? trim( (string) ( $result['data']['Token'] ?? '' ) ) : '';
@@ -252,23 +290,52 @@ final class EcpgPaymentController {
 		if ( ! $order ) {
 			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '訂單不存在或不在可付款狀態。', 'ys-cart-ecpay' ) ], 404 );
 		}
-		$detail = OrderPaymentDetail::read( (int) $order->id ) ?? [];
-		$mtn    = (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' );
+		$detail = OrderPaymentDetail::read( (int) $order->id );
+		$mtn    = $this->string_param( $request, 'attempt' );
+		$afp    = $this->string_param( $request, 'afp' );
+		if ( null === $detail ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '付款資料無法確認，請回到結帳頁重新開始。', 'ys-cart-ecpay' ) ], 409 );
+		}
 		$flow   = (string) ( $detail['ecpay_ecpg_flow'] ?? EcpgOrderContext::FLOW_PAY );
 		$member = (string) ( $detail['ecpay_ecpg_member_id'] ?? '' );
 
 		$pay_token  = $this->string_param( $request, 'pay_token' );
 		$bind_token = $this->string_param( $request, 'bind_card_pay_token' );
 		$client     = new EcpgClient();
+		$kind       = '';
 		if ( EcpgOrderContext::FLOW_BIND === $flow && '' !== $bind_token && '' !== $member ) {
-			$result = $client->create_bind_card( $bind_token, $member );
+			$kind = 'bind';
 		} elseif ( '' !== $pay_token ) {
-			$result = $client->create_payment( $pay_token, $mtn );
+			$kind = 'pay';
 		} else {
 			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '缺少付款代碼。', 'ys-cart-ecpay' ) ], 400 );
 		}
+		$gateway_id = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+		$claim_nonce = EcpayPaymentAttempt::claim_browser_authorization(
+			(int) $order->id,
+			$gateway_id,
+			$mtn,
+			$afp,
+			'confirm'
+		);
+		if ( '' === $claim_nonce ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'stale', 'message' => __( '此付款嘗試已被處理或已失效，請勿重複付款。', 'ys-cart-ecpay' ) ], 409 );
+		}
+		$pre_send = static fn (): bool => EcpayPaymentAttempt::authorize_browser_send(
+			(int) $order->id,
+			$gateway_id,
+			$mtn,
+			$afp,
+			$claim_nonce
+		);
+		$result = 'bind' === $kind
+			? $client->create_bind_card( $bind_token, $member, $pre_send )
+			: $client->create_payment( $pay_token, $mtn, $pre_send );
+		if ( empty( $result['sent'] ) && EcpgClient::OUTCOME_REJECTED === ( $result['outcome'] ?? '' ) ) {
+			EcpayPaymentAttempt::release_browser_authorization( (int) $order->id, $gateway_id, $mtn, $afp, $claim_nonce );
+		}
 
-		$this->respond_json( ...$this->authorization_response( $order, $result, 'ecpg_confirm' ) );
+		$this->respond_json( ...$this->authorization_response( $order, $result, 'ecpg_confirm', $mtn, $afp, $claim_nonce ) );
 	}
 
 	public function charge_saved( \WP_REST_Request $request ): void {
@@ -290,11 +357,26 @@ final class EcpgPaymentController {
 			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '找不到這張已綁定的卡片。', 'ys-cart-ecpay' ) ], 404 );
 		}
 
-		$detail = OrderPaymentDetail::read( (int) $order->id ) ?? [];
-		$mtn    = (string) ( $detail['ecpay_merchant_trade_no'] ?? $detail['mer_trade_no'] ?? '' );
+		$detail = OrderPaymentDetail::read( (int) $order->id );
+		$mtn    = $this->string_param( $request, 'attempt' );
+		$afp    = $this->string_param( $request, 'afp' );
+		if ( null === $detail ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '付款資料無法確認，請回到結帳頁重新開始。', 'ys-cart-ecpay' ) ], 409 );
+		}
 		$amount = (int) ( $detail['ecpay_charged_amount'] ?? 0 );
 		if ( '' === $mtn || $amount <= 0 ) {
 			$this->respond_json( [ 'ok' => false, 'status' => 'invalid', 'message' => __( '付款資料不完整，請回到結帳頁重新開始。', 'ys-cart-ecpay' ) ], 409 );
+		}
+		$gateway_id = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+		$claim_nonce = EcpayPaymentAttempt::claim_browser_authorization(
+			(int) $order->id,
+			$gateway_id,
+			$mtn,
+			$afp,
+			'saved'
+		);
+		if ( '' === $claim_nonce ) {
+			$this->respond_json( [ 'ok' => false, 'status' => 'stale', 'message' => __( '此付款嘗試已被處理或已失效，請勿重複付款。', 'ys-cart-ecpay' ) ], 409 );
 		}
 		$member_id = EcpgOrderContext::member_id( $customer_id );
 		$result    = ( new EcpgClient() )->create_payment_with_card_id( [
@@ -303,30 +385,39 @@ final class EcpgPaymentController {
 			'ConsumerInfo' => EcpgOrderContext::consumer_info( $order, $member_id ),
 			'Need3D'       => 0,
 			'CustomField'  => '',
-		] );
+		], static fn (): bool => EcpayPaymentAttempt::authorize_browser_send(
+			(int) $order->id,
+			$gateway_id,
+			$mtn,
+			$afp,
+			$claim_nonce
+		) );
+		if ( empty( $result['sent'] ) && EcpgClient::OUTCOME_REJECTED === ( $result['outcome'] ?? '' ) ) {
+			EcpayPaymentAttempt::release_browser_authorization( (int) $order->id, $gateway_id, $mtn, $afp, $claim_nonce );
+		}
 
-		$this->respond_json( ...$this->authorization_response( $order, $result, 'ecpg_charge_saved' ) );
+		$this->respond_json( ...$this->authorization_response( $order, $result, 'ecpg_charge_saved', $mtn, $afp, $claim_nonce ) );
 	}
 
 	// ── 綠界回呼 ───────────────────────────────────────────────────────────────
 
 	public function return_notify( \WP_REST_Request $request ): void {
-		$credentials = Settings::payment_credentials();
 		$body        = $request->get_json_params();
 		if ( ! is_array( $body ) || [] === $body ) {
 			$body = json_decode( (string) $request->get_body(), true );
 		}
-		$data = EcpgClient::decode_callback( $body, $credentials['hash_key'], $credentials['hash_iv'] );
-		if ( null === $data ) {
+		$verified = $this->decode_callback_payload( $body );
+		if ( null === $verified ) {
 			$this->respond_text( '0|Invalid Payload', 400 );
 		}
+		$data = $verified['data'];
 		$order_info = is_array( $data['OrderInfo'] ?? null ) ? $data['OrderInfo'] : [];
 		$order      = EcpgSettlement::find_order_by_merchant_trade_no( (string) ( $order_info['MerchantTradeNo'] ?? '' ) );
 		if ( ! $order ) {
 			$this->respond_text( '0|Order Not Found', 404 );
 		}
 
-		$outcome = EcpgSettlement::apply( $order, $data, 'ecpg_return' );
+		$outcome = EcpgSettlement::apply( $order, $data, 'ecpg_return', $verified['identity'] );
 		if ( EcpgSettlement::STATUS_PERSIST_FAILED === $outcome['status']
 			|| EcpgSettlement::VAULT_FAILED === $outcome['vault'] ) {
 			// 我們自己寫不進去：不 ACK，讓綠界重送。綁卡的 BindCardID 只在這份 payload 裡。
@@ -342,21 +433,21 @@ final class EcpgPaymentController {
 	}
 
 	public function order_result( \WP_REST_Request $request ): void {
-		$credentials = Settings::payment_credentials();
-		$raw         = $request->get_param( 'ResultData' );
-		$data        = is_string( $raw ) && '' !== $raw
-			? EcpgClient::decode_callback( wp_unslash( $raw ), $credentials['hash_key'], $credentials['hash_iv'] )
+		$raw      = $request->get_param( 'ResultData' );
+		$verified = is_string( $raw ) && '' !== $raw
+			? $this->decode_callback_payload( wp_unslash( $raw ) )
 			: null;
-		if ( null === $data ) {
+		if ( null === $verified ) {
 			$this->render_notice( __( '付款結果無法解讀', 'ys-cart-ecpay' ), __( '綠界回傳的資料無法驗證。若您已完成付款，訂單狀態會在幾分鐘內由綠界通知更新。', 'ys-cart-ecpay' ), home_url( '/' ), __( '回到首頁', 'ys-cart-ecpay' ) );
 		}
+		$data = $verified['data'];
 		$order_info = is_array( $data['OrderInfo'] ?? null ) ? $data['OrderInfo'] : [];
 		$order      = EcpgSettlement::find_order_by_merchant_trade_no( (string) ( $order_info['MerchantTradeNo'] ?? '' ) );
 		if ( ! $order ) {
 			$this->render_notice( __( '找不到對應的訂單', 'ys-cart-ecpay' ), __( '付款結果無法對應到本站訂單，請聯繫客服並提供綠界交易編號。', 'ys-cart-ecpay' ), home_url( '/' ), __( '回到首頁', 'ys-cart-ecpay' ) );
 		}
 
-		$outcome = EcpgSettlement::apply( $order, $data, 'ecpg_result' );
+		$outcome = EcpgSettlement::apply( $order, $data, 'ecpg_result', $verified['identity'] );
 		switch ( $outcome['status'] ) {
 			case EcpgSettlement::STATUS_PAID:
 			case EcpgSettlement::STATUS_ALREADY_PAID:
@@ -388,18 +479,54 @@ final class EcpgPaymentController {
 	 *
 	 * @return array{0:array<string,mixed>,1:int}
 	 */
-	private function authorization_response( object $order, array $result, string $source ): array {
+	private function authorization_response(
+		object $order,
+		array $result,
+		string $source,
+		string $merchant_trade_no,
+		string $fingerprint,
+		string $claim_nonce
+	): array {
 		if ( EcpgClient::OUTCOME_REJECTED === $result['outcome'] ) {
 			return [ [ 'ok' => false, 'status' => 'rejected', 'message' => $this->public_message( $result ) ], 409 ];
 		}
 		$data = is_array( $result['data'] ?? null ) ? $result['data'] : [];
+		$verified_identity = $this->result_identity( $result );
+		if ( ! $this->browser_owner_is_current( $order, $merchant_trade_no, $fingerprint, $verified_identity ) ) {
+			YSLogger::warning( 'ecpay', 'ECPG provider 回應抵達時付款嘗試已變更；未交付舊 3D／重付入口', [
+				'order_id' => (int) $order->id,
+				'source'   => $source,
+			] );
+			return [ [
+				'ok'       => false,
+				'status'   => 'pending',
+				'message'  => __( '付款結果正在確認，請稍後於訂單頁查看，請勿重複付款。', 'ys-cart-ecpay' ),
+				'redirect' => EcpgOrderContext::thank_you_url( $order ),
+			], 202 ];
+		}
 		if ( EcpgClient::OUTCOME_INDETERMINATE === $result['outcome'] ) {
 			YSLogger::warning( 'ecpay', 'ECPG 授權結果不明，等待綠界幕後通知', [ 'order_id' => (int) $order->id, 'source' => $source, 'message' => $result['message'] ] );
 			return [ [ 'ok' => false, 'status' => 'pending', 'message' => __( '付款結果待綠界確認，請稍後於訂單頁查看，請勿重複付款。', 'ys-cart-ecpay' ), 'redirect' => EcpgOrderContext::thank_you_url( $order ) ], 202 ];
 		}
 		if ( EcpgClient::OUTCOME_PROVIDER_FAILED === $result['outcome'] ) {
+			$failure = null;
+			$failure_message = '' !== trim( (string) ( $result['rtn_msg'] ?? '' ) )
+				? (string) $result['rtn_msg']
+				: (string) ( $result['message'] ?? '' );
 			if ( [] !== $data && isset( $data['OrderInfo'] ) ) {
-				EcpgSettlement::mark_failure( $order, $data, $source );
+				$failure = EcpgSettlement::mark_failure( $order, $data, $source, null, $verified_identity );
+			} elseif ( ! empty( $result['sent'] ) ) {
+				$failure = EcpgSettlement::mark_hosted_failure(
+					$order,
+					$merchant_trade_no,
+					$source,
+					is_int( $result['rtn_code'] ?? null ) ? $result['rtn_code'] : null,
+					$failure_message,
+					$verified_identity
+				);
+			}
+			if ( ! is_array( $failure ) || EcpgSettlement::STATUS_FAILED !== ( $failure['status'] ?? '' ) ) {
+				return [ [ 'ok' => false, 'status' => 'pending', 'message' => __( '付款結果正在確認，請勿重複付款。', 'ys-cart-ecpay' ), 'redirect' => EcpgOrderContext::thank_you_url( $order ) ], 202 ];
 			}
 			return [ [ 'ok' => false, 'status' => 'failed', 'message' => $this->public_message( $result ), 'repay' => EcpgOrderContext::repay_url( $order ) ], 402 ];
 		}
@@ -407,9 +534,42 @@ final class EcpgPaymentController {
 		// success：先看要不要 3D。
 		$three_d = EcpgClient::three_d_url( $data );
 		if ( '' !== $three_d ) {
+			$order_info = is_array( $data['OrderInfo'] ?? null ) ? $data['OrderInfo'] : [];
+			$card_info  = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
+			$reported   = $order_info['TradeAmt'] ?? $card_info['Amount'] ?? null;
+			$reported_amount = ( is_int( $reported ) || ( is_string( $reported ) && 1 === preg_match( '/^[1-9][0-9]*$/D', $reported ) ) )
+				? (int) $reported
+				: 0;
+			$gateway_id = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+			$credential_merchant_id = is_array( $verified_identity ) ? (string) $verified_identity['merchant_id'] : '';
+			$environment = is_array( $verified_identity ) ? (string) $verified_identity['environment'] : '';
+			$handoff = EcpayPaymentAttempt::claim_browser_result_handoff(
+				(int) $order->id,
+				$gateway_id,
+				$merchant_trade_no,
+				$fingerprint,
+				$claim_nonce,
+				$credential_merchant_id,
+				$environment,
+				(string) ( $data['MerchantID'] ?? '' ),
+				(string) ( $order_info['MerchantTradeNo'] ?? '' ),
+				$reported_amount
+			);
+			if ( ! $handoff ) {
+				YSLogger::warning( 'ecpay', 'ECPG 3D 回應未通過目前付款嘗試的原子交付檢查', [
+					'order_id' => (int) $order->id,
+					'source'   => $source,
+				] );
+				return [ [
+					'ok'       => false,
+					'status'   => 'pending',
+					'message'  => __( '付款結果正在確認，請稍後於訂單頁查看，請勿重複付款。', 'ys-cart-ecpay' ),
+					'redirect' => EcpgOrderContext::thank_you_url( $order ),
+				], 202 ];
+			}
 			return [ [ 'ok' => true, 'status' => 'redirect', 'url' => $three_d ], 200 ];
 		}
-		$outcome = EcpgSettlement::apply( $order, $data, $source );
+		$outcome = EcpgSettlement::apply( $order, $data, $source, $verified_identity );
 		switch ( $outcome['status'] ) {
 			case EcpgSettlement::STATUS_PAID:
 			case EcpgSettlement::STATUS_ALREADY_PAID:
@@ -419,6 +579,48 @@ final class EcpgPaymentController {
 			default:
 				return [ [ 'ok' => false, 'status' => 'pending', 'message' => __( '付款已受理，狀態將於綠界確認後更新，請勿重複付款。', 'ys-cart-ecpay' ), 'redirect' => EcpgOrderContext::thank_you_url( $order ) ], 202 ];
 		}
+	}
+
+	/** @return array{data:array<string,mixed>,identity:array{merchant_id:string,environment:string}}|null */
+	private function decode_callback_payload( mixed $payload ): ?array {
+		$lease = ProviderMaintenanceLock::reader_lease();
+		if ( null === $lease ) {
+			return null;
+		}
+		$credentials = Settings::payment_credentials();
+		if ( '' === (string) ( $credentials['merchant_id'] ?? '' )
+			|| '' === (string) ( $credentials['hash_key'] ?? '' )
+			|| '' === (string) ( $credentials['hash_iv'] ?? '' ) ) {
+			return null;
+		}
+		$data = EcpgClient::decode_callback(
+			$payload,
+			(string) $credentials['hash_key'],
+			(string) $credentials['hash_iv']
+		);
+		if ( null === $data || ! ProviderMaintenanceLock::reader_fence( $lease->token ) ) {
+			return null;
+		}
+		return [
+			'data'     => $data,
+			'identity' => [
+				'merchant_id' => (string) $credentials['merchant_id'],
+				'environment' => ! empty( $credentials['test_mode'] ) ? 'stage' : 'live',
+			],
+		];
+	}
+
+	/** @return array{merchant_id:string,environment:string}|null */
+	private function result_identity( array $result ): ?array {
+		$identity = $result['credential_context'] ?? null;
+		if ( ! is_array( $identity )
+			|| ! is_string( $identity['merchant_id'] ?? null )
+			|| '' === $identity['merchant_id']
+			|| ! is_string( $identity['environment'] ?? null )
+			|| ! in_array( $identity['environment'], [ 'stage', 'live' ], true ) ) {
+			return null;
+		}
+		return [ 'merchant_id' => $identity['merchant_id'], 'environment' => $identity['environment'] ];
 	}
 
 	/** 給顧客看的失敗原因：綠界的 RtnMsg 可以顯示，連線／金鑰層的細節不給。 */
@@ -469,11 +671,13 @@ final class EcpgPaymentController {
 
 	/** order＋key 能力網址 → 屬於本閘道的訂單；任何一項不符回 null（不透露哪一項）。 */
 	private function resolve_order( \WP_REST_Request $request, bool $allow_query ): ?object {
+		unset( $allow_query );
 		$order_id = (int) $request->get_param( 'order' );
 		$key      = $this->string_param( $request, 'key' );
 		if ( $order_id <= 0 || '' === $key || ! YSOrder::verify_order_key( $order_id, $key ) ) {
 			return null;
 		}
+		YSOrder::forget( $order_id );
 		$order   = YSOrder::find( $order_id );
 		$gateway = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
 		return $order && EcpgOrderContext::GATEWAY_ID === $gateway ? $order : null;
@@ -481,7 +685,28 @@ final class EcpgPaymentController {
 
 	private function resolve_pending_order( \WP_REST_Request $request ): ?object {
 		$order = $this->resolve_order( $request, false );
-		return $order && 'pending' === (string) ( $order->status ?? '' ) ? $order : null;
+		if ( ! $order || 'pending' !== (string) ( $order->status ?? '' ) ) {
+			return null;
+		}
+		$detail = OrderPaymentDetail::read( (int) $order->id );
+		$gateway_id = (string) ( $order->gateway_id ?? $order->payment_method ?? '' );
+		return is_array( $detail ) && EcpayPaymentAttempt::browser_owner_matches(
+			$detail,
+			(int) $order->id,
+			$gateway_id,
+			$this->string_param( $request, 'attempt' ),
+			$this->string_param( $request, 'afp' )
+		) ? $order : null;
+	}
+
+	private function browser_owner_is_current( object $order, string $merchant_trade_no, string $fingerprint, ?array $verified_identity = null ): bool {
+		$order_id = (int) ( $order->id ?? 0 );
+		YSOrder::forget( $order_id );
+		$fresh = YSOrder::find( $order_id );
+		$gateway_id = is_object( $fresh ) ? (string) ( $fresh->gateway_id ?? $fresh->payment_method ?? '' ) : '';
+		return is_object( $fresh )
+			&& 'pending' === (string) ( $fresh->status ?? '' )
+			&& EcpayPaymentAttempt::browser_owner_is_current( $order_id, $gateway_id, $merchant_trade_no, $fingerprint, $verified_identity );
 	}
 
 	private function string_param( \WP_REST_Request $request, string $name ): string {

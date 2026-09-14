@@ -36,7 +36,7 @@ abstract class PaymentDetailWpdbAdapter
     /** Most recent raw CAS preimage decoded from an UPDATE predicate. */
     public ?string $last_payment_detail_preimage = null;
 
-    /** `legacy` or `canonical_text`, matching the predicate Core emitted. */
+    /** `legacy`, `canonical_text`, or `exact_binary`, matching the predicate Core emitted. */
     public ?string $last_payment_detail_predicate = null;
 
     public function prepare(string $sql, ...$args): string
@@ -113,15 +113,21 @@ abstract class PaymentDetailWpdbAdapter
                 return 0;
             }
         } else {
-            $pattern = "/AND\\s+(CAST\\(\\s*payment_detail\\s+AS\\s+CHAR\\s*\\)|payment_detail)\\s*=\\s*'((?:''|[^'])*)'/is";
-            if (!preg_match($pattern, $sql, $match)) {
+            $binaryPattern = "/AND\\s+CAST\\(\\s*CAST\\(\\s*payment_detail\\s+AS\\s+CHAR\\s*\\)\\s+AS\\s+BINARY\\s*\\)\\s*=\\s*CAST\\(\\s*'((?:''|[^'])*)'\\s+AS\\s+BINARY\\s*\\)/is";
+            $textPattern = "/AND\\s+(CAST\\(\\s*payment_detail\\s+AS\\s+CHAR\\s*\\)|payment_detail)\\s*=\\s*'((?:''|[^'])*)'/is";
+            if (preg_match($binaryPattern, $sql, $match)) {
+                $this->last_payment_detail_predicate = 'exact_binary';
+                $preimage = $match[1];
+            } elseif (preg_match($textPattern, $sql, $match)) {
+                $this->last_payment_detail_predicate = str_starts_with(strtoupper($match[1]), 'CAST')
+                    ? 'canonical_text'
+                    : 'legacy';
+                $preimage = $match[2];
+            } else {
                 return 0;
             }
 
-            $this->last_payment_detail_predicate = str_starts_with(strtoupper($match[1]), 'CAST')
-                ? 'canonical_text'
-                : 'legacy';
-            $this->last_payment_detail_preimage = str_replace("''", "'", $match[2]);
+            $this->last_payment_detail_preimage = str_replace("''", "'", $preimage);
             if ($this->last_payment_detail_preimage !== (string) $this->value) {
                 return 0;
             }

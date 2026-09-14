@@ -32,16 +32,32 @@ final class OrderPaymentDetail {
 	 * @param int      $order_id 訂單 ID
 	 * @param callable $mutator  fn( array $detail, int $attempt, mixed &$decision ): ?array
 	 */
-	public static function mutate( int $order_id, callable $mutator, ?int $max_attempts = null ): DetailWriteOutcome {
+	public static function mutate(
+		int $order_id,
+		callable $mutator,
+		?int $max_attempts = null,
+		bool $ambient_dispatch_guard = true,
+		array $columns = [],
+		?string $expected_status = null,
+		array $compare_columns = [],
+		array $expected_column_values = []
+	): DetailWriteOutcome {
 		if ( ! self::is_available() ) {
 			// 核心服務缺席時**不得**退回 provider 自己的寫入器：兩套互不相認的 CAS
 			// 各自為政比沒有 CAS 更危險（雙方都以為自己贏了）。
 			return DetailWriteOutcome::core_unavailable();
 		}
 
-		$result = null === $max_attempts
-			? YSPaymentDetailStore::mutate( $order_id, $mutator )
-			: YSPaymentDetailStore::mutate( $order_id, $mutator, $max_attempts );
+		$result = YSPaymentDetailStore::mutate(
+			$order_id,
+			$mutator,
+			null === $max_attempts ? YSPaymentDetailStore::DEFAULT_MAX_ATTEMPTS : $max_attempts,
+			$ambient_dispatch_guard,
+			$columns,
+			$expected_status,
+			$compare_columns,
+			$expected_column_values
+		);
 
 		return DetailWriteOutcome::from_core( $result );
 	}

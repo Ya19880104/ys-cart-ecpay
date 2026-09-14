@@ -66,6 +66,7 @@ namespace YangSheep\Ecommerce\DTOs {
 namespace YangSheep\Ecommerce\Models {
 	final class YSOrder
 	{
+		public static function forget(int $id): void { unset($id); }
 		public static function find(int $id): ?object
 		{
 			if (7 !== $id) {
@@ -75,6 +76,8 @@ namespace YangSheep\Ecommerce\Models {
 			return (object) [
 				'id'             => 7,
 				'total'          => 100.0,
+				'gateway_id'     => 'ys_ec_ecpay_credit',
+				'payment_method' => 'ys_ec_ecpay_credit',
 				'payment_detail' => json_encode([
 					'mer_trade_no'       => 'YS7TLOCAL',
 					'ecpay_charged_amount' => 100,
@@ -87,25 +90,80 @@ namespace YangSheep\Ecommerce\Models {
 namespace YangSheep\Ecommerce\Services\Payment {
 	final class YSPaymentLifecycleService
 	{
-		public static function mark_paid(int $order_id, object $detail, string $source): array
+		private static function transition(string $kind, int $order_id, ?callable $guard, array $options): array
 		{
-			unset($order_id, $detail, $source);
-			file_put_contents((string) $GLOBALS['ys_ecpay_marker_path'], 'paid|', FILE_APPEND);
-			return ['success' => true];
+			$current = \YangSheep\YSCartEcpay\Support\OrderPaymentDetail::read($order_id);
+			if (null !== $guard && ! $guard($current)) {
+				return ['success' => false, 'retryable' => false, 'outcome' => 'stale'];
+			}
+			$patch = $options['detail_patch'] ?? null;
+			$next  = is_callable($patch) ? $patch($current) : $current;
+			file_put_contents(
+				(string) $GLOBALS['ys_ecpay_marker_path'],
+				'atomic-' . $kind . ':' . json_encode(['detail' => $next, 'columns' => $options['columns'] ?? []]) . '|',
+				FILE_APPEND
+			);
+			if ('persist-fail' === ($GLOBALS['ys_ecpay_scenario'] ?? '')) {
+				return ['success' => false, 'retryable' => true, 'outcome' => 'db_error'];
+			}
+			return ['success' => true, 'retryable' => false, 'outcome' => 'won'];
 		}
 
-		public static function mark_failed(int $order_id, object $detail, string $source): array
+		public static function mark_paid(int $order_id, object $detail, string $source, ?callable $guard = null, array $options = []): array
 		{
-			unset($order_id, $detail, $source);
-			file_put_contents((string) $GLOBALS['ys_ecpay_marker_path'], 'failed|', FILE_APPEND);
-			return ['success' => true];
+			unset($detail, $source);
+			return self::transition('paid', $order_id, $guard, $options);
 		}
 
-		public static function mark_pending_offline(int $order_id, object $detail, string $source): array
+		public static function mark_failed(int $order_id, object $detail, string $source, string $target = 'failed', ?callable $guard = null, array $options = []): array
 		{
-			unset($order_id, $detail, $source);
-			file_put_contents((string) $GLOBALS['ys_ecpay_marker_path'], 'pending-offline|', FILE_APPEND);
-			return ['success' => true];
+			unset($detail, $source, $target);
+			return self::transition('failed', $order_id, $guard, $options);
+		}
+
+		public static function mark_pending_offline(int $order_id, object $detail, string $source, ?callable $guard = null, array $options = []): array
+		{
+			unset($detail, $source);
+			return self::transition('pending-offline', $order_id, $guard, $options);
+		}
+	}
+}
+
+namespace YangSheep\YSCartEcpay\Payment {
+	final class EcpayPaymentAttempt
+	{
+		public const ACTION_SUCCESS = 'success';
+		public const ACTION_FAILURE = 'failure';
+		public const ACTION_PAYMENT_INFO = 'payment_info';
+		public static function identity_is_discoverable(array $detail, string $mtn): bool
+		{
+			return ($detail['mer_trade_no'] ?? $detail['ecpay_merchant_trade_no'] ?? '') === $mtn;
+		}
+		public static function historical_callback_matches(object $order, array $detail, string $mtn, int $amount, string $merchant_id, string $environment): bool
+		{
+			unset($order, $detail, $mtn, $amount, $merchant_id, $environment);
+			return false;
+		}
+		public static function callback_claim(object $order, array $detail, string $merchant_trade_no, int $amount, string $merchant_id, string $environment = '', string $action = self::ACTION_SUCCESS): ?array
+		{
+			unset($detail);
+			return '' !== $merchant_trade_no && $amount > 0
+				? ['gateway_id' => (string) ($order->gateway_id ?? ''), 'merchant_trade_no' => $merchant_trade_no, 'charged_amount' => $amount, 'merchant_id' => $merchant_id, 'environment' => $environment, 'action' => $action, 'scalar_gateway_bound' => true]
+				: null;
+		}
+		public static function callback_guard(array $claim): callable
+		{
+			return static fn(array $detail): bool => ($detail['mer_trade_no'] ?? '') === ($claim['merchant_trade_no'] ?? '');
+		}
+		public static function callback_detail_patch(array $claim, array $fields = []): callable
+		{
+			unset($claim);
+			return static fn(array $detail): array => array_merge($detail, $fields);
+		}
+		public static function callback_lifecycle_options(array $claim, callable $patch, array $columns = []): array
+		{
+			$columns['gateway_id'] = (string) ($claim['gateway_id'] ?? '');
+			return ['detail_patch' => $patch, 'columns' => $columns, 'expected_column_values' => ['gateway_id' => $columns['gateway_id']]];
 		}
 	}
 }
@@ -167,7 +225,14 @@ namespace YangSheep\YSCartEcpay\Support {
 		public static function read(int $order_id): array
 		{
 			unset($order_id);
-			return ['ecpay_charged_amount' => 100];
+			return [
+				'mer_trade_no'           => 'YS7TLOCAL',
+				'ecpay_charged_amount'    => 100,
+				'payment_provider'        => 'ecpay',
+				'payment_method'          => 'ys_ec_ecpay_credit',
+				'ecpay_merchant_id'       => 'LOCAL-MERCHANT',
+				'ecpay_environment'       => 'stage',
+			];
 		}
 
 		public static function mutate(int $order_id, callable $callback): FakePersistedWrite
@@ -310,17 +375,18 @@ namespace {
 		'Replayed SimulatePaid=1 remains an ACK-only no-op'
 	);
 	$assert(
-		str_contains($real['event'], 'detail-write|')
-		&& str_contains($real['event'], 'scalar-write|')
-		&& str_contains($real['event'], 'paid|'),
-		'RtnCode=1 with SimulatePaid=0 persists identity before invoking the paid lifecycle transition'
+		str_contains($real['event'], 'atomic-paid:')
+		&& str_contains($real['event'], 'LOCAL-TRADE-1')
+		&& ! str_contains($real['event'], 'detail-write|')
+		&& ! str_contains($real['event'], 'scalar-write|'),
+		'RtnCode=1 with SimulatePaid=0 writes callback detail, scalar TradeNo, and paid lifecycle in one CAS'
 	);
 	$assert(
 		'1|OK' === $real['stdout'] && '' === $real['stderr'] && 0 === $real['exit'],
 		'Real paid callback returns the byte-exact successful callback ACK'
 	);
 	$assert(
-		str_contains($signed_raw_bytes['event'], 'paid|')
+		str_contains($signed_raw_bytes['event'], 'atomic-paid:')
 		&& '1|OK' === $signed_raw_bytes['stdout']
 		&& '' === $signed_raw_bytes['stderr']
 		&& 0 === $signed_raw_bytes['exit'],
@@ -334,21 +400,21 @@ namespace {
 		'Invalid CheckMacValue is rejected before any lifecycle mutation'
 	);
 	$assert(
-		'detail-write|' === $persist_fail['event']
+		str_contains($persist_fail['event'], 'atomic-paid:')
 		&& '0|Persist Failed' === $persist_fail['stdout']
 		&& '' === $persist_fail['stderr']
 		&& 0 === $persist_fail['exit'],
 		'Real payment persistence failure is non-ACK and never advances lifecycle'
 	);
 	$assert(
-		'failed|' === $notify_failed['event']
+		str_contains($notify_failed['event'], 'atomic-failed:')
 		&& '1|OK' === $notify_failed['stdout']
 		&& '' === $notify_failed['stderr']
 		&& 0 === $notify_failed['exit'],
 		'Non-success payment result transitions to failed and ACKs exactly once'
 	);
 	$assert(
-		'pending-offline|' === $payment_info['event']
+		str_contains($payment_info['event'], 'atomic-pending-offline:')
 		&& '1|OK' === $payment_info['stdout']
 		&& '' === $payment_info['stderr']
 		&& 0 === $payment_info['exit'],
