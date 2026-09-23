@@ -17,6 +17,11 @@ use YangSheep\YSCartEcpay\Payment\EcpayPaymentAttempt;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
+// v0.5.12：首購訂閱綁卡的三態對齊（Core 首購卡片權威）；不走 autoloader 的測試夾具也要載得到。
+if ( ! class_exists( EcpgInitialCardBinding::class ) ) {
+	require_once __DIR__ . '/EcpgInitialCardBinding.php';
+}
+
 /**
  * 站內付 2.0 授權結果 → YS CART 訂單狀態（v0.5.0）
  *
@@ -446,7 +451,8 @@ final class EcpgSettlement {
 		}
 
 		YSPaymentEffects::run( $order_id, $receipt, [
-			$effect => static function ( string $_key ) use ( $order, $data, $source, $bind_card_id, $customer_id, $order_id, $follow_up ): bool {
+			// v0.5.12：Core 以 idle 模式投遞時會多交連線與 session fence，原樣轉給首購卡片權威（與 Core PayUni notify 相同）。
+			$effect => static function ( string $_key, ?object $effect_db = null, ?array $effect_idle_fence = null ) use ( $order, $data, $source, $bind_card_id, $customer_id, $order_id, $follow_up, $receipt ): bool {
 				$card_info = is_array( $data['CardInfo'] ?? null ) ? $data['CardInfo'] : [];
 				$card_id   = YSCreditCard::create_or_get( [
 					'customer_id' => $customer_id,
@@ -467,12 +473,16 @@ final class EcpgSettlement {
 					return false;
 				}
 
-				if ( ! $follow_up && ! YSSubscription::bind_initial_order_card(
+				// v0.5.12：先把首購卡片權威寫進 Core 的已付款收據（三態見 EcpgInitialCardBinding）；
+				// Core 收下時綁卡交給 Core 完成，訂閱尚未建立不再要求綠界重送；Core 不收或沒有該 API 時維持 0.5.11 行為。
+				if ( ! $follow_up && ! EcpgInitialCardBinding::attach(
 					$order_id,
 					$customer_id,
 					(int) ( $order->user_id ?? 0 ),
-					EcpgOrderContext::GATEWAY_ID,
-					(int) $card_id
+					(int) $card_id,
+					$receipt,
+					$effect_db,
+					$effect_idle_fence
 				) ) {
 					YSLogger::error( 'ecpay', 'ECPG 初始訂閱卡片綁定尚未完成，要求重送', [
 						'order_id'    => $order_id,
@@ -483,7 +493,7 @@ final class EcpgSettlement {
 					return false;
 				}
 
-				YSLogger::info( 'ecpay', $follow_up ? 'ECPG 綁卡已存入卡片庫' : 'ECPG 綁卡已存入卡片庫並綁定初始訂閱', [
+				YSLogger::info( 'ecpay', $follow_up ? 'ECPG 綁卡已存入卡片庫' : 'ECPG 綁卡已存入卡片庫；初始訂閱已綁定或已交由 Core 以收據上的權威綁定', [
 					'order_id'    => $order_id,
 					'customer_id' => $customer_id,
 					'card_id'     => (int) $card_id,

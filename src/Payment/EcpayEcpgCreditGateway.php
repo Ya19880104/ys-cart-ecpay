@@ -18,6 +18,11 @@ use YangSheep\YSCartEcpay\Ecpg\EcpgOrderContext;
 use YangSheep\YSCartEcpay\Support\OrderPaymentDetail;
 use YangSheep\YSCartEcpay\Support\Settings;
 
+// v0.5.12：「支援訂閱」宣告的相容橋（Core 2.69.7 有介面才 extends）；不走 autoloader 的測試夾具也要載得到。
+if ( ! interface_exists( EcpgSubscriptionCapability::class ) ) {
+	require_once __DIR__ . '/EcpgSubscriptionCapability.php';
+}
+
 /**
  * 綠界信用卡——站內付 2.0 綁卡（軌 B，v0.5.0）
  *
@@ -33,7 +38,7 @@ use YangSheep\YSCartEcpay\Support\Settings;
  * 導轉）的交易模型開關。站內付 2.0 綁卡以**付款方式**的形態與導轉方式並存，由業主在
  * 「金流方式」分頁逐一開關——訂閱商品用它，一般商品可以繼續用導轉。
  */
-final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderScopedTokenChargeGatewayInterface {
+final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderScopedTokenChargeGatewayInterface, EcpgSubscriptionCapability {
 	/**
 	 * 核心 coordinator 讀取續扣結果 DTO 的鍵名（`$result['payment_detail']`）。
 	 *
@@ -63,6 +68,22 @@ final class EcpayEcpgCreditGateway extends EcpayGatewayBase implements YSOrderSc
 	/** 訂閱結帳只留 supports_token 的閘道（核心 YSCheckoutAvailabilityService）。 */
 	public function supports_token(): bool {
 		return true;
+	}
+
+	/**
+	 * v0.5.12：明示「支援訂閱」（Core 2.69.7 的能力宣告；舊 Core 以 supports_token() 相容，結果相同）。
+	 * 與 supports_token() 綁在一起：token 能力拿掉時訂閱資格一起拿掉。
+	 */
+	public function supports_subscriptions(): bool {
+		return $this->supports_token();
+	}
+
+	/**
+	 * v0.5.12：續扣排程權威＝本站（Core 排程，以 BindCardID 走 CreatePaymentWithCardID）。
+	 * 綠界定期定額（金流商代管）不是這個付款方式。
+	 */
+	public function subscription_schedule_authority(): string {
+		return 'core';
 	}
 
 	/**

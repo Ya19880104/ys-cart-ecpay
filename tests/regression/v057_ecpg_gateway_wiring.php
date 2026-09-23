@@ -307,6 +307,11 @@ namespace {
 	$assert( 'ys_ec_ecpay_ecpg_credit' === $gateway->get_id() && EcpgOrderContext::GATEWAY_ID === $gateway->get_id(), 'B1 gateway id is the catalogue id' );
 	$assert( true === $gateway->supports_token(), 'B2 supports_token() → subscription checkout keeps this gateway' );
 	$assert( $gateway instanceof YSOrderScopedTokenChargeGatewayInterface, 'B3 opts into the order-scoped token-charge contract (Core fails unknown token gateways closed)' );
+	$assert(
+		true === $gateway->supports_subscriptions() && 'core' === $gateway->subscription_schedule_authority()
+			&& $gateway instanceof \YangSheep\YSCartEcpay\Payment\EcpgSubscriptionCapability,
+		'B3b v0.5.12 declares subscription support (tied to supports_token) with Core-scheduled renewals (authority exactly core) through the compatibility bridge'
+	);
 	$assert( '綠界信用卡（站內付）' === $gateway->get_title(), 'B4 title from the catalogue' );
 
 	// ── C. 首刷 process_payment ────────────────────────────────────────────────

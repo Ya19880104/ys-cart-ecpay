@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.12 - 未發布
+
+- 站內付 2.0（ECPG）首購訂閱綁卡改對齊 Core 的首購卡片權威：BindCardID 存進卡片庫後，先把「這張卡是這筆首購的扣款卡」寫進 Core 的已付款收據（`YSInitialSubscriptionCardBinding::enroll()`），再帶收據綁卡。Core 2.69.7 起與訂閱同步綁卡；訂閱尚未建立時交給 Core 以同一份權威完成，不再回失敗要求綠界重送。
+- 舊 Core（2.69.6 以前只接受 PayUni 的首購卡片權威、或沒有該 API）與權威被拒時，一律維持 0.5.11 行為：不帶收據綁卡，訂閱尚未建立就回失敗讓綠界重送。權威沒寫進收據時絕不回成功。
+- 站內付 2.0 閘道宣告「支援訂閱」（Core 2.69.7 的可選介面 `YSSubscriptionCapableGatewayInterface`，續扣排程由 Core 負責）；舊 Core 仍以 `supports_token()` 判定，行為不變。
+- 最低 Core 版本維持 2.67.11；與訂閱同步綁卡需 Core 2.69.7。
+
 ## 0.5.11 - 2026-09-15
 
 - ECPay 重新付款 rotation 以同一 CAS 歸檔精確 predecessor 收據；晚到 AIO／ATM／超商／ECPG callback 只在持久寫入已付款、已失敗或有限異常證據後 ACK，重播與舊別名不能改寫目前 attempt。

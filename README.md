@@ -2,7 +2,7 @@
 
 Standalone ECPay provider plugin for YS CART.
 
-Current version: **0.5.11**
+Current version: **0.5.12**
 
 ## Features
 
@@ -64,6 +64,21 @@ Current version: **0.5.11**
   order-scoped token-charge contract PayUni uses. Non-subscription orders use the
   same page without binding. Ships disabled; requires ECPay activation of 站內付 2.0
   and 綁定信用卡. Coexists with the redirect (AIO) methods.
+  - **Initial subscription card binding (0.5.12).** After the vaulted BindCardID is
+    stored, the plugin first records it as the initial-subscription card authority on
+    Core's paid receipt (`YSInitialSubscriptionCardBinding::enroll()`), then binds with
+    that receipt. With **YS CART 2.69.7+** Core accepts the ECPay attempt, so the card is
+    bound together with the subscription (Core creates the subscription and binds the
+    authoritative card; a subscription that does not exist yet is left pending for Core
+    to finish) and ECPay no longer has to resend the callback. With an older Core (up to
+    2.69.6, which accepts only PayUni for that authority) or a Core without the API, the
+    plugin keeps the 0.5.11 behaviour: it binds without a receipt and, while the
+    subscription has not been created yet, answers ECPay with a failure so ECPay resends
+    and the binding completes on a later callback. The minimum Core version is unchanged.
+  - **Subscription capability (0.5.12).** The gateway declares Core 2.69.7's optional
+    `YSSubscriptionCapableGatewayInterface` (supports subscriptions, renewals scheduled by
+    Core) through a bridge that only extends the interface when Core has it. Older Core
+    keeps treating the gateway as subscription-capable through `supports_token()`.
 - YS Plugin Hub Client bundled for updates from yangsheep.com.tw.
 
 ## Requirements
@@ -80,7 +95,9 @@ Current version: **0.5.11**
   2.61.7 order-scoped token-charge contract used by ECPG bind-card renewals;
   2.67.11 adds attempt history, guarded callback writes and final payable handoff)
 - **ECPG bind-card:** the same Core 2.67.11 floor, plus the complete payment-effects
-  receipt and initial-subscription card-binding APIs.
+  receipt and initial-subscription card-binding APIs. Binding the initial subscription
+  card in the same step as the subscription needs **YS CART 2.69.7+**; older Core keeps
+  the 0.5.11 behaviour (see above).
 - **Multi-temperature mapping:** paired Core 2.67.0+. The provider exposes its
   11-method `temperature_layer_mapping_v1` capability only when that Core is loaded.
 
