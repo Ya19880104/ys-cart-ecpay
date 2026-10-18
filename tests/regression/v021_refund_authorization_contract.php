@@ -415,15 +415,56 @@ namespace {
     $base       = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Payment/EcpayGatewayBase.php' ) );
     $logistics  = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Api/EcpayLogisticsController.php' ) );
 
+    // AIO/base now bind scalars with payment_detail in the attempt/lifecycle CAS.
+    // Logistics still uses ScalarColumnWriter for its separate shipping scalars.
+    // Inspect executable tokens so historical comments cannot satisfy the path
+    // assertions, and reject direct writes even when they are not inside an if.
+    $code = static function ( string $source ): string {
+        $result = '';
+        foreach ( token_get_all( $source ) as $token ) {
+            if ( is_array( $token ) ) {
+                if ( in_array( $token[0], [ T_COMMENT, T_DOC_COMMENT, T_WHITESPACE ], true ) ) {
+                    continue;
+                }
+                $result .= $token[1];
+            } else {
+                $result .= $token;
+            }
+        }
+        return $result;
+    };
+    $controller_code = $code( $controller );
+    $base_code = $code( $base );
+    $logistics_code = $code( $logistics );
+    $attempt_code = $code( (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Payment/EcpayPaymentAttempt.php' ) );
+    $detail_code = $code( (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Support/OrderPaymentDetail.php' ) );
+    $lifecycle_code = $code( (string) file_get_contents( $core_root . '/src/Services/Payment/YSPaymentLifecycleService.php' ) );
+    $bind_start = strpos( $attempt_code, 'publicstaticfunctionbind_payment_identity(' );
+    $bind_end = false === $bind_start ? false : strpos( $attempt_code, 'publicstaticfunctioncallback_claim(', $bind_start );
+    $bind_code = false === $bind_start || false === $bind_end ? '' : substr( $attempt_code, $bind_start, $bind_end - $bind_start );
+    $direct_writes = false;
+    foreach ( [ $controller_code, $base_code, $logistics_code, $attempt_code, $detail_code ] as $writer_code ) {
+        $direct_writes = $direct_writes || str_contains( $writer_code, 'YSOrder::update(' );
+    }
     $assert(
-        str_contains( $controller, 'ScalarColumnWriter::required_string(' )
-        && str_contains( $controller, 'ScalarColumnWriter::is_persisted(' )
-        && str_contains( $base, 'ScalarColumnWriter::is_persisted(' )
-        && str_contains( $logistics, 'ScalarColumnWriter::is_persisted(' )
-        && ! preg_match( "/if \( ! YSOrder::update\(/", $controller )
-        && ! preg_match( "/if \( ! YSOrder::update\(/", $base )
-        && ! preg_match( "/if \( ! YSOrder::update\(/", $logistics ),
-        '(d2) 三個 scalar writer 全部改走 typed write／readback，無 `if ( ! YSOrder::update(` 殘留'
+        str_contains( $controller_code, 'YSPaymentLifecycleService::mark_paid(' )
+        && str_contains( $controller_code, 'YSPaymentLifecycleService::mark_failed(' )
+        && str_contains( $controller_code, 'YSPaymentLifecycleService::mark_pending_offline(' )
+        && str_contains( $controller_code, 'EcpayPaymentAttempt::callback_lifecycle_options(' )
+        && str_contains( $controller_code, "['gateway_trade_no'=>\$trade_no]" )
+        && str_contains( $attempt_code, "\$options['columns']=\$columns;" )
+        && str_contains( $lifecycle_code, 'YSPaymentDetailStore::mutate(' )
+        && str_contains( $base_code, 'EcpayPaymentAttempt::bind_payment_identity(' )
+        && str_contains( $base_code, 'if(!$persisted->is_persisted())' )
+        && str_contains( $bind_code, 'returnOrderPaymentDetail::mutate(' )
+        && str_contains( $bind_code, "['gateway_id'=>\$gateway_id,'payment_method'=>\$gateway_id]" )
+        && str_contains( $detail_code, 'YSPaymentDetailStore::mutate(' )
+        && str_contains( $detail_code, 'DetailWriteOutcome::from_core($result)' )
+        && str_contains( $logistics_code, 'OrderPaymentDetail::mutate(' )
+        && str_contains( $logistics_code, 'if(!$mutated->is_persisted())' )
+        && str_contains( $logistics_code, 'ScalarColumnWriter::is_persisted(' )
+        && ! $direct_writes,
+        '(d2) AIO／base 經現行 attempt／lifecycle CAS 與 OrderPaymentDetail；物流保留 typed scalar write，無直接 YSOrder::update'
     );
 
     $writer_src = str_replace( "\r\n", "\n", (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Support/ScalarColumnWriter.php' ) );
