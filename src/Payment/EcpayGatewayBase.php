@@ -289,6 +289,11 @@ abstract class EcpayGatewayBase implements YSGatewayInterface {
 		return null;
 	}
 
+	/** Declare record-only refunds; credit overrides this with its existing option. */
+	public function supports_gateway_refund(): bool {
+		return false;
+	}
+
 	public function process_refund( int $order_id, float $amount, string $reason = '', array $context = [] ): array {
 		unset( $order_id, $amount, $reason, $context );
 		return [ 'success' => false, 'message' => __( '此版本尚未提供綠界退款功能。', 'ys-cart-ecpay' ) ];

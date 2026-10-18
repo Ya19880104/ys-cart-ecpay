@@ -2,7 +2,7 @@
 
 Standalone ECPay provider plugin for YS CART.
 
-Current version: **0.5.12**
+Current version: **0.5.13**
 
 ## Features
 

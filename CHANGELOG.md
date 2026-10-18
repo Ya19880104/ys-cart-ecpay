@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.13 - Unreleased
+
+- ATM、超商、條碼、WebATM、Apple Pay、TWQR、BNPL、銀聯、微信支付、分期與站內付信用卡的退款改為只記錄、不向綠界送出（原本會被誤判為結果未明而凍結、需用指令列處理）；信用卡一次付清的自動退款設定不變。
+
 ## 0.5.12 - 2026-09-23
 
 - 站內付 2.0（ECPG）首購訂閱綁卡改對齊 Core 的首購卡片權威：BindCardID 存進卡片庫後，先把「這張卡是這筆首購的扣款卡」寫進 Core 的已付款收據（`YSInitialSubscriptionCardBinding::enroll()`），再帶收據綁卡。Core 2.69.7 起與訂閱同步綁卡；訂閱尚未建立時交給 Core 以同一份權威完成，不再回失敗要求綠界重送。
