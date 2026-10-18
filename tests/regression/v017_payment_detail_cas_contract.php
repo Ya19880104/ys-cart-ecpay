@@ -132,12 +132,16 @@ namespace {
     $core_main = (string) file_get_contents($core_root . '/ys-cart.php');
     preg_match("/define\(\s*'YS_ECOMMERCE_VERSION',\s*'([^']+)'/", $core_main, $version_match);
     $core_version = (string) ($version_match[1] ?? '0.0.0');
-    $expected_predicate = version_compare($core_version, '2.58.0', '>=')
-        ? 'canonical_text'
-        : 'legacy';
-    $expected_sql_fragment = 'canonical_text' === $expected_predicate
-        ? 'CAST( payment_detail AS CHAR ) = \'{"a":1}\''
-        : 'payment_detail = \'{"a":1}\'';
+    // Core 2.67.11's attempt seam fix (8665c806) requires byte-exact CAS.
+    // Keep the oracle independent of the emitted SQL so reverting that fix fails.
+    $expected_predicate = version_compare($core_version, '2.67.11', '>=')
+        ? 'exact_binary'
+        : (version_compare($core_version, '2.58.0', '>=') ? 'canonical_text' : 'legacy');
+    $expected_sql_fragment = match ($expected_predicate) {
+        'exact_binary' => 'CAST( CAST( payment_detail AS CHAR ) AS BINARY ) = CAST( \'{"a":1}\' AS BINARY )',
+        'canonical_text' => 'CAST( payment_detail AS CHAR ) = \'{"a":1}\'',
+        default => 'payment_detail = \'{"a":1}\'',
+    };
 
     // (0) 反自欺：受測的是核心 production 檔
     $rc = new \ReflectionClass(Store::class);
